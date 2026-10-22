@@ -46,7 +46,7 @@ def cmd_ls(ctx, args, stdin):
     multi = len(paths) > 1
     for idx, path in enumerate(paths):
         try:
-            node = ctx.fs.lookup(path, ctx.cwd, ctx.home)
+            node = ctx.fs.lookup(path, ctx.cwd, ctx.home, user=ctx.user)
         except PyOSError as exc:
             out_lines.append(f"ls: cannot access '{path}': {exc.message}")
             continue
@@ -108,7 +108,7 @@ def _long_line(ctx, node, human=False):
           category="filesystem")
 def cmd_cd(ctx, args, stdin):
     target = args[0] if args else ctx.home
-    node = ctx.fs.lookup(target, ctx.cwd, ctx.home)
+    node = ctx.fs.lookup(target, ctx.cwd, ctx.home, user=ctx.user)
     if not node.is_dir():
         raise NotADirectory(target)
     if not ctx.fs.has_perm(node, ctx.user, 1):  # x
@@ -153,8 +153,7 @@ def cmd_touch(ctx, args, stdin):
         raise InvalidArgument("touch: missing file operand")
     for path in paths:
         try:
-            node = ctx.fs.lookup(path, ctx.cwd, ctx.home)
-            node.touch_mtime()
+            ctx.fs.touch(path, ctx.user, ctx.cwd, ctx.home)
         except NoSuchFileOrDirectory:
             ctx.fs.create_file(path, ctx.user, ctx.cwd, ctx.home)
     return None
@@ -285,7 +284,7 @@ def cmd_chmod(ctx, args, stdin):
         if spec.isdigit():
             new_mode = int(spec, 8) & 0o7777
         else:
-            node = ctx.fs.lookup(path, ctx.cwd, ctx.home)
+            node = ctx.fs.lookup(path, ctx.cwd, ctx.home, user=ctx.user)
             import re
             new_mode = node.mode
             for clause in spec.split(","):
@@ -344,7 +343,7 @@ def cmd_stat(ctx, args, stdin):
         raise InvalidArgument("stat: missing operand")
     lines = []
     for path in paths:
-        node = ctx.fs.lookup(path, ctx.cwd, ctx.home)
+        node = ctx.fs.lookup(path, ctx.cwd, ctx.home, user=ctx.user)
         owner = ctx.users.get_by_uid(node.uid)
         lines.append(f"  File: {ctx.fs.path_of(node)}")
         lines.append(f"  Size: {getattr(node, 'size', 0)}")

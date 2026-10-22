@@ -71,49 +71,93 @@ def _load(kernel, root, tmpname):
 
 
 # ============================================================================
-# CHARACTERIZE — пути и права (инверсия на этапе 2)
+# пути и права (этап 2: CHARACTERIZE инвертированы)
 # ============================================================================
 
 
-def test_lookup_without_user_bypasses_x_currently(kernel, root, user, capsys):
-    # CHARACTERIZE: lookup() без user в командах (cd/stat) обходит право x на
-    # промежуточных каталогах; fixed in stage 2 (В1).
+def _unsearchable_setup(kernel, root):
     fs = kernel.fs
     fs.mkdir("/root/secret", root, mode=0o755)              # /root = 700
     fs.create_file("/root/secret/hidden", root,
                    data="TOPSECRET", mode=0o644)
+    return fs
 
+
+def test_cd_denies_unsearchable_parent(kernel, root, user, capsys):
+    # В1: cd больше не обходит x на промежуточных каталогах.
+    _unsearchable_setup(kernel, root)
     sh = Shell(kernel, user)
-    sh.handle_line("cd /root/secret")
-    # пользователь вошёл в каталог внутри /root (700) без права прохода
-    assert sh.cwd == "/root/secret"
+    start = sh.cwd
+    out = _run(sh, capsys, "cd /root/secret")
+    assert "Permission denied" in out
+    assert sh.cwd == start
 
+
+def test_stat_denies_unsearchable_parent(kernel, root, user, capsys):
+    # В1: stat не раскрывает метаданные из непроходимого каталога.
+    _unsearchable_setup(kernel, root)
+    sh = Shell(kernel, user)
     out = _run(sh, capsys, "stat /root/secret/hidden")
-    # метаданные файла в непроходимом для пользователя каталоге раскрыты
-    assert "/root/secret/hidden" in out
+    assert "Permission denied" in out
+    assert "TOPSECRET" not in out
 
-    # ls защищён: listdir() передаёт user и проверяет промежуточный x.
-    out = _run(sh, capsys, "ls /root/secret")
+
+def test_touch_denies_unsearchable_parent(kernel, root, user, capsys):
+    # В1: touch не создаёт файл через непроходимый каталог.
+    fs = _unsearchable_setup(kernel, root)
+    sh = Shell(kernel, user)
+    out = _run(sh, capsys, "touch /root/secret")
+    assert "Permission denied" in out
+    out = _run(sh, capsys, "touch /root/secret/new")
+    assert "Permission denied" in out
+    with pytest.raises(NoSuchFileOrDirectory):
+        fs.lookup("/root/secret/new", root, "/", "/")
+
+
+def test_chmod_denies_unsearchable_parent(kernel, root, user, capsys):
+    # В1: chmod (символьная форма идёт через lookup) не обходит x.
+    _unsearchable_setup(kernel, root)
+    sh = Shell(kernel, user)
+    out = _run(sh, capsys, "chmod u+w /root/secret")
     assert "Permission denied" in out
 
 
-def test_glob_ignores_permissions_currently(kernel, root, user, capsys):
-    # CHARACTERIZE: glob() не использует user и не проверяет x/r; fixed in
-    # stage 2 (В2).
+def test_touch_existing_requires_write_or_owner(kernel, root, user, capsys):
+    # В1: mtime чужого файла нельзя менять без root/владельца/права W.
     fs = kernel.fs
-    fs.mkdir("/root/secret", root, mode=0o755)
-    fs.create_file("/root/secret/hidden", root,
-                   data="TOPSECRET", mode=0o644)
+    fs.create_file("/tmp/root_ro", root, data="x", mode=0o644)
+    fs.create_file("/tmp/root_ww", root, data="x", mode=0o666)
+    fs.create_file("/tmp/user_ro", user, data="x", mode=0o444)
+    for path in ("/tmp/root_ro", "/tmp/root_ww", "/tmp/user_ro"):
+        fs.lookup(path, root, "/", "/").mtime = 1.0
+
+    sh = Shell(kernel, user)
+    out = _run(sh, capsys, "touch /tmp/root_ro")
+    assert "Permission denied" in out
+    assert fs.lookup("/tmp/root_ro", root, "/", "/").mtime == 1.0
+
+    out = _run(sh, capsys, "touch /tmp/root_ww")
+    assert "Permission denied" not in out
+    assert fs.lookup("/tmp/root_ww", root, "/", "/").mtime != 1.0
+
+    out = _run(sh, capsys, "touch /tmp/user_ro")
+    assert "Permission denied" not in out
+    assert fs.lookup("/tmp/user_ro", root, "/", "/").mtime != 1.0
+
+
+def test_glob_does_not_leak_unsearchable_directory(kernel, root, user, capsys):
+    # В2: glob не раскрывает имена из каталогов без x/r.
+    _unsearchable_setup(kernel, root)
+    assert kernel.fs.glob("/root/secret/*", user, "/", user.home) == []
 
     sh = Shell(kernel, user)
     out = _run(sh, capsys, "echo /root/secret/*")
-    assert "/root/secret/hidden" in out
+    assert "hidden" not in out
+    assert "/root/secret/*" in out  # shell сохраняет литерал
 
 
-def test_rm_r_ignores_nested_dir_permissions_currently(kernel, root, user,
-                                                      capsys):
-    # CHARACTERIZE: rm -r проверяет права только верхнего каталога, вложенные
-    # не проверяются; fixed in stage 2 (В6).
+def test_rm_r_checks_nested_permissions(kernel, root, user, capsys):
+    # В6: rm -r проверяет всё дерево до удаления, без частичного удаления.
     fs = kernel.fs
     fs.mkdir("/tmp/up", user, "/", user.home, mode=0o755)
     fs.mkdir("/tmp/up/inner", root, "/", "/", mode=0o000)
@@ -122,28 +166,36 @@ def test_rm_r_ignores_nested_dir_permissions_currently(kernel, root, user,
 
     sh = Shell(kernel, user)
     out = _run(sh, capsys, "rm -r /tmp/up")
-    assert "Permission denied" not in out
-    with pytest.raises(NoSuchFileOrDirectory):
-        fs.lookup("/tmp/up", root, "/", "/")
+    assert "Permission denied" in out
+    assert fs.lookup("/tmp/up", root, "/", "/").is_dir()
+    assert fs.lookup("/tmp/up/inner", root, "/", "/").is_dir()
+    assert fs.lookup("/tmp/up/inner/f", root, "/", "/").is_file()
 
 
-def test_cp_r_reads_unreadable_source_currently(kernel, root, user, capsys):
-    # CHARACTERIZE: copy_tree() читает child.data напрямую, обходя право R на
-    # источник; fixed in stage 2 (В4).
+def test_cp_r_checks_source_permissions(kernel, root, user, capsys):
+    # В4: cp -r требует R/X на source-каталоге и R на source-файлах.
     fs = kernel.fs
-    fs.mkdir("/tmp/src2", user, "/", user.home, mode=0o711)
-    fs.create_file("/tmp/src2/secret", root, "/", "/",
+    fs.mkdir("/tmp/private", root, "/", "/", mode=0o711)
+    fs.create_file("/tmp/private/secret", root, "/", "/",
                    data="DATALEAK", mode=0o000)
+    fs.create_file("/tmp/blocked", root, "/", "/",
+                   data="X", mode=0o000)
 
     sh = Shell(kernel, user)
-    _run(sh, capsys, "cp -r /tmp/src2 /tmp/dst2")
-    assert fs.read_file("/tmp/dst2/secret", root, "/", "/") == "DATALEAK"
+    out = _run(sh, capsys, "cp -r /tmp/private /tmp/leak")
+    assert "Permission denied" in out
+    with pytest.raises(NoSuchFileOrDirectory):
+        fs.lookup("/tmp/leak", root, "/", "/")
+    assert fs.read_file("/tmp/private/secret", root, "/", "/") == "DATALEAK"
+
+    out = _run(sh, capsys, "cp /tmp/blocked /tmp/leakfile")
+    assert "Permission denied" in out
+    with pytest.raises(NoSuchFileOrDirectory):
+        fs.lookup("/tmp/leakfile", root, "/", "/")
 
 
-def test_cp_r_into_subtree_does_not_terminate_currently(kernel, root):
-    # CHARACTERIZE: copy_tree() не имеет containment-guard (в отличие от
-    # rename/_is_within) и рекурсивно уходит в собственное поддерево; fixed in
-    # stage 2 (В5). Bounded через понижение recursionlimit + RecursionError.
+def test_cp_r_rejects_copy_into_self(kernel, root):
+    # В5: копирование каталога в себя/своё поддерево отклоняется, не зависает.
     fs = kernel.fs
     fs.mkdir("/tmp/self", root, mode=0o755)
     fs.create_file("/tmp/self/a", root, data="a", mode=0o644)
@@ -151,22 +203,44 @@ def test_cp_r_into_subtree_does_not_terminate_currently(kernel, root):
     old_limit = sys.getrecursionlimit()
     try:
         sys.setrecursionlimit(_stack_depth() + 60)
-        with pytest.raises(RecursionError):
+        with pytest.raises(InvalidArgument, match="into itself"):
             fs.copy_tree("/tmp/self", "/tmp/self/sub", root, "/", "/")
     finally:
         sys.setrecursionlimit(old_limit)
+    assert fs.lookup("/tmp/self/a", root, "/", "/").data == "a"
 
 
-def test_mv_dir_over_file_replaces_currently(kernel, root, capsys):
-    # CHARACTERIZE: rename() каталога поверх существующего файла заменяет файл
-    # каталогом; fixed in stage 2 (В7).
+def test_cp_r_rejects_overlapping_recursive_copy(kernel, root, capsys):
+    # В5: descendant -> ancestor через mv-подобную семантику cp тоже отклоняется.
     fs = kernel.fs
-    fs.mkdir("/tmp/dd", root, mode=0o755)
-    fs.create_file("/tmp/ff", root, data="f", mode=0o644)
+    fs.mkdir("/tmp/parent", root, mode=0o755)
+    fs.mkdir("/tmp/parent/child", root, mode=0o755)
+    fs.create_file("/tmp/parent/child/f", root, data="x", mode=0o644)
 
     sh = Shell(kernel, root)
-    _run(sh, capsys, "mv /tmp/dd /tmp/ff")
-    assert fs.lookup("/tmp/ff", root, "/", "/").is_dir()
+    old_limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(_stack_depth() + 60)
+        out = _run(sh, capsys, "cp -r /tmp/parent/child /tmp/parent")
+    finally:
+        sys.setrecursionlimit(old_limit)
+    assert "cannot copy" in out
+    assert fs.lookup("/tmp/parent/child/f", root, "/", "/").is_file()
+
+
+def test_mv_dir_over_file_returns_not_a_directory(kernel, root, capsys):
+    # В7: mv каталога поверх файла больше не заменяет файл каталогом.
+    fs = kernel.fs
+    fs.mkdir("/tmp/srcdir", root, mode=0o755)
+    fs.create_file("/tmp/dstfile", root, data="keep", mode=0o644)
+
+    sh = Shell(kernel, root)
+    out = _run(sh, capsys, "mv /tmp/srcdir /tmp/dstfile")
+    assert "Not a directory" in out
+    node = fs.lookup("/tmp/dstfile", root, "/", "/")
+    assert node.is_file()
+    assert node.data == "keep"
+    assert fs.lookup("/tmp/srcdir", root, "/", "/").is_dir()
 
 
 # ============================================================================

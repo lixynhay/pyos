@@ -432,6 +432,15 @@ class FileSystem:
             raise NoSuchFileOrDirectory(path)
         return self.create_file(path, user, cwd, home, data=data)
 
+    def touch(self, path, user=None, cwd="/", home="/") -> Node:
+        """Обновляет mtime узла; чужой файл требует root, владельца или W."""
+        node = self._walk(path, cwd, home, True, 0, user)
+        if user is not None and not getattr(user, "is_root", False):
+            if node.uid != user.uid and not self.has_perm(node, user, W_BIT):
+                raise PermissionDenied(path)
+        node.touch_mtime()
+        return node
+
     def create_file(self, path, user=None, cwd="/", home="/", data="",
                     mode=0o644) -> File:
         parent, name, norm = self._parent_and_name(path, cwd, home, user)
@@ -527,11 +536,20 @@ class FileSystem:
         if node.is_dir():
             if not recursive:
                 raise IsADirectory(norm)
-            if node.children and not self.has_perm(node, user, W_BIT | X_BIT):
-                raise PermissionDenied(norm)
+            self._check_rmtree(node, user, norm)
             self._rmtree(node)
         self._drop_entry(parent, name)
         parent.touch_mtime()
+
+    def _check_rmtree(self, node: Dir, user, path):
+        """Проверяет права на всё дерево до удаления (без частичного rm -r)."""
+        if user is None or getattr(user, "is_root", False):
+            return
+        if node.children:
+            self._require(node, user, W_BIT | X_BIT, path)
+        for child in node.children.values():
+            if child.is_dir():
+                self._check_rmtree(child, user, self.path_of(child))
 
     def _rmtree(self, node: Dir):
         for child in list(node.children.values()):
@@ -612,6 +630,8 @@ class FileSystem:
                 return node
             if existing.is_dir() and not node.is_dir():
                 raise IsADirectory(dnorm)
+            if node.is_dir() and not existing.is_dir():
+                raise NotADirectory(dnorm)
             if existing.is_dir() and existing.children:
                 raise DirectoryNotEmpty(dnorm)
             self._drop_entry(dparent, dname)
@@ -634,6 +654,21 @@ class FileSystem:
                 break
             cur = cur.parent
         return False
+
+    def _existing_prefix(self, norm: str, user=None) -> Node:
+        """Самый глубокий существующий узел пути ``norm`` (с учётом symlink)."""
+        node = self.root
+        if norm == "/":
+            return node
+        for comp in norm.strip("/").split("/"):
+            node = self._deref(node, 0, user)
+            if not node.is_dir():
+                return node
+            child = node.children.get(comp)
+            if child is None:
+                return node
+            node = child
+        return node
 
     # -- жёсткие ссылки ------------------------------------------------------
     def link(self, src, dst, user=None, cwd="/", home="/") -> File:
@@ -665,10 +700,19 @@ class FileSystem:
         snode = self._walk(src, cwd, home, True, 0, user)
         dnorm = self.normalize(dst, cwd, home)
         if snode.is_file():
-            self.write_file(dnorm, snode.data, user, cwd, home)
+            data = self.read_file(src, user, cwd, home)
+            self.write_file(dnorm, data, user, cwd, home)
             return self._walk(dnorm, "/", "/", True, 0, user)
         if not snode.is_dir():
             raise InvalidArgument(f"{src}: unsupported file type")
+
+        snorm = self.path_of(snode)
+        dprefix = self._existing_prefix(dnorm, user)
+        if self._is_within(snode, dprefix):
+            raise InvalidArgument(f"cannot copy '{snorm}' into itself")
+
+        self._require(snode, user, R_BIT | X_BIT, snorm)
+
         try:
             dnode = self._walk(dnorm, "/", "/", True, 0, user)
         except NoSuchFileOrDirectory:
@@ -680,7 +724,8 @@ class FileSystem:
             if child.is_dir():
                 self.copy_tree(self.path_of(child), target, user)
             elif child.is_file():
-                self.write_file(target, child.data, user, "/", "/")
+                data = self.read_file(self.path_of(child), user, "/", "/")
+                self.write_file(target, data, user, "/", "/")
             else:  # символическая ссылка
                 self.symlink(child.target, target, user, "/", "/")
         return dnode
@@ -707,14 +752,19 @@ class FileSystem:
             nxt = []
             for node in nodes:
                 try:
-                    node = self._deref(node, 0)
+                    node = self._deref(node, 0, user)
                 except PyOSError:
                     continue
                 if not node.is_dir():
                     continue
+                # без x нельзя даже войти в каталог, без r — перечислить имена
+                if user is not None and not self.has_perm(node, user, X_BIT):
+                    continue
                 self._refresh(node)
                 if comp == "..":
                     nxt.append(node.parent if node.parent is not None else node)
+                    continue
+                if user is not None and not self.has_perm(node, user, R_BIT):
                     continue
                 for child in node.children.values():
                     if self._match_component(child.name, comp):
