@@ -296,6 +296,18 @@ def test_pack_rejects_hardlink(kernel, root):
         _pack(ctx, "/tmp/hard-root", "/tmp/hard.pkg.json")
 
 
+def test_pkg_pack_still_detects_nlink_gt_1(kernel, root):
+    # После переезда uid/gid/mode в общий FileLink nlink по-прежнему > 1.
+    ctx = _ctx(kernel, root)
+    _write(kernel, root, "/tmp/nlink-root/a.txt", "x")
+    kernel.fs.link("/tmp/nlink-root/a.txt", "/tmp/nlink-root/b.txt", root, "/", "/")
+
+    assert kernel.fs.lookup("/tmp/nlink-root/a.txt", root).nlink == 2
+    with pytest.raises(InvalidArgument, match="hardlink"):
+        _pack(ctx, "/tmp/nlink-root", "/tmp/nlink.pkg.json")
+
+
+
 def test_pack_rejects_special_file(kernel, root):
     ctx = _ctx(kernel, root)
     _mkdir(kernel, root, "/tmp/special-root")

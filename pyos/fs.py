@@ -98,25 +98,57 @@ class Node:
 
 
 class FileLink:
-    """Совместно используемое состояние файла (inode): данные и счётчик ссылок.
+    """Совместно используемое состояние файла (inode).
 
     Несколько жёстких ссылок (имён каталога) указывают на один ``FileLink``,
-    поэтому изменение данных через одну ссылку видно через остальные.
+    поэтому данные, ``chmod`` и ``chown`` через одну ссылку видны через
+    остальные.
     """
 
-    __slots__ = ("data", "nlink")
+    __slots__ = ("data", "nlink", "uid", "gid", "mode")
 
-    def __init__(self, data=""):
+    def __init__(self, data="", uid=0, gid=0, mode=0o644):
         self.data = data
         self.nlink = 1
+        self.uid = uid
+        self.gid = gid
+        self.mode = mode & 0o7777
 
 
 class File(Node):
     kind = "file"
 
     def __init__(self, name, uid=0, gid=0, mode=0o644, data="", link=None):
-        super().__init__(name, uid, gid, mode)
-        self._link = link if link is not None else FileLink(data)
+        if link is None:
+            link = FileLink(data, uid, gid, mode)
+        self._link = link
+        # uid/gid/mode всегда берутся из общего inode; аргументы значимы
+        # только при создании нового FileLink (link is None).
+        super().__init__(name, link.uid, link.gid, link.mode)
+
+    @property
+    def uid(self) -> int:
+        return self._link.uid
+
+    @uid.setter
+    def uid(self, value: int):
+        self._link.uid = value
+
+    @property
+    def gid(self) -> int:
+        return self._link.gid
+
+    @gid.setter
+    def gid(self, value: int):
+        self._link.gid = value
+
+    @property
+    def mode(self) -> int:
+        return self._link.mode
+
+    @mode.setter
+    def mode(self, value: int):
+        self._link.mode = value & 0o7777
 
     def is_file(self) -> bool:
         return True
@@ -684,9 +716,9 @@ class FileSystem:
         self._require_parent(parent, user, W_BIT | X_BIT, norm)
         if name in parent.children:
             raise FileExists(norm)
-        uid = user.uid if user else 0
-        gid = user.gid if user else 0
-        new = File(name, uid=uid, gid=gid, mode=snode.mode, link=snode._link)
+        # метаданные (uid/gid/mode) принадлежат inode, а не имени: новое имя
+        # не получает владельца-вызывающего
+        new = File(name, link=snode._link)
         new.parent = parent
         new.inode = snode.inode
         new._link.nlink += 1

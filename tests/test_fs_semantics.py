@@ -244,44 +244,139 @@ def test_mv_dir_over_file_returns_not_a_directory(kernel, root, capsys):
 
 
 # ============================================================================
-# CHARACTERIZE — inode / hardlink / cp mode (инверсия на этапе 3a)
+# inode / hardlink (этап 3a) и cp mode (этап 3b)
 # ============================================================================
 
 
-def test_hardlink_metadata_is_per_name_currently(kernel, root, user, capsys):
-    # CHARACTERIZE: hardlink делит только FileLink (data/nlink); uid/gid/mode
-    # остаются per-name, поэтому новый линк получает владельца-вызывающего при
-    # общем inode; fixed in stage 3a (В3).
+def test_hardlink_shares_uid_gid_mode(kernel, root, user):
+    # uid/gid/mode принадлежат FileLink: ссылка пользователя на root-файл
+    # сохраняет владельца и права inode, а не вызывающего.
     fs = kernel.fs
-    fs.create_file("/tmp/rf", root, "/", "/",
-                   data="ROOTONLY", mode=0o600)
+    fs.create_file("/tmp/rf", root, "/", "/", data="X", mode=0o640)
+    fs.link("/tmp/rf", "/tmp/link1", user, "/", user.home)
+
+    orig = fs.lookup("/tmp/rf")
+    link = fs.lookup("/tmp/link1")
+    assert (link.uid, link.gid, link.mode) == (0, 0, 0o640)
+    assert (link.uid, link.gid, link.mode) == (
+        orig.uid, orig.gid, orig.mode)
+    assert link.inode == orig.inode
+    assert link.nlink == orig.nlink == 2
+
+
+def test_chmod_through_hardlink_affects_all_links(kernel, root):
+    fs = kernel.fs
+    fs.create_file("/tmp/a", root, data="x", mode=0o600)
+    fs.link("/tmp/a", "/tmp/b", root, "/", "/")
+
+    fs.chmod("/tmp/b", 0o640, root, "/", "/")
+    assert fs.lookup("/tmp/a").mode == 0o640
+    assert fs.lookup("/tmp/b").mode == 0o640
+
+    fs.chmod("/tmp/a", 0o600, root, "/", "/")
+    assert fs.lookup("/tmp/b").mode == 0o600
+
+
+def test_chown_through_hardlink_affects_all_links(kernel, root, user):
+    fs = kernel.fs
+    fs.create_file("/tmp/a", root, data="x", mode=0o600)
+    fs.link("/tmp/a", "/tmp/b", root, "/", "/")
+
+    fs.chown("/tmp/b", uid=user.uid, gid=user.gid, user=root)
+    a = fs.lookup("/tmp/a")
+    b = fs.lookup("/tmp/b")
+    assert (a.uid, a.gid) == (user.uid, user.gid)
+    assert (b.uid, b.gid) == (user.uid, user.gid)
+
+    fs.chown("/tmp/a", uid=0, gid=0, user=root)
+    assert fs.lookup("/tmp/b").uid == 0
+    assert fs.lookup("/tmp/b").gid == 0
+
+
+def test_user_cannot_read_root_private_file_via_hardlink(kernel, root, user,
+                                                        capsys):
+    fs = kernel.fs
+    fs.create_file("/tmp/rf", root, data="ROOTONLY", mode=0o600)
+    fs.link("/tmp/rf", "/tmp/link1", user, "/", user.home)
+
+    with pytest.raises(PermissionDenied):
+        fs.read_file("/tmp/link1", user, "/", user.home)
 
     sh = Shell(kernel, user)
-    _run(sh, capsys, "ln /tmp/rf /tmp/link1")
+    out = _run(sh, capsys, "cat /tmp/link1")
+    assert "Permission denied" in out
+    assert "ROOTONLY" not in out
 
-    link = fs.lookup("/tmp/link1", root, "/", "/")
-    orig = fs.lookup("/tmp/rf", root, "/", "/")
-    assert link.uid == user.uid
-    assert link.mode == 0o600
-    assert orig.uid == 0
-    assert orig.mode == 0o600
-    assert link.inode == orig.inode
 
-    # user читает данные root-файла 0600 через свою ссылку
-    assert fs.read_file("/tmp/link1", user, "/", user.home) == "ROOTONLY"
+def test_root_can_grant_access_via_chmod_on_any_hardlink(kernel, root, user,
+                                                         capsys):
+    fs = kernel.fs
+    fs.create_file("/tmp/rf", root, data="ROOTONLY", mode=0o600)
+    fs.link("/tmp/rf", "/tmp/link1", user, "/", user.home)
+    sh_user = Shell(kernel, user)
 
-    # chmod через ссылку меняет только новое имя
-    fs.chmod("/tmp/link1", 0o644, user, "/", user.home)
-    assert fs.lookup("/tmp/link1", root, "/", "/").mode == 0o644
-    assert fs.lookup("/tmp/rf", root, "/", "/").mode == 0o600
+    assert "Permission denied" in _run(sh_user, capsys, "cat /tmp/link1")
 
-    # stat показывает один inode и разные uid
-    out_link = _run(sh, capsys, "stat /tmp/link1")
-    out_orig = _run(sh, capsys, "stat /tmp/rf")
-    assert f"Inode: {link.inode}" in out_link
-    assert f"Inode: {orig.inode}" in out_orig
-    assert "Uid: (1000/" in out_link
-    assert "Uid: (0/root)" in out_orig
+    sh_root = Shell(kernel, root)
+    _run(sh_root, capsys, "chmod 644 /tmp/link1")
+    assert fs.lookup("/tmp/rf").mode == 0o644
+    assert fs.lookup("/tmp/link1").mode == 0o644
+    assert "ROOTONLY" in _run(sh_user, capsys, "cat /tmp/link1")
+
+
+def test_statShows_same_inode_metadata_for_hardlinks(kernel, root, capsys):
+    fs = kernel.fs
+    fs.create_file("/tmp/h1", root, data="x", mode=0o640)
+    fs.link("/tmp/h1", "/tmp/h2", root, "/", "/")
+    node = fs.lookup("/tmp/h1")
+
+    sh = Shell(kernel, root)
+    out1 = _run(sh, capsys, "stat /tmp/h1")
+    out2 = _run(sh, capsys, "stat /tmp/h2")
+    for out in (out1, out2):
+        assert f"Inode: {node.inode}  Links: 2" in out
+        assert "Access: (0640/" in out
+        assert "Uid: (0/root)" in out
+        assert "Gid: (0/root)" in out
+
+    out = _run(sh, capsys, "ls -l /tmp/h1 /tmp/h2")
+    lines = [line for line in out.splitlines()
+             if line.endswith((" h1", " h2"))]
+    assert len(lines) == 2
+    for line in lines:
+        assert "-rw-r-----" in line
+        assert " 2 " in line
+        assert "root" in line
+
+
+def test_save_load_hardlinks_remain_independent_but_keep_metadata(
+        kernel, root, user):
+    # DOCUMENTED LIMIT сохраняется: связи и inode не восстанавливаются, но
+    # каждый независимый файл хранит свои uid/gid/mode.
+    fs = kernel.fs
+    fs.create_file("/tmp/h1", root, "/", "/", data="AAA", mode=0o640)
+    fs.link("/tmp/h1", "/tmp/h2", root, "/", "/")
+    fs.create_file("/tmp/u", user, "/", user.home, data="U", mode=0o600)
+
+    tmpname = _save(kernel, root)
+    try:
+        _load(kernel, root, tmpname)
+        h1 = fs.lookup("/tmp/h1", root, "/", "/")
+        h2 = fs.lookup("/tmp/h2", root, "/", "/")
+        u = fs.lookup("/tmp/u", root, "/", "/")
+
+        assert h1.mode == h2.mode == 0o640
+        assert h1.uid == h2.uid == 0
+        assert h1.gid == h2.gid == 0
+        assert (u.uid, u.gid, u.mode) == (user.uid, user.gid, 0o600)
+
+        assert h1.nlink == h2.nlink == 1
+        assert h1.inode != h2.inode
+        fs.write_file("/tmp/h1", "ZZZ", root, "/", "/")
+        assert fs.read_file("/tmp/h2", root, "/", "/") == "AAA"
+    finally:
+        os.unlink(tmpname)
+
 
 
 def test_cp_drops_mode_bits_currently(kernel, root, capsys):
