@@ -442,6 +442,54 @@ def test_kill_nonexistent(kernel, root, capsys):
     assert "No such process" in captured.out + captured.err
 
 
+def _spawn_victim(kernel):
+    """Создаёт живой процесс, которого можно убить."""
+    return kernel.create_process(name="victim", remaining=10**9)
+
+
+@pytest.mark.parametrize("signal_spec", ["9", "TERM", "SIGTERM", "KILL", "SIGKILL"])
+def test_kill_accepts_signal_specs(kernel, root, capsys, signal_spec):
+    """kill понимает номера и имена сигналов."""
+    proc = _spawn_victim(kernel)
+    Shell(kernel, root).handle_line(f"kill -{signal_spec} {proc.pid}")
+    captured = capsys.readouterr()
+    assert kernel.get_process(proc.pid) is None
+    assert captured.err == ""
+
+
+def test_kill_rejects_invalid_signal_name(kernel, root, capsys):
+    """Неизвестный сигнал — ошибка invalid signal specification."""
+    proc = _spawn_victim(kernel)
+    sh = Shell(kernel, root)
+    sh.handle_line(f"kill -BOGUS {proc.pid}")
+    captured = capsys.readouterr()
+    assert "invalid signal specification" in captured.err
+    assert sh.last_code != 0
+    assert kernel.get_process(proc.pid) is proc
+
+
+@pytest.mark.parametrize("signal_spec", ["STOP", "SIGSTOP", "CONT", "SIGCONT",
+                                         "TSTP", "SIGTSTP"])
+def test_kill_rejects_unsupported_signals(kernel, root, capsys, signal_spec):
+    """Остановка/продолжение не реализованы в симуляторе."""
+    proc = _spawn_victim(kernel)
+    sh = Shell(kernel, root)
+    sh.handle_line(f"kill -{signal_spec} {proc.pid}")
+    captured = capsys.readouterr()
+    assert "not supported" in captured.err
+    assert sh.last_code != 0
+    assert kernel.get_process(proc.pid) is proc
+
+
+def test_kill_named_signal_logs_number_in_dmesg(kernel, root, capsys):
+    """Имя сигнала разворачивается в номер в журнале ядра."""
+    proc = _spawn_victim(kernel)
+    sh = Shell(kernel, root)
+    sh.handle_line(f"kill -KILL {proc.pid}")
+    sh.handle_line("dmesg")
+    assert f"signal 9 sent to pid {proc.pid}" in capsys.readouterr().out
+
+
 # -- uptime -----------------------------------------------------------------
 
 

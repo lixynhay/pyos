@@ -3,7 +3,35 @@
 from ..errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
 from ..process import ProcessState
 from ..scheduler import TICKS_PER_SECOND
+from ..signals import signal_number
 from .registry import register
+
+
+# Сигналы, которые ядро pyOS не умеет обрабатывать: остановка/продолжение
+# процессов не реализованы, поэтому такие запросы отклоняются явно.
+_UNSUPPORTED_SIGNAL_NAMES = {"STOP", "TSTP", "CONT"}
+
+
+def _parse_kill_signal(opts):
+    """Разбирает опции kill и возвращает номер сигнала (по умолчанию 15)."""
+    signum = 15
+
+    for o in opts:
+        spec = o[1:]
+        resolved = signal_number(spec)
+
+        if resolved is None:
+            raise InvalidArgument(f"kill: {o}: invalid signal specification")
+
+        base = spec.upper().removeprefix("SIG")
+        if base in _UNSUPPORTED_SIGNAL_NAMES:
+            raise InvalidArgument(
+                f"kill: {o}: signal is not supported by pyos simulator"
+            )
+
+        signum = resolved
+
+    return signum
 
 
 def _fmt_time(ticks: int) -> str:
@@ -69,14 +97,11 @@ def cmd_top(ctx, args, stdin):
     return "\n".join(frames)
 
 
-@register("kill", usage="kill [-9] pid ...", summary="Послать сигнал процессу",
+@register("kill", usage="kill [-signal] pid ...", summary="Послать сигнал процессу",
           category="process")
 def cmd_kill(ctx, args, stdin):
     opts, pids = _split(args)
-    signum = 15
-    for o in opts:
-        if o.startswith("-") and o[1:].isdigit():
-            signum = int(o[1:])
+    signum = _parse_kill_signal(opts)
     if not pids:
         raise InvalidArgument("kill: usage: kill [-signum] pid ...")
     errs = []
