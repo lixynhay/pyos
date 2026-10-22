@@ -120,6 +120,7 @@ def _make_repo(kernel, root, name="local", packages=None, priority=100,
         filename = spec.get("filename", f"{pkgname}-{version}.pkg.json")
         data = spec.get("data") or _package_json(
             name=pkgname, version=version, release=release,
+            description=spec.get("description", "test package"),
             depends=spec.get("depends", []),
             provides=spec.get("provides", []),
             conflicts=spec.get("conflicts", []))
@@ -135,6 +136,7 @@ def _make_repo(kernel, root, name="local", packages=None, priority=100,
             name=pkgname, version=version, release=release,
             filename=filename, url="packages/" + filename,
             sha256=sha256, size=size,
+            description=spec.get("description", "test package"),
             depends=spec.get("depends", []),
             provides=spec.get("provides", []),
             conflicts=spec.get(
@@ -573,6 +575,127 @@ def test_installed_and_owners_db_untouched_by_repo_commands(kernel, root):
     assert kernel.fs.read_file(manifest_path, root, "/", "/") == manifest_before
     assert kernel.fs.read_file(owners_path, root, "/", "/") == owners_before
     assert kernel.fs.read_file("/usr/bin/demo", root, "/", "/") == "demo"
+# -- pkg search -------------------------------------------------------------
+
+
+def test_search_matches_name_substring(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["search", "ELL"], "")
+
+    assert "hello" in result
+    assert "1.0-1" in result
+
+
+def test_search_matches_description_substring_case_insensitive(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "editor", "version": "1.0",
+         "description": "Fast Text Editor"},
+        {"name": "other", "version": "1.0",
+         "description": "nothing here"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["search", "TEXT"], "")
+
+    assert "editor" in result
+    assert "Fast Text Editor" in result
+    assert "other" not in result
+
+
+def test_search_skips_repo_without_cache_with_warning(kernel, root):
+    ctx = _ctx(kernel, root)
+    cached = _make_repo(kernel, root, name="cached", packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    missing = _repo("missing", "/srv/missing/", priority=10)
+    _use_repos(kernel, root, [cached, missing])
+
+    result = cmd_pkg(ctx, ["search", "hello"], "")
+
+    assert "hello" in result
+    assert "warning" in result
+    assert "missing" in result
+    assert "run pkg repo update" in result
+
+
+def test_search_empty_query_usage_error(kernel, root):
+    ctx = _ctx(kernel, root)
+
+    with pytest.raises(InvalidArgument, match="usage"):
+        cmd_pkg(ctx, ["search"], "")
+    with pytest.raises(InvalidArgument, match="usage"):
+        cmd_pkg(ctx, ["search", "   "], "")
+
+
+def test_search_output_sorted_by_repo_name_version(kernel, root):
+    ctx = _ctx(kernel, root)
+    zrepo = _make_repo(kernel, root, name="zrepo", priority=100, packages=[
+        {"name": "tool", "version": "1.9"},
+        {"name": "tool", "version": "1.10"},
+    ])
+    arepo = _make_repo(kernel, root, name="arepo", priority=10, packages=[
+        {"name": "tool", "version": "2.0"},
+        {"name": "tool-box", "version": "9.0"},
+    ])
+    _use_repos(kernel, root, [zrepo, arepo])
+
+    result = cmd_pkg(ctx, ["search", "tool"], "")
+
+    lines = [line for line in result.splitlines() if line.strip()]
+    assert [line.split("  ")[:3] for line in lines] == [
+        ["arepo", "tool", "2.0-1"],
+        ["arepo", "tool-box", "9.0-1"],
+        ["zrepo", "tool", "1.10-1"],
+        ["zrepo", "tool", "1.9-1"],
+    ]
+
+
+def test_search_does_not_touch_installed_db(kernel, root):
+    ctx = _ctx(kernel, root)
+    kernel.fs.write_file(
+        "/root/installed-only.pkg.json",
+        json.dumps(_package_json(name="installed-only")),
+        root, "/", "/")
+    cmd_pkg(ctx, ["install", "/root/installed-only.pkg.json"], "")
+
+    manifest_path = "/var/lib/packages/installed/installed-only.json"
+    owners_path = "/var/lib/packages/file-owners.json"
+    manifest_before = kernel.fs.read_file(manifest_path, root, "/", "/")
+    owners_before = kernel.fs.read_file(owners_path, root, "/", "/")
+
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["search", "install"], "")
+    assert "installed-only" not in result
+
+    result = cmd_pkg(ctx, ["search", "hello"], "")
+    assert "hello" in result
+    assert "installed-only" not in result
+
+    assert kernel.fs.read_file(manifest_path, root, "/", "/") == manifest_before
+    assert kernel.fs.read_file(owners_path, root, "/", "/") == owners_before
+
+
+def test_search_available_to_non_root(kernel, root, user):
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(_ctx(kernel, user), ["search", "hello"], "")
+
+    assert "hello" in result
+
+
 # -- pkg install <name> из репозиториев -------------------------------------
 
 

@@ -1105,7 +1105,7 @@ def _format_pkg_info(data, installed=False):
           usage=("pkg install <name|name@repo|name[op]version|file.pkg.json> "
                  "[--dry-run] | "
                  "pkg remove <name> [--force] [--dry-run] | "
-                 "pkg list | pkg info <name> | "
+                 "pkg list | pkg info <name> | pkg search <query> | "
                  "pkg repo add|remove|list|update ..."),
           summary="Управление пакетами",
           category="system")
@@ -1120,17 +1120,19 @@ def cmd_pkg(ctx, args, stdin):
       pkg remove <pkgname>    — удалить пакет
       pkg list                — показать установленные пакеты
       pkg info <pkgname>      — информация о пакете
+      pkg search <query>      — поиск по name/description в кэшах репозиториев
       pkg repo ...            — управление репозиториями
     """
     if not args:
-        return "Usage: pkg install|remove|list|info|repo [args]"
+        return "Usage: pkg install|search|remove|list|info|repo [args]"
 
     subcmd = args[0]
     cmd_args = args[1:]
 
-    # pkg repo list доступен всем, остальные операции pkg — только root.
+    # pkg repo list и pkg search доступны всем, остальные pkg — только root.
     repo_list = subcmd == "repo" and cmd_args[:1] == ["list"]
-    if not repo_list and ctx.user.uid != 0:
+    read_only = repo_list or subcmd == "search"
+    if not read_only and ctx.user.uid != 0:
         raise PermissionDenied(message="pkg: only root can manage packages")
 
     if subcmd == "repo":
@@ -1139,6 +1141,21 @@ def cmd_pkg(ctx, args, stdin):
         from ..repo import handle_repo_command
 
         return handle_repo_command(ctx, cmd_args)
+
+    if subcmd == "search":
+        if not cmd_args:
+            raise InvalidArgument(
+                "pkg search: missing query (usage: pkg search <query>)")
+        if len(cmd_args) > 1:
+            raise InvalidArgument(
+                "pkg search: too many arguments (usage: pkg search <query>)")
+        query = cmd_args[0].strip()
+        if not query:
+            raise InvalidArgument(
+                "pkg search: empty query (usage: pkg search <query>)")
+        from ..repo import search_packages
+
+        return search_packages(ctx, query)
 
     if subcmd == "install":
         dry_run = "--dry-run" in cmd_args
@@ -1185,5 +1202,5 @@ def cmd_pkg(ctx, args, stdin):
     else:
         raise InvalidArgument(
             f"pkg: unknown subcommand '{subcmd}' "
-            "(use: install, remove, list, info, repo)"
+            "(use: install, search, remove, list, info, repo)"
         )

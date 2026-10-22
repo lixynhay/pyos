@@ -121,6 +121,8 @@ python -m pyos
 - `pkg install <path.pkg.json>` — установка локального пакета из виртуальной
   ФС;
 - `pkg remove <name> [--force]`, `pkg list`, `pkg info <name>`;
+- `pkg search <query>` — регистронезависимый поиск по `name`/`description`
+  в кэшированных индексах enabled-репозиториев (read-only, доступен всем);
 - `--dry-run` для `pkg install` и `pkg remove` показывает план без изменений
   ФС;
 - установленные пакеты хранятся в `/var/lib/packages/installed/<name>.json`,
@@ -232,6 +234,19 @@ python -m pyos
 - кэш (`/var/cache/repos/<name>/index.json` и `index.meta.json` с `fetched_at`,
   `source_url`, `type`, `index_sha256`, `package_count`) обновляется только
   после успешной валидации; при ошибке старый кэш не трогается.
+
+Поиск по репозиториям:
+
+- `pkg search <query>` — регистронезависимый substring-match по `name` и
+  `description` в кэшированных индексах enabled-репозиториев; сеть не
+  используется, команда доступна всем;
+- вывод: `repo  name  version-release  arch  description`, по одной строке
+  на совпадение; сортировка по repo, затем name, затем версия по
+  `pkgvercmp` (по убыванию);
+- репозиторий без кэша индекса пропускается с warning
+  `run pkg repo update`; остальные репозитории продолжают искаться;
+- installed DB не читается и не меняется: установленные пакеты смотрите
+  через `pkg list`.
 
 Установка по имени:
 

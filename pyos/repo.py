@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
+from functools import cmp_to_key
 
 from .commands import network_cmds
 from .errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
@@ -615,6 +616,69 @@ def read_cached_index(fs, user, repo):
         raise InvalidArgument(
             f"repo: cannot read cached index '{path}': {exc}")
     return _parse_index(text, path, repo)
+
+
+def search_packages(ctx, query):
+    """Ищет подстроку в name/description кэшированных индексов.
+
+    Read-only: сеть не используется, installed DB не читается. Репозитории
+    без кэша пропускаются с warning, поиск продолжается по остальным.
+    """
+    from .commands.package_cmds import pkgvercmp
+
+    config = read_repos(ctx.fs, ctx.user)
+    repos = [repo for repo in config["repos"] if repo["enabled"]]
+    if not repos:
+        return "pkg: no enabled repositories"
+
+    needle = query.casefold()
+    hits = []
+    warnings = []
+
+    for repo in sorted(repos, key=lambda item: item["name"]):
+        try:
+            index = read_cached_index(ctx.fs, ctx.user, repo)
+        except InvalidArgument as exc:
+            message = _clean_error(exc)
+            if "run pkg repo update" not in message:
+                message += " (run pkg repo update)"
+            warnings.append(
+                f"pkg: warning: skipping repo '{repo['name']}': {message}")
+            continue
+
+        for package in index["packages"]:
+            if (needle in package["name"].casefold()
+                    or needle in package["description"].casefold()):
+                hits.append((repo["name"], package))
+
+    def compare(left, right):
+        left_repo, left_pkg = left
+        right_repo, right_pkg = right
+        if left_repo != right_repo:
+            return (left_repo > right_repo) - (left_repo < right_repo)
+        if left_pkg["name"] != right_pkg["name"]:
+            return ((left_pkg["name"] > right_pkg["name"])
+                    - (left_pkg["name"] < right_pkg["name"]))
+        return -pkgvercmp(
+            _package_full_version(left_pkg),
+            _package_full_version(right_pkg))
+
+    hits.sort(key=cmp_to_key(compare))
+
+    lines = list(warnings)
+    for repo_name, package in hits:
+        description = package["description"].replace("\n", " ")
+        lines.append("  ".join([
+            repo_name,
+            package["name"],
+            _package_full_version(package),
+            package["arch"],
+            description,
+        ]))
+
+    if not lines:
+        return f"pkg: no matches for '{query}'"
+    return "\n".join(lines)
 
 
 def _enabled_repos(config):
