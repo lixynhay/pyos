@@ -1161,3 +1161,520 @@ def test_install_by_path_still_works(kernel, root):
     assert "installed 'manual'" in result
     assert _manifest(kernel, root, "manual") is not None
     assert kernel.fs.read_file("/usr/bin/manual", root, "/", "/") == "manual"
+
+
+# -- pkg upgrade ------------------------------------------------------------
+
+
+def _file(path, content):
+    return {
+        "path": path,
+        "mode": "0644",
+        "owner": "root",
+        "group": "root",
+        "encoding": "utf-8",
+        "content": content,
+    }
+
+
+def _upgrade_spec(name, version, release=1, depends=None, files=None):
+    data = _package_json(
+        name=name, version=version, release=release,
+        depends=list(depends or []))
+    if files is not None:
+        data["files"] = files
+    return {
+        "name": name,
+        "version": version,
+        "release": release,
+        "depends": list(depends or []),
+        "data": data,
+    }
+
+
+def _install_old(kernel, root, packages, repo_name="local", priority=100):
+    repo = _make_repo(kernel, root, name=repo_name, priority=priority,
+                      packages=packages)
+    _use_repos(kernel, root, [repo])
+    ctx = _ctx(kernel, root)
+    for spec in packages:
+        cmd_pkg(ctx, ["install", spec["name"]], "")
+    return ctx
+
+
+def _switch_repo(kernel, root, packages, repo_name="local", priority=100):
+    repo = _make_repo(kernel, root, name=repo_name, priority=priority,
+                      packages=packages)
+    _use_repos(kernel, root, [repo])
+    return repo
+
+
+def _owners(kernel, root):
+    return json.loads(kernel.fs.read_file(
+        "/var/lib/packages/file-owners.json", root, "/", "/"))
+
+
+def test_upgrade_no_op_when_installed_is_latest(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0"),
+    ])
+    _switch_repo(kernel, root, [_upgrade_spec("hello", "1.0")])
+
+    result = cmd_pkg(ctx, ["upgrade"], "")
+
+    assert "nothing to do" in result
+    assert _manifest(kernel, root, "hello")["version"] == "1.0"
+
+
+def test_upgrade_single_package_updates_files_and_db(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0", files=[
+            _file("/usr/bin/hello", "old")]),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("hello", "2.0", files=[
+            _file("/usr/bin/hello", "new")]),
+    ])
+
+    result = cmd_pkg(ctx, ["upgrade"], "")
+
+    assert "upgrading hello 1.0-1 -> 2.0-1" in result
+    assert result.rstrip().endswith("done")
+    assert _manifest(kernel, root, "hello")["version"] == "2.0"
+    assert kernel.fs.read_file("/usr/bin/hello", root, "/", "/") == "new"
+    assert _owners(kernel, root)["/usr/bin/hello"] == "hello"
+
+
+def test_upgrade_dry_run_does_not_write(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0", files=[
+            _file("/usr/bin/hello", "old")]),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("hello", "2.0", files=[
+            _file("/usr/bin/hello", "new")]),
+    ])
+
+    result = cmd_pkg(ctx, ["upgrade", "--dry-run"], "")
+
+    assert "upgrade hello 1.0-1 -> 2.0-1 (local)" in result
+    assert _manifest(kernel, root, "hello")["version"] == "1.0"
+    assert kernel.fs.read_file("/usr/bin/hello", root, "/", "/") == "old"
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup(
+            _package_cache("local", "hello", "2.0"), root, "/", "/")
+
+
+def test_upgrade_only_root(kernel, root, user):
+    _install_old(kernel, root, [_upgrade_spec("hello", "1.0")])
+    _switch_repo(kernel, root, [_upgrade_spec("hello", "2.0")])
+
+    with pytest.raises(PermissionDenied):
+        cmd_pkg(_ctx(kernel, user), ["upgrade"], "")
+
+
+def test_upgrade_requires_repo_index_cache(kernel, root):
+    ctx = _install_old(kernel, root, [_upgrade_spec("hello", "1.0")])
+    kernel.fs.unlink("/var/cache/repos/local/index.json", root, "/", "/")
+
+    with pytest.raises(InvalidArgument, match="pkg repo update first"):
+        cmd_pkg(ctx, ["upgrade"], "")
+
+
+def test_upgrade_output_contains_upgrade_arrow(kernel, root):
+    ctx = _install_old(kernel, root, [_upgrade_spec("hello", "1.0")])
+    _switch_repo(kernel, root, [_upgrade_spec("hello", "2.0")])
+
+    result = cmd_pkg(ctx, ["upgrade", "--dry-run"], "")
+
+    assert "1.0-1 -> 2.0-1" in result
+
+
+def test_upgrade_installs_new_dependency(kernel, root):
+    ctx = _install_old(kernel, root, [_upgrade_spec("app", "1.0")])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("app", "2.0", depends=["lib>=1.0"]),
+    ])
+
+    result = cmd_pkg(ctx, ["upgrade"], "")
+
+    assert "installing lib 1.0-1" in result
+    assert _manifest(kernel, root, "lib") is not None
+    assert _manifest(kernel, root, "app")["version"] == "2.0"
+
+
+def test_upgrade_upgrades_dependency_if_required(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("app", "1.0"),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("lib", "2.0"),
+        _upgrade_spec("app", "2.0", depends=["lib>=2.0"]),
+    ])
+
+    cmd_pkg(ctx, ["upgrade"], "")
+
+    assert _manifest(kernel, root, "lib")["version"] == "2.0"
+    assert _manifest(kernel, root, "app")["version"] == "2.0"
+
+
+def test_upgrade_does_not_reinstall_satisfied_dependency(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("app", "1.0"),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("lib", "2.0"),
+        _upgrade_spec("app", "2.0", depends=["lib>=1.0"]),
+    ])
+
+    cmd_pkg(ctx, ["upgrade", "app"], "")
+
+    assert _manifest(kernel, root, "lib")["version"] == "1.0"
+    assert _manifest(kernel, root, "app")["version"] == "2.0"
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup(
+            _package_cache("local", "lib", "2.0"), root, "/", "/")
+
+
+def test_upgrade_refuses_downgrade_dependency(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "2.0"),
+        _upgrade_spec("app", "1.0"),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("app", "2.0", depends=["lib=1.0"]),
+    ])
+
+    with pytest.raises(InvalidArgument, match="downgrade refused") as exc:
+        cmd_pkg(ctx, ["upgrade", "app"], "")
+
+    assert "lib" in str(exc.value)
+    assert _manifest(kernel, root, "app")["version"] == "1.0"
+    assert _manifest(kernel, root, "lib")["version"] == "2.0"
+
+
+def test_upgrade_dependency_cycle_errors(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("app", "1.0"),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("lib", "2.0", depends=["app"]),
+        _upgrade_spec("app", "2.0", depends=["lib"]),
+    ])
+
+    with pytest.raises(InvalidArgument, match="dependency cycle"):
+        cmd_pkg(ctx, ["upgrade"], "")
+
+    assert _manifest(kernel, root, "app")["version"] == "1.0"
+    assert _manifest(kernel, root, "lib")["version"] == "1.0"
+
+
+def test_upgrade_bulk_holds_back_breaking_reverse_dependency(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("gvim", "1.0", depends=["lib=1.0"]),
+    ])
+    _switch_repo(kernel, root, [_upgrade_spec("lib", "2.0")])
+
+    result = cmd_pkg(ctx, ["upgrade"], "")
+
+    assert "held back:" in result
+    assert "gvim requires lib=1.0" in result
+    assert _manifest(kernel, root, "lib")["version"] == "1.0"
+
+
+def test_upgrade_named_breaking_reverse_dependency_errors(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("gvim", "1.0", depends=["lib=1.0"]),
+    ])
+    _switch_repo(kernel, root, [_upgrade_spec("lib", "2.0")])
+
+    with pytest.raises(InvalidArgument, match="reverse dependency"):
+        cmd_pkg(ctx, ["upgrade", "lib"], "")
+
+    assert _manifest(kernel, root, "lib")["version"] == "1.0"
+
+
+def test_upgrade_force_allows_breaking_reverse_dependency_with_warning(
+        kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("gvim", "1.0", depends=["lib=1.0"]),
+    ])
+    _switch_repo(kernel, root, [_upgrade_spec("lib", "2.0")])
+
+    result = cmd_pkg(ctx, ["upgrade", "lib", "--force"], "")
+
+    assert "warnings:" in result
+    assert "reverse dependency" in result
+    assert _manifest(kernel, root, "lib")["version"] == "2.0"
+
+
+def test_upgrade_reverse_dependency_satisfied_if_dependent_also_upgraded(
+        kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("app", "1.0", depends=["lib=1.0"]),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("lib", "2.0"),
+        _upgrade_spec("app", "2.0", depends=["lib>=2.0"]),
+    ])
+
+    result = cmd_pkg(ctx, ["upgrade"], "")
+
+    assert "held back" not in result
+    assert _manifest(kernel, root, "lib")["version"] == "2.0"
+    assert _manifest(kernel, root, "app")["version"] == "2.0"
+
+
+def test_upgrade_prunes_old_owned_files_not_in_new_package(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0", files=[
+            _file("/usr/bin/hello", "old"),
+            _file("/usr/share/hello-old", "remove"),
+        ]),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("hello", "2.0", files=[
+            _file("/usr/bin/hello", "new")]),
+    ])
+
+    result = cmd_pkg(ctx, ["upgrade"], "")
+
+    assert "pruning 1 old file owned by hello" in result
+    assert kernel.fs.read_file("/usr/bin/hello", root, "/", "/") == "new"
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/usr/share/hello-old", root, "/", "/")
+    assert "/usr/share/hello-old" not in _owners(kernel, root)
+
+
+def test_upgrade_does_not_remove_files_owned_by_other_package(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0", files=[
+            _file("/usr/bin/hello", "old"),
+            _file("/usr/share/shared", "shared"),
+        ]),
+    ])
+    owners = _owners(kernel, root)
+    owners["/usr/share/shared"] = "other"
+    kernel.fs.write_file(
+        "/var/lib/packages/file-owners.json", json.dumps(owners), root, "/", "/")
+    _switch_repo(kernel, root, [
+        _upgrade_spec("hello", "2.0", files=[
+            _file("/usr/bin/hello", "new")]),
+    ])
+
+    cmd_pkg(ctx, ["upgrade"], "")
+
+    assert kernel.fs.read_file("/usr/share/shared", root, "/", "/") == "shared"
+    assert _owners(kernel, root)["/usr/share/shared"] == "other"
+
+
+def test_upgrade_prechecks_file_conflict_before_apply(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0", files=[
+            _file("/usr/bin/hello", "old")]),
+        _upgrade_spec("other", "1.0", files=[
+            _file("/usr/share/shared", "other")]),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("hello", "2.0", files=[
+            _file("/usr/bin/hello", "new"),
+            _file("/usr/share/shared", "hijack"),
+        ]),
+    ])
+
+    with pytest.raises(InvalidArgument, match="file conflict") as exc:
+        cmd_pkg(ctx, ["upgrade"], "")
+
+    assert "other" in str(exc.value)
+    assert _manifest(kernel, root, "hello")["version"] == "1.0"
+    assert kernel.fs.read_file("/usr/share/shared", root, "/", "/") == "other"
+
+
+def test_upgrade_same_package_can_replace_own_files(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0", files=[
+            _file("/usr/bin/hello", "old")]),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("hello", "2.0", files=[
+            _file("/usr/bin/hello", "new")]),
+    ])
+
+    cmd_pkg(ctx, ["upgrade"], "")
+
+    assert kernel.fs.read_file("/usr/bin/hello", root, "/", "/") == "new"
+    assert _owners(kernel, root)["/usr/bin/hello"] == "hello"
+
+
+def test_upgrade_updates_file_owners_db(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0", files=[
+            _file("/usr/bin/hello-old", "old")]),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("hello", "2.0", files=[
+            _file("/usr/bin/hello-new", "new")]),
+    ])
+
+    cmd_pkg(ctx, ["upgrade"], "")
+
+    owners = _owners(kernel, root)
+    assert owners["/usr/bin/hello-new"] == "hello"
+    assert "/usr/bin/hello-old" not in owners
+    assert _manifest(kernel, root, "hello")["files"] == ["/usr/bin/hello-new"]
+
+
+def test_upgrade_downloads_and_verifies_sha256_for_all_candidates_before_apply(
+        kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("app", "1.0"),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("lib", "2.0"),
+        _upgrade_spec("app", "2.0", depends=["lib>=2.0"]),
+    ])
+
+    result = cmd_pkg(ctx, ["upgrade"], "")
+
+    verify_lib = result.index("verifying sha256 lib-2.0.pkg.json")
+    verify_app = result.index("verifying sha256 app-2.0.pkg.json")
+    upgrade_lib = result.index("upgrading lib")
+    upgrade_app = result.index("upgrading app")
+    assert verify_lib < upgrade_lib
+    assert verify_app < upgrade_lib
+    assert upgrade_lib < upgrade_app
+
+
+def test_upgrade_sha256_mismatch_aborts_before_apply(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0", files=[
+            _file("/usr/bin/hello", "old")]),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("hello", "2.0", files=[
+            _file("/usr/bin/hello", "new")]),
+    ])
+    index_path = "/var/cache/repos/local/index.json"
+    index = json.loads(kernel.fs.read_file(index_path, root, "/", "/"))
+    index["packages"][0]["sha256"] = "b" * 64
+    kernel.fs.write_file(
+        index_path, json.dumps(index), root, "/", "/")
+
+    with pytest.raises(PyOSError, match="sha256 mismatch"):
+        cmd_pkg(ctx, ["upgrade"], "")
+
+    assert _manifest(kernel, root, "hello")["version"] == "1.0"
+    assert kernel.fs.read_file("/usr/bin/hello", root, "/", "/") == "old"
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup(
+            _package_cache("local", "hello", "2.0"), root, "/", "/")
+
+
+def test_upgrade_reuses_cached_package_when_sha_matches(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0", files=[
+            _file("/usr/bin/hello", "old")]),
+    ])
+    data = _package_json(name="hello", version="2.0", files=[
+        _file("/usr/bin/hello", "new")])
+    _switch_repo(kernel, root, [{
+        "name": "hello",
+        "version": "2.0",
+        "data": data,
+        "skip_source": True,
+    }])
+    _ensure(kernel, root, "/var/cache/packages/local")
+    kernel.fs.write_file(
+        _package_cache("local", "hello", "2.0"),
+        json.dumps(data), root, "/", "/")
+
+    result = cmd_pkg(ctx, ["upgrade"], "")
+
+    assert "(cached)" in result
+    assert _manifest(kernel, root, "hello")["version"] == "2.0"
+
+
+def test_upgrade_size_limit_exceeded_aborts(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("hello", "1.0", files=[
+            _file("/usr/bin/hello", "old")]),
+    ])
+    data = _package_json(name="hello", version="2.0", files=[
+        _file("/usr/bin/hello", "new")])
+    raw = json.dumps(data)
+    _switch_repo(kernel, root, [{
+        "name": "hello",
+        "version": "2.0",
+        "data": data,
+        "size": len(raw.encode("utf-8")) - 1,
+    }])
+
+    with pytest.raises(PyOSError, match="size"):
+        cmd_pkg(ctx, ["upgrade"], "")
+
+    assert _manifest(kernel, root, "hello")["version"] == "1.0"
+    assert kernel.fs.read_file("/usr/bin/hello", root, "/", "/") == "old"
+
+
+def test_upgrade_applies_dependencies_before_dependents(kernel, root):
+    from pyos.commands import package_cmds
+
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("app", "1.0"),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("lib", "2.0"),
+        _upgrade_spec("app", "2.0", depends=["lib>=2.0"]),
+    ])
+
+    calls = []
+    original = package_cmds._apply_upgrade_package
+
+    def spy(apply_ctx, entry, package, targets):
+        calls.append(package["name"])
+        return original(apply_ctx, entry, package, targets)
+
+    with mock.patch.object(
+            package_cmds, "_apply_upgrade_package", side_effect=spy):
+        cmd_pkg(ctx, ["upgrade"], "")
+
+    assert calls == ["lib", "app"]
+
+
+def test_upgrade_topological_order_with_chain(kernel, root):
+    from pyos.commands import package_cmds
+
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("c", "1.0"),
+        _upgrade_spec("b", "1.0"),
+        _upgrade_spec("a", "1.0"),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("c", "2.0"),
+        _upgrade_spec("b", "2.0", depends=["c>=2.0"]),
+        _upgrade_spec("a", "2.0", depends=["b>=2.0"]),
+    ])
+
+    calls = []
+    original = package_cmds._apply_upgrade_package
+
+    def spy(apply_ctx, entry, package, targets):
+        calls.append(package["name"])
+        return original(apply_ctx, entry, package, targets)
+
+    with mock.patch.object(
+            package_cmds, "_apply_upgrade_package", side_effect=spy):
+        cmd_pkg(ctx, ["upgrade"], "")
+
+    assert calls == ["c", "b", "a"]

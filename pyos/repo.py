@@ -751,6 +751,43 @@ def _select_package(indexes, name, op, version, repo_filter, required_by,
     return top[0]
 
 
+def find_upgrade_candidate(indexes, name, pkgvercmp):
+    """Выбирает лучший кандидат для upgrade с учётом priority.
+
+    Возвращает ``(repo, package)`` или ``None``. Если лучший NVR доступен
+    в нескольких репозиториях с одинаковым максимальным priority — ошибка
+    ambiguity.
+    """
+    by_repo = []
+    for repo, index in indexes:
+        candidates = [package for package in index["packages"]
+                      if package["name"] == name]
+        if candidates:
+            by_repo.append((repo, candidates))
+
+    if not by_repo:
+        return None
+
+    top_priority = max(repo["priority"] for repo, _ in by_repo)
+    top = [(repo, package)
+           for repo, candidates in by_repo
+           if repo["priority"] == top_priority
+           for package in candidates]
+    best = _max_package([package for _, package in top], pkgvercmp)
+    best_full = _package_full_version(best)
+    same = [(repo, package) for repo, package in top
+            if _package_full_version(package) == best_full]
+    repo_names = {repo["name"] for repo, _ in same}
+    if len(repo_names) > 1:
+        details = ", ".join(
+            f"{repo['name']} ({_package_full_version(package)})"
+            for repo, package in same)
+        raise InvalidArgument(
+            f"pkg: ambiguous package '{name}' at priority "
+            f"{top_priority}: {details}")
+    return same[0]
+
+
 class _DependencyResolver:
     """Жадный DFS-резолвер с post-order планом установки."""
 
@@ -911,10 +948,17 @@ def _remove_cached_file(ctx, path):
         pass
 
 
-def _cache_package(ctx, repo, package):
-    """Скачивает/переиспользует пакет в кэше и проверяет sha256/size."""
+def _cache_package(ctx, repo, package, with_status=False):
+    """Скачивает/переиспользует пакет в кэше и проверяет sha256/size.
+
+    При ``with_status=True`` возвращает ``(cache_path, reused)``, где reused
+    означает, что подходящий файл уже был в кэше.
+    """
     cache_path = _package_cache_path(repo, package)
     expected_sha = str(package["sha256"]).lower()
+    # URL проверяем всегда, даже если файл уже лежит в кэше: индекс с
+    # path traversal не должен приниматься только из-за совпадения sha.
+    url = _safe_package_url(repo, package)
 
     try:
         cached = ctx.fs.read_file(cache_path, ctx.user, "/", "/")
@@ -927,9 +971,15 @@ def _cache_package(ctx, repo, package):
     if (cached is not None
             and hashlib.sha256(cached.encode("utf-8")).hexdigest().lower()
             == expected_sha):
-        return cache_path
+        size = package.get("size")
+        cached_size = len(cached.encode("utf-8"))
+        if size is not None and cached_size > size:
+            _remove_cached_file(ctx, cache_path)
+            raise PyOSError(
+                f"pkg: package '{package['name']}' exceeds declared size "
+                f"({cached_size} > {size})")
+        return (cache_path, True) if with_status else cache_path
 
-    url = _safe_package_url(repo, package)
     text = _fetch_package_text(ctx, repo, package, url)
 
     _ensure_dir(ctx.fs, f"{PACKAGE_CACHE_ROOT}/{repo['name']}", ctx.user)
@@ -950,7 +1000,7 @@ def _cache_package(ctx, repo, package):
             f"pkg: package '{package['name']}' exceeds declared size "
             f"({actual_size} > {size})")
 
-    return cache_path
+    return (cache_path, False) if with_status else cache_path
 
 
 def install_package_by_name(ctx, target, *, dry_run=False, installer,

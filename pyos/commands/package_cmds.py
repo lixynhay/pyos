@@ -964,6 +964,669 @@ def _install_package_file(ctx, path, dry_run=False):
     return f"pkg: installed '{name}' (version {version}-{release})"
 
 
+# -- pkg upgrade ------------------------------------------------------------
+
+_UPGRADE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._-]*$")
+
+
+def _manifest_identity(manifest):
+    """Возвращает ``(version, release)`` из нового или старого manifest."""
+    version = manifest.get("version")
+    release = manifest.get("release")
+
+    if version is None:
+        raw = str(manifest.get("pkgver") or "0")
+        if release is None and "-" in raw:
+            version, release = raw.rsplit("-", 1)
+        else:
+            version = raw
+
+    if release is None:
+        release = manifest.get("pkgrel", 1)
+    if release is None or release == "":
+        release = 1
+
+    return str(version), str(release)
+
+
+def _recover_depends_from_indexes(indexes, name, version, release):
+    """Пытается восстановить depends установленной версии из индексов."""
+    for _repo, index in indexes:
+        for package in index["packages"]:
+            if (package["name"] == name
+                    and str(package["version"]) == version
+                    and str(package["release"]) == release):
+                return list(package.get("depends", []) or [])
+    return []
+
+
+def _installed_upgrade_states(ctx, indexes):
+    """Читает installed DB и восстанавливает files/depends, если нужно."""
+    owners = _read_owners(ctx.fs, ctx.user)
+    states = {}
+
+    for name in _get_installed_packages(ctx.fs, ctx.user):
+        manifest = _read_manifest(ctx.fs, ctx.user, name)
+        if manifest is None:
+            continue
+
+        version, release = _manifest_identity(manifest)
+
+        raw_files = manifest.get("files")
+        if isinstance(raw_files, list):
+            files = _manifest_paths(manifest)
+        else:
+            files = sorted(path for path, owner in owners.items()
+                           if owner == name)
+
+        raw_depends = manifest.get("depends")
+        if isinstance(raw_depends, list):
+            depends = [dep for dep in raw_depends if isinstance(dep, str)]
+        else:
+            depends = _recover_depends_from_indexes(
+                indexes, name, version, release)
+
+        states[name] = {
+            "name": name,
+            "version": version,
+            "release": release,
+            "full": f"{version}-{release}",
+            "files": files,
+            "depends": depends,
+            "manifest": manifest,
+        }
+
+    return states
+
+
+def _state_matches(state, op, version, pkgvercmp):
+    """Проверяет version-spec для установленного состояния."""
+    if op is None:
+        return True
+    from ..repo import _version_matches
+
+    installed = {"version": state["version"], "release": state["release"]}
+    return _version_matches(installed, op, version, pkgvercmp)
+
+
+def _upgrade_plan_entry(action, repo, package, old=None, required_by=None):
+    """Создаёт запись плана upgrade/install."""
+    return {
+        "action": action,
+        "repo": repo,
+        "package": package,
+        "old": old,
+        "required_by": required_by,
+    }
+
+
+def _plan_upgrade(ctx, names, force):
+    """Строит план upgrade и применяет ограничения обратных зависимостей.
+
+    Возвращает ``(entries, held, warnings, planned)``. В ``entries`` только
+    пакеты, которые будут применены, в топологическом порядке.
+    """
+    from ..repo import (
+        _enabled_repos,
+        _package_full_version,
+        _select_package,
+        _version_matches,
+        find_upgrade_candidate,
+        parse_dependency,
+        read_cached_index,
+        read_repos,
+    )
+
+    config = read_repos(ctx.fs, ctx.user)
+    repos = _enabled_repos(config)
+    indexes = [(repo, read_cached_index(ctx.fs, ctx.user, repo))
+               for repo in repos]
+    states = _installed_upgrade_states(ctx, indexes)
+
+    requested = list(dict.fromkeys(names)) if names else None
+    if requested is not None:
+        missing = [name for name in requested if name not in states]
+        if missing:
+            raise InvalidArgument(
+                f"pkg upgrade: package '{missing[0]}' is not installed")
+        candidate_names = requested
+    else:
+        candidate_names = sorted(states)
+
+    # Сначала выбираем корневые upgrade-кандидаты, чтобы зависимости не
+    # понижали версию пакета, который пользователь тоже просил обновить.
+    roots = {}
+    for name in candidate_names:
+        state = states[name]
+        candidate = find_upgrade_candidate(indexes, name, pkgvercmp)
+        if candidate is None:
+            continue
+        repo, package = candidate
+        if pkgvercmp(_package_full_version(package), state["full"]) <= 0:
+            continue
+        roots[name] = _upgrade_plan_entry(
+            "upgrade", repo, package, old=state)
+
+    planned = dict(roots)
+    order = []
+    resolved = set()
+    stack = []
+
+    def add_dependency(raw, required_by):
+        dep = parse_dependency(raw)
+        dep_name = dep["name"]
+
+        existing = planned.get(dep_name)
+        if existing is not None:
+            if _version_matches(existing["package"], dep["op"],
+                                dep["version"], pkgvercmp):
+                return dep
+            raise InvalidArgument(
+                f"pkg upgrade: dependency '{raw}' required by "
+                f"'{required_by}' conflicts with planned '{dep_name}' "
+                f"{_package_full_version(existing['package'])}")
+
+        state = states.get(dep_name)
+        if state is not None:
+            if _state_matches(state, dep["op"], dep["version"], pkgvercmp):
+                return dep
+
+            repo, package = _select_package(
+                indexes, dep_name, dep["op"], dep["version"], None,
+                required_by, pkgvercmp)
+            comparison = pkgvercmp(
+                _package_full_version(package), state["full"])
+            if comparison < 0:
+                raise InvalidArgument(
+                    f"pkg upgrade: downgrade refused for dependency "
+                    f"'{dep_name}': installed {state['full']}, candidate "
+                    f"{_package_full_version(package)} "
+                    f"(required by '{required_by}')")
+            if comparison == 0:
+                raise InvalidArgument(
+                    f"pkg upgrade: dependency '{raw}' required by "
+                    f"'{required_by}' is not satisfied by installed "
+                    f"version {state['full']}")
+
+            planned[dep_name] = _upgrade_plan_entry(
+                "upgrade", repo, package, old=state,
+                required_by=required_by)
+            return dep
+
+        repo, package = _select_package(
+            indexes, dep_name, dep["op"], dep["version"], None,
+            required_by, pkgvercmp)
+        planned[dep_name] = _upgrade_plan_entry(
+            "install", repo, package, required_by=required_by)
+        return dep
+
+    def resolve(name):
+        if name in resolved:
+            return
+        if name in stack:
+            start = stack.index(name)
+            chain = stack[start:] + [name]
+            raise InvalidArgument(
+                f"pkg upgrade: dependency cycle: {' -> '.join(chain)}")
+
+        entry = planned[name]
+        stack.append(name)
+        try:
+            for raw in entry["package"].get("depends", []) or []:
+                dep = add_dependency(raw, name)
+                if dep["name"] in planned:
+                    resolve(dep["name"])
+        finally:
+            stack.pop()
+
+        resolved.add(name)
+        order.append(name)
+
+    for name in roots:
+        resolve(name)
+
+    active = set(planned)
+    held = {}
+    warnings = []
+
+    def effective_depends(dependent):
+        if dependent in active:
+            return list(
+                planned[dependent]["package"].get("depends", []) or [])
+        state = states.get(dependent)
+        return list(state["depends"]) if state is not None else []
+
+    def reverse_break(name):
+        entry = planned[name]
+        if entry["action"] != "upgrade":
+            return None
+        package = entry["package"]
+
+        for dependent in sorted(states):
+            if dependent == name:
+                continue
+            for raw in effective_depends(dependent):
+                try:
+                    dep = parse_dependency(raw)
+                except InvalidArgument:
+                    continue
+                if dep["name"] != name:
+                    continue
+                if not _version_matches(
+                        package, dep["op"], dep["version"], pkgvercmp):
+                    return (f"would break reverse dependency: "
+                            f"{dependent} requires {raw}")
+        return None
+
+    def dependency_problem(name):
+        entry = planned[name]
+        for raw in entry["package"].get("depends", []) or []:
+            dep = parse_dependency(raw)
+            dep_name = dep["name"]
+
+            if dep_name in active:
+                planned_dep = planned[dep_name]["package"]
+                if not _version_matches(
+                        planned_dep, dep["op"], dep["version"], pkgvercmp):
+                    return (f"dependency '{raw}' is not satisfied by "
+                            f"planned '{dep_name}' "
+                            f"{_package_full_version(planned_dep)}")
+                continue
+
+            state = states.get(dep_name)
+            if state is not None:
+                if _state_matches(
+                        state, dep["op"], dep["version"], pkgvercmp):
+                    continue
+                return (f"dependency '{raw}' is not installed or does "
+                        f"not satisfy the requirement")
+
+            return f"dependency '{raw}' is not installed"
+        return None
+
+    warned = set()
+    while True:
+        changed = False
+
+        if force:
+            for name in order:
+                if name not in active:
+                    continue
+                if planned[name]["action"] != "upgrade":
+                    continue
+                reason = reverse_break(name)
+                if reason is not None and name not in warned:
+                    entry = planned[name]
+                    warnings.append(
+                        f"upgrade {name} {entry['old']['full']} -> "
+                        f"{_package_full_version(entry['package'])}: "
+                        f"{reason}")
+                    warned.add(name)
+        else:
+            for name in list(order):
+                if name not in active:
+                    continue
+                if planned[name]["action"] != "upgrade":
+                    continue
+                reason = reverse_break(name)
+                if reason is None:
+                    continue
+                if requested is not None:
+                    entry = planned[name]
+                    raise InvalidArgument(
+                        f"pkg upgrade: upgrade '{name}' "
+                        f"{entry['old']['full']} -> "
+                        f"{_package_full_version(entry['package'])} "
+                        f"refused: {reason}")
+                held[name] = reason
+                active.remove(name)
+                changed = True
+
+        for name in list(order):
+            if name not in active:
+                continue
+            reason = dependency_problem(name)
+            if reason is None:
+                continue
+
+            entry = planned[name]
+            old_text = (entry["old"]["full"] if entry["old"] is not None
+                        else "not installed")
+            new_text = _package_full_version(entry["package"])
+
+            if force:
+                raise InvalidArgument(
+                    f"pkg upgrade: '{name}' {old_text} -> {new_text} "
+                    f"cannot be applied: {reason}")
+            if requested is not None:
+                raise InvalidArgument(
+                    f"pkg upgrade: upgrade '{name}' {old_text} -> "
+                    f"{new_text} cannot be applied: {reason}")
+
+            held[name] = reason
+            active.remove(name)
+            changed = True
+
+        if not changed:
+            break
+
+    # Убираем из плана пакеты, которые больше не нужны после held back.
+    wanted = set()
+
+    def mark_needed(name):
+        if name in wanted or name not in active:
+            return
+        wanted.add(name)
+        for raw in planned[name]["package"].get("depends", []) or []:
+            dep = parse_dependency(raw)
+            if dep["name"] in active:
+                mark_needed(dep["name"])
+
+    for name in roots:
+        if name in active:
+            mark_needed(name)
+
+    entries = [planned[name] for name in order if name in wanted]
+    return entries, held, warnings, planned
+
+
+def _format_upgrade_plan(entries, held, warnings, planned):
+    """Форматирует dry-run план upgrade."""
+    lines = ["plan:"]
+    if not entries:
+        lines.append("  (no changes)")
+    for entry in entries:
+        package = entry["package"]
+        name = package["name"]
+        full = f"{package['version']}-{package['release']}"
+        if entry["action"] == "upgrade":
+            lines.append(
+                f"  upgrade {name} {entry['old']['full']} -> {full} "
+                f"({entry['repo']['name']})")
+        else:
+            parent = entry["required_by"]
+            suffix = (f"dependency of {parent}" if parent is not None
+                      else entry["repo"]["name"])
+            lines.append(f"  install {name} {full} ({suffix})")
+
+    lines.append("held back:")
+    if not held:
+        lines.append("  (none)")
+    else:
+        for name in sorted(held):
+            entry = planned[name]
+            package = entry["package"]
+            full = f"{package['version']}-{package['release']}"
+            if entry["action"] == "upgrade":
+                lines.append(
+                    f"  {name} {entry['old']['full']} -> {full} "
+                    f"({held[name]})")
+            else:
+                lines.append(f"  install {name} {full} ({held[name]})")
+
+    lines.append("warnings:")
+    if not warnings:
+        lines.append("  none")
+    else:
+        lines.extend(f"  {warning}" for warning in warnings)
+
+    if not entries and not held:
+        lines.append("pkg: nothing to do")
+    return "\n".join(lines)
+
+
+def _upgrade_notice_lines(held, warnings, planned):
+    """Секции held back/warnings для реального применения."""
+    lines = []
+    if held:
+        lines.append("held back:")
+        for name in sorted(held):
+            entry = planned[name]
+            package = entry["package"]
+            full = f"{package['version']}-{package['release']}"
+            if entry["action"] == "upgrade":
+                lines.append(
+                    f"  {name} {entry['old']['full']} -> {full} "
+                    f"({held[name]})")
+            else:
+                lines.append(f"  install {name} {full} ({held[name]})")
+    if warnings:
+        lines.append("warnings:")
+        lines.extend(f"  {warning}" for warning in warnings)
+    return lines
+
+
+def _validate_upgrade_package(entry, package):
+    """Проверяет, что скачанный .pkg.json соответствует записи индекса."""
+    index_package = entry["package"]
+    name = entry["package"]["name"]
+    if package["name"] != name:
+        raise InvalidArgument(
+            f"pkg upgrade: downloaded package name '{package['name']}' "
+            f"does not match index name '{name}'")
+    if str(package["version"]) != str(index_package["version"]):
+        raise InvalidArgument(
+            f"pkg upgrade: '{name}' downloaded version "
+            f"{package['version']} does not match index "
+            f"{index_package['version']}")
+    if str(package["release"]) != str(index_package["release"]):
+        raise InvalidArgument(
+            f"pkg upgrade: '{name}' downloaded release "
+            f"{package['release']} does not match index "
+            f"{index_package['release']}")
+
+
+def _upgrade_precheck_files(ctx, targets, owners):
+    """Проверяет файловые конфликты для всей транзакции до записи."""
+    by_path = {}
+    for name, paths in targets.items():
+        for path in paths:
+            by_path.setdefault(path, set()).add(name)
+
+    for path, names in sorted(by_path.items()):
+        if len(names) > 1:
+            raise InvalidArgument(
+                f"pkg upgrade: file conflict in transaction: '{path}' "
+                f"is provided by {', '.join(sorted(names))}")
+
+    transaction = set(targets)
+    for name in sorted(targets):
+        for path in targets[name]:
+            owner = owners.get(path)
+            if owner is not None and owner != name and owner not in transaction:
+                raise InvalidArgument(
+                    f"pkg upgrade: file conflict for '{name}': '{path}' "
+                    f"is owned by '{owner}'")
+            if owner is None:
+                try:
+                    node = ctx.fs.lookup(path, ctx.user, "/", "/")
+                except NoSuchFileOrDirectory:
+                    continue
+                if node.is_dir():
+                    raise InvalidArgument(
+                        f"pkg upgrade: file conflict for '{name}': "
+                        f"'{path}' is a directory")
+
+
+def _apply_upgrade_package(ctx, entry, package, targets):
+    """Безопасно применяет upgrade существующего пакета.
+
+    Новые файлы пишутся, manifest и owners обновляются, затем удаляются
+    только старые файлы этого же пакета, если они не стали чужими.
+    """
+    name = package["name"]
+    old = entry["old"]
+    new_paths = [item["path"] for item in package["files"]]
+
+    for item in package["files"]:
+        target = item["path"]
+        parent = target.rsplit("/", 1)[0] or "/"
+        try:
+            _ensure_dir(ctx.fs, parent, ctx.user)
+            ctx.fs.write_file(target, item["content"], ctx.user, "/", "/",
+                              create=True)
+            ctx.fs.chmod(target, item["mode"], ctx.user, "/", "/")
+            ctx.fs.chown(target, uid=item["uid"], gid=item["gid"],
+                         user=ctx.user, cwd="/", home="/")
+        except PyOSError as exc:
+            raise PyOSError(
+                f"pkg upgrade: failed to write '{target}' for '{name}': "
+                f"{exc}")
+
+    old_manifest = old.get("manifest") or {}
+    manifest = {
+        "format": PKG_FORMAT,
+        "name": name,
+        "version": package["version"],
+        "release": package["release"],
+        "arch": package["arch"],
+        "description": package["description"],
+        "depends": package["depends"],
+        "provides": package["provides"],
+        "conflicts": package["conflicts"],
+        "files": new_paths,
+        "pkgname": name,
+        "pkgver": package["version"],
+        "pkgrel": package["release"],
+        "pkgdesc": package["description"],
+    }
+    if "installed_at" in old_manifest:
+        manifest["installed_at"] = old_manifest["installed_at"]
+
+    try:
+        _write_manifest(ctx.fs, ctx.user, name, manifest)
+    except PyOSError as exc:
+        raise PyOSError(
+            f"pkg upgrade: failed to update installed DB for '{name}': "
+            f"{exc}")
+
+    owners = _read_owners(ctx.fs, ctx.user)
+    for path in new_paths:
+        owners[path] = name
+
+    claimed_by_others = set()
+    for other, paths in targets.items():
+        if other != name:
+            claimed_by_others.update(paths)
+
+    pruned = 0
+    for path in sorted(set(old["files"])):
+        if path in new_paths:
+            continue
+        if path in claimed_by_others:
+            continue
+        if owners.get(path) != name:
+            continue
+        try:
+            node = ctx.fs.lookup(path, ctx.user, "/", "/")
+        except NoSuchFileOrDirectory:
+            node = None
+        if node is not None and node.is_dir():
+            continue
+        try:
+            ctx.fs.unlink(path, ctx.user, "/", "/")
+        except NoSuchFileOrDirectory:
+            pass
+        except PyOSError as exc:
+            raise PyOSError(
+                f"pkg upgrade: failed to prune '{path}' for '{name}': "
+                f"{exc}")
+        owners.pop(path, None)
+        pruned += 1
+
+    try:
+        _write_owners(ctx.fs, ctx.user, owners)
+    except PyOSError as exc:
+        raise PyOSError(
+            f"pkg upgrade: failed to update file owners for '{name}': "
+            f"{exc}")
+
+    return pruned
+
+
+def _upgrade_packages(ctx, names, dry_run=False, force=False):
+    """Выполняет pkg upgrade после полной проверки плана."""
+    from ..repo import _cache_package
+
+    entries, held, warnings, planned = _plan_upgrade(ctx, names, force)
+
+    if dry_run:
+        return _format_upgrade_plan(entries, held, warnings, planned)
+
+    notice_lines = _upgrade_notice_lines(held, warnings, planned)
+    if not entries:
+        lines = list(notice_lines)
+        lines.append("pkg: nothing to do")
+        return "\n".join(lines)
+
+    # Скачиваем и валидируем весь план до первой записи в installed DB/ФС.
+    download_lines = []
+    package_data = {}
+    cache_paths = {}
+
+    for entry in entries:
+        repo = entry["repo"]
+        package = entry["package"]
+        name = package["name"]
+
+        line = (f"downloading {package['filename']} from "
+                f"{repo['name']}")
+        cache_path, reused = _cache_package(
+            ctx, repo, package, with_status=True)
+        if reused:
+            line += " (cached)"
+        download_lines.append(line)
+        download_lines.append(
+            f"verifying sha256 {package['filename']}")
+
+        try:
+            text = ctx.fs.read_file(cache_path, ctx.user, "/", "/")
+        except PyOSError as exc:
+            raise InvalidArgument(
+                f"pkg upgrade: cannot read cached package for "
+                f"'{name}': {exc}")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise InvalidArgument(
+                f"pkg upgrade: invalid package file for '{name}': "
+                f"{exc.msg}")
+
+        validated = _validate_pkg(ctx, data, cache_path)
+        _validate_upgrade_package(entry, validated)
+        package_data[name] = validated
+        cache_paths[name] = cache_path
+
+    targets = {
+        name: [item["path"] for item in package["files"]]
+        for name, package in package_data.items()
+    }
+    owners = _read_owners(ctx.fs, ctx.user)
+    _upgrade_precheck_files(ctx, targets, owners)
+
+    lines = list(notice_lines) + download_lines
+    for entry in entries:
+        package = entry["package"]
+        name = package["name"]
+        full = f"{package['version']}-{package['release']}"
+
+        if entry["action"] == "install":
+            lines.append(f"installing {name} {full}")
+            lines.append(
+                _install_package_file(ctx, cache_paths[name], dry_run=False))
+            continue
+
+        lines.append(f"upgrading {name} {entry['old']['full']} -> {full}")
+        pruned = _apply_upgrade_package(
+            ctx, entry, package_data[name], targets)
+        if pruned:
+            suffix = "file" if pruned == 1 else "files"
+            lines.append(f"pruning {pruned} old {suffix} owned by {name}")
+
+    lines.append("done")
+    return "\n".join(lines)
+
+
 def _remove_package(ctx, pkgname, force=False, dry_run=False):
     """Удаляет установленный пакет."""
     manifest = _read_manifest(ctx.fs, ctx.user, pkgname)
@@ -1104,6 +1767,7 @@ def _format_pkg_info(data, installed=False):
 @register("pkg",
           usage=("pkg install <name|name@repo|name[op]version|file.pkg.json> "
                  "[--dry-run] | "
+                 "pkg upgrade [<name>...] [--dry-run] [--force] | "
                  "pkg remove <name> [--force] [--dry-run] | "
                  "pkg list | pkg info <name> | pkg search <query> | "
                  "pkg repo add|remove|list|update ..."),
@@ -1117,6 +1781,7 @@ def cmd_pkg(ctx, args, stdin):
       pkg install <name>      — установить из репозитория (или кэша makepkg)
       pkg install <name>@<repo> — только из указанного репозитория
       pkg install <name>=<version> / >= / <= / > / < — version-spec
+      pkg upgrade [<name>...] [--dry-run] [--force] — обновить пакеты
       pkg remove <pkgname>    — удалить пакет
       pkg list                — показать установленные пакеты
       pkg info <pkgname>      — информация о пакете
@@ -1124,7 +1789,8 @@ def cmd_pkg(ctx, args, stdin):
       pkg repo ...            — управление репозиториями
     """
     if not args:
-        return "Usage: pkg install|search|remove|list|info|repo [args]"
+        return ("Usage: pkg install|upgrade|search|remove|list|info|repo "
+                "[args]")
 
     subcmd = args[0]
     cmd_args = args[1:]
@@ -1176,6 +1842,25 @@ def cmd_pkg(ctx, args, stdin):
 
         return _install_named_package(ctx, target, dry_run=dry_run)
 
+    elif subcmd == "upgrade":
+        allowed = {"--dry-run", "--force"}
+        unknown = [a for a in cmd_args
+                   if a.startswith("--") and a not in allowed]
+        if unknown:
+            raise InvalidArgument(f"pkg upgrade: unknown option '{unknown[0]}'")
+
+        positional = [a for a in cmd_args if not a.startswith("--")]
+        for name in positional:
+            if not _UPGRADE_NAME_RE.match(name):
+                raise InvalidArgument(
+                    f"pkg upgrade: invalid package name '{name}' "
+                    "(version specs are not supported)")
+
+        return _upgrade_packages(
+            ctx, positional,
+            dry_run="--dry-run" in cmd_args,
+            force="--force" in cmd_args)
+
     elif subcmd == "remove":
         allowed = {"--force", "--dry-run"}
         unknown = [a for a in cmd_args
@@ -1202,5 +1887,5 @@ def cmd_pkg(ctx, args, stdin):
     else:
         raise InvalidArgument(
             f"pkg: unknown subcommand '{subcmd}' "
-            "(use: install, search, remove, list, info, repo)"
+            "(use: install, upgrade, search, remove, list, info, repo)"
         )
