@@ -22,6 +22,9 @@ from .registry import register
 CACHE_ROOT = "/var/cache/packages"
 LIB_ROOT = "/var/lib/packages"
 BUILD_ROOT = "/var/tmp/makepkg"
+INSTALLED_ROOT = f"{LIB_ROOT}/installed"
+OWNERS_FILE = f"{LIB_ROOT}/file-owners.json"
+PKG_FORMAT = 1
 
 # -- сравнение версий -------------------------------------------------------
 
@@ -454,38 +457,86 @@ def cmd_makepkg(ctx, args, stdin):
 
 
 def _get_installed_packages(fs, user):
-    """Возвращает список установленных пакетов (имена каталогов в LIB_ROOT)."""
+    """Возвращает имена установленных пакетов из новой и старой базы."""
+    names = set()
+
+    # Новая база: /var/lib/packages/installed/<name>.json.
+    try:
+        node = fs.lookup(INSTALLED_ROOT, user, "/", "/")
+        if node.is_dir():
+            for name in node.children:
+                if name.endswith(".json"):
+                    names.add(name[:-len(".json")])
+    except (NoSuchFileOrDirectory, PyOSError):
+        pass
+
+    # Старый формат: /var/lib/packages/<name>/manifest.
     try:
         node = fs.lookup(LIB_ROOT, user, "/", "/")
-    except NoSuchFileOrDirectory:
-        return []
-    if not node.is_dir():
-        return []
-    return sorted(node.children.keys())
+        if node.is_dir():
+            for name, child in node.children.items():
+                if name != "installed" and child.is_dir():
+                    names.add(name)
+    except (NoSuchFileOrDirectory, PyOSError):
+        pass
+
+    return sorted(names)
 
 
 def _read_manifest(fs, user, pkgname):
-    """Читает manifest установленного пакета."""
-    path = f"{LIB_ROOT}/{pkgname}/manifest"
-    try:
-        data = fs.read_file(path, user, "/", "/")
-        return json.loads(data)
-    except (NoSuchFileOrDirectory, json.JSONDecodeError, PyOSError):
-        return None
+    """Читает manifest установленного пакета (новый или старый формат)."""
+    for path in (
+        f"{INSTALLED_ROOT}/{pkgname}.json",
+        f"{LIB_ROOT}/{pkgname}/manifest",
+    ):
+        try:
+            return json.loads(fs.read_file(path, user, "/", "/"))
+        except (NoSuchFileOrDirectory, json.JSONDecodeError, PyOSError):
+            continue
+    return None
 
 
 def _write_manifest(fs, user, pkgname, manifest):
-    """Пишет manifest установленного пакета."""
-    _ensure_dir(fs, f"{LIB_ROOT}", user)
+    """Пишет manifest в новую базу и в старый путь для совместимости."""
+    _ensure_dir(fs, LIB_ROOT, user)
+    _ensure_dir(fs, INSTALLED_ROOT, user)
+    data = json.dumps(manifest, indent=2, ensure_ascii=False)
+    fs.write_file(f"{INSTALLED_ROOT}/{pkgname}.json", data, user, "/", "/",
+                  create=True)
     _ensure_dir(fs, f"{LIB_ROOT}/{pkgname}", user)
-    fs.write_file(
-        f"{LIB_ROOT}/{pkgname}/manifest",
-        json.dumps(manifest, indent=2),
-        user, "/", "/", create=True,
-    )
+    fs.write_file(f"{LIB_ROOT}/{pkgname}/manifest", data, user, "/", "/",
+                  create=True)
 
 
-def _install_from_cache(ctx, pkgname, pkgver):
+def _read_owners(fs, user):
+    """Читает базу владельцев файлов: путь -> имя пакета."""
+    try:
+        data = json.loads(fs.read_file(OWNERS_FILE, user, "/", "/"))
+    except (NoSuchFileOrDirectory, json.JSONDecodeError, PyOSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(path): str(name) for path, name in data.items()}
+
+
+def _write_owners(fs, user, owners):
+    """Сохраняет базу владельцев файлов."""
+    _ensure_dir(fs, LIB_ROOT, user)
+    fs.write_file(OWNERS_FILE, json.dumps(owners, indent=2, sort_keys=True),
+                  user, "/", "/", create=True)
+
+
+def _manifest_paths(manifest):
+    """Возвращает пути файлов из manifest (строки или объекты)."""
+    paths = []
+    for item in manifest.get("files", []) or []:
+        path = item.get("path") if isinstance(item, dict) else item
+        if isinstance(path, str):
+            paths.append(path)
+    return paths
+
+
+def _install_from_cache(ctx, pkgname, pkgver, dry_run=False):
     """Устанавливает пакет из кэша."""
     cache_dir = f"{CACHE_ROOT}/{pkgname}-{pkgver}"
 
@@ -517,6 +568,15 @@ def _install_from_cache(ctx, pkgname, pkgver):
         # Пакет без файлов — бывает
         node = None
 
+    # Собираем список файлов заранее, чтобы dry-run ничего не менял.
+    cached_files = []
+    if node and node.is_dir():
+        cached_files = ["/" + rel for rel, _ in _tree_walk(node)]
+
+    if dry_run:
+        return (f"pkg: would install '{pkgname}' "
+                f"(version {pkgver}, {len(cached_files)} files)")
+
     if node and node.is_dir():
         # Обходим файлы и устанавливаем
         _copy_pkg_files(ctx, node, pkg_files_dir, "", installed_files)
@@ -530,6 +590,11 @@ def _install_from_cache(ctx, pkgname, pkgver):
         "files": installed_files,
     }
     _write_manifest(ctx.fs, ctx.user, pkgname, manifest)
+
+    owners = _read_owners(ctx.fs, ctx.user)
+    for path in installed_files:
+        owners[path] = pkgname
+    _write_owners(ctx.fs, ctx.user, owners)
 
     return f"pkg: installed '{pkgname}' (version {pkgver})"
 
@@ -556,28 +621,309 @@ def _copy_pkg_files(ctx, node, base_path, rel_prefix, installed_files):
             _copy_pkg_files(ctx, child, base_path, new_rel, installed_files)
 
 
-def _remove_package(ctx, pkgname):
+# -- установка .pkg.json ----------------------------------------------------
+
+
+def _normalize_pkg_path(raw):
+    """Проверяет и нормализует абсолютный путь внутри пакета."""
+    if not raw.startswith("/"):
+        raise InvalidArgument(f"pkg: file path must be absolute: '{raw}'")
+
+    parts = []
+    for part in raw.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise InvalidArgument(
+                f"pkg: path traversal is not allowed: '{raw}'")
+        parts.append(part)
+
+    if not parts:
+        raise InvalidArgument(f"pkg: invalid file path: '{raw}'")
+    return "/" + "/".join(parts)
+
+
+def _parse_pkg_mode(raw, path):
+    """Разбирает восьмеричный режим файла (например, '0755')."""
+    try:
+        mode = int(raw, 8) if isinstance(raw, str) else int(raw)
+    except (TypeError, ValueError):
+        raise InvalidArgument(f"pkg: invalid mode for '{path}': {raw!r}")
+    if not 0 <= mode <= 0o7777:
+        raise InvalidArgument(f"pkg: invalid mode for '{path}': {raw!r}")
+    return mode
+
+
+def _validate_pkg(ctx, data, source):
+    """Валидирует .pkg.json и возвращает нормализованное описание."""
+    if not isinstance(data, dict):
+        raise InvalidArgument(f"pkg: '{source}': package must be a JSON object")
+
+    fmt = data.get("format")
+    if fmt != PKG_FORMAT:
+        raise InvalidArgument(
+            f"pkg: '{source}': unsupported package format {fmt!r} "
+            f"(expected {PKG_FORMAT})")
+
+    name = data.get("name")
+    if not isinstance(name, str) or not name:
+        raise InvalidArgument(f"pkg: '{source}': missing package name")
+    if "/" in name or "\\" in name or name in (".", ".."):
+        raise InvalidArgument(f"pkg: '{source}': invalid package name '{name}'")
+
+    version = data.get("version")
+    if not isinstance(version, str) or not version:
+        raise InvalidArgument(f"pkg: '{source}': missing package version")
+
+    release = data.get("release", 1)
+    if isinstance(release, int):
+        release = str(release)
+    elif not (isinstance(release, str) and release.isdigit()):
+        raise InvalidArgument(f"pkg: '{source}': invalid release {release!r}")
+
+    arch = data.get("arch", "any")
+    if not isinstance(arch, str) or not arch:
+        raise InvalidArgument(f"pkg: '{source}': invalid arch {arch!r}")
+
+    description = data.get("description", "")
+    if not isinstance(description, str):
+        raise InvalidArgument(f"pkg: '{source}': invalid description")
+
+    meta = {}
+    for field in ("depends", "provides", "conflicts"):
+        value = data.get(field, [])
+        if not isinstance(value, list) or not all(
+                isinstance(item, str) for item in value):
+            raise InvalidArgument(
+                f"pkg: '{source}': '{field}' must be a list of strings")
+        meta[field] = list(value)
+
+    raw_files = data.get("files", [])
+    if not isinstance(raw_files, list):
+        raise InvalidArgument(f"pkg: '{source}': 'files' must be a list")
+
+    files = []
+    seen = set()
+    for entry in raw_files:
+        if not isinstance(entry, dict):
+            raise InvalidArgument(
+                f"pkg: '{source}': file entry must be an object")
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise InvalidArgument(
+                f"pkg: '{source}': file entry without path")
+        path = _normalize_pkg_path(raw_path)
+        if path in seen:
+            raise InvalidArgument(
+                f"pkg: '{source}': duplicate file '{path}'")
+        seen.add(path)
+
+        encoding = entry.get("encoding", "utf-8")
+        if not isinstance(encoding, str) or encoding.lower() not in (
+                "utf-8", "utf8"):
+            raise InvalidArgument(
+                f"pkg: '{source}': unsupported encoding {encoding!r} "
+                "(only utf-8 is supported)")
+
+        content = entry.get("content", "")
+        if not isinstance(content, str):
+            raise InvalidArgument(
+                f"pkg: '{source}': content must be a string")
+
+        mode = _parse_pkg_mode(entry.get("mode", "0644"), path)
+        owner = entry.get("owner", "root")
+        group = entry.get("group", "root")
+        uid = ctx.users.resolve_owner(str(owner))
+        if uid is None:
+            raise InvalidArgument(
+                f"pkg: '{source}': unknown owner '{owner}' for '{path}'")
+        gid = ctx.users.resolve_group(str(group))
+        if gid is None:
+            raise InvalidArgument(
+                f"pkg: '{source}': unknown group '{group}' for '{path}'")
+
+        files.append({
+            "path": path,
+            "mode": mode,
+            "uid": uid,
+            "gid": gid,
+            "content": content,
+        })
+
+    return {
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": arch,
+        "description": description,
+        "files": files,
+        **meta,
+    }
+
+
+def _dep_name(spec):
+    """Отделяет имя пакета от ограничения версии в зависимости."""
+    return re.split(r"[<>= ]", str(spec), maxsplit=1)[0].strip()
+
+
+def _package_dependents(ctx, pkgname):
+    """Возвращает установленные пакеты, которые зависят от pkgname."""
+    dependents = []
+    for other in _get_installed_packages(ctx.fs, ctx.user):
+        if other == pkgname:
+            continue
+        manifest = _read_manifest(ctx.fs, ctx.user, other)
+        if not manifest:
+            continue
+        depends = manifest.get("depends") or []
+        if not isinstance(depends, list):
+            continue
+        if pkgname in {_dep_name(dep) for dep in depends}:
+            dependents.append(other)
+    return dependents
+
+
+def _install_package_file(ctx, path, dry_run=False):
+    """Устанавливает локальный .pkg.json из виртуальной ФС."""
+    try:
+        text = ctx.fs.read_file(path, ctx.user, ctx.cwd, ctx.home)
+    except NoSuchFileOrDirectory:
+        raise InvalidArgument(f"pkg: package file '{path}' not found")
+    except PyOSError as exc:
+        raise InvalidArgument(f"pkg: cannot read '{path}': {exc}")
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InvalidArgument(
+            f"pkg: invalid package file '{path}': {exc.msg}")
+
+    pkg = _validate_pkg(ctx, data, path)
+    name = pkg["name"]
+    version = pkg["version"]
+    release = pkg["release"]
+
+    existing = _read_manifest(ctx.fs, ctx.user, name)
+    if existing is not None:
+        raise PyOSError(
+            f"pkg: '{name}' is already installed "
+            f"(version {existing.get('pkgver', existing.get('version', '?'))})"
+        )
+
+    installed = set(_get_installed_packages(ctx.fs, ctx.user))
+
+    for dep in pkg["depends"]:
+        dep_name = _dep_name(dep)
+        if dep_name and dep_name not in installed:
+            raise InvalidArgument(
+                f"pkg: missing dependency '{dep}' for '{name}'")
+
+    for conflict in pkg["conflicts"]:
+        conflict_name = _dep_name(conflict)
+        if conflict_name in installed:
+            raise InvalidArgument(
+                f"pkg: '{name}' conflicts with installed package "
+                f"'{conflict_name}'")
+
+    owners = _read_owners(ctx.fs, ctx.user)
+    file_conflicts = []
+    for entry in pkg["files"]:
+        target = entry["path"]
+        owner = owners.get(target)
+        if owner:
+            file_conflicts.append(f"  {target} (owned by {owner})")
+            continue
+        try:
+            node = ctx.fs.lookup(target, ctx.user, "/", "/")
+        except NoSuchFileOrDirectory:
+            continue
+        if node.is_dir():
+            file_conflicts.append(f"  {target} (directory)")
+
+    if file_conflicts:
+        raise InvalidArgument(
+            f"pkg: file conflict in '{name}':\n" + "\n".join(file_conflicts))
+
+    if dry_run:
+        return (f"pkg: would install '{name}' "
+                f"(version {version}-{release}, {len(pkg['files'])} files)")
+
+    for entry in pkg["files"]:
+        target = entry["path"]
+        parent = target.rsplit("/", 1)[0] or "/"
+        _ensure_dir(ctx.fs, parent, ctx.user)
+        ctx.fs.write_file(target, entry["content"], ctx.user, "/", "/",
+                          create=True)
+        ctx.fs.chmod(target, entry["mode"], ctx.user, "/", "/")
+        ctx.fs.chown(target, uid=entry["uid"], gid=entry["gid"],
+                     user=ctx.user, cwd="/", home="/")
+
+    paths = [entry["path"] for entry in pkg["files"]]
+    manifest = {
+        "format": PKG_FORMAT,
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": pkg["arch"],
+        "description": pkg["description"],
+        "depends": pkg["depends"],
+        "provides": pkg["provides"],
+        "conflicts": pkg["conflicts"],
+        "files": paths,
+        # Совместимость со старым форматом manifest.
+        "pkgname": name,
+        "pkgver": version,
+        "pkgrel": release,
+        "pkgdesc": pkg["description"],
+    }
+    _write_manifest(ctx.fs, ctx.user, name, manifest)
+    for target in paths:
+        owners[target] = name
+    _write_owners(ctx.fs, ctx.user, owners)
+
+    return f"pkg: installed '{name}' (version {version}-{release})"
+
+
+def _remove_package(ctx, pkgname, force=False, dry_run=False):
     """Удаляет установленный пакет."""
     manifest = _read_manifest(ctx.fs, ctx.user, pkgname)
     if manifest is None:
         raise InvalidArgument(f"pkg: package '{pkgname}' is not installed")
 
-    files = manifest.get("files", [])
+    dependents = _package_dependents(ctx, pkgname)
+    if dependents and not force:
+        raise InvalidArgument(
+            f"pkg: cannot remove '{pkgname}': required by "
+            f"{', '.join(dependents)} (use --force to override)")
+
+    if dry_run:
+        return f"pkg: would remove '{pkgname}'"
+
+    files = _manifest_paths(manifest)
+    owners = _read_owners(ctx.fs, ctx.user)
     errors = []
     for fpath in files:
+        owner = owners.get(fpath)
+        if owner is not None and owner != pkgname:
+            continue
         try:
             # Удаляем только если файл существует
-            try:
-                ctx.fs.unlink(fpath, ctx.user, "/", "/")
-            except NoSuchFileOrDirectory:
-                pass
-            except PyOSError as e:
-                errors.append(str(e))
-        except PyOSError:
-            errors.append(fpath)
+            ctx.fs.unlink(fpath, ctx.user, "/", "/")
+        except NoSuchFileOrDirectory:
+            pass
+        except PyOSError as exc:
+            errors.append(str(exc))
+        owners.pop(fpath, None)
 
-    # Удаляем manifest
+    # Удаляем manifest обоих форматов.
+    try:
+        ctx.fs.unlink(f"{INSTALLED_ROOT}/{pkgname}.json", ctx.user, "/", "/")
+    except NoSuchFileOrDirectory:
+        pass
+    except PyOSError:
+        pass
     _remove_tree(ctx.fs, f"{LIB_ROOT}/{pkgname}", ctx.user)
+    _write_owners(ctx.fs, ctx.user, owners)
 
     # Пробуем удалить пустые родительские каталоги
     removed_dirs = set()
@@ -645,10 +991,14 @@ def _show_package_info(ctx, pkgname):
 
 def _format_pkg_info(data, installed=False):
     """Форматирует метаданные пакета для вывода."""
+    name = data.get("pkgname", data.get("name", "?"))
+    version = data.get("pkgver", data.get("version", "?"))
+    release = data.get("pkgrel", data.get("release", "1"))
+    description = data.get("pkgdesc", data.get("description", ""))
     lines = [
-        f"Package:    {data.get('pkgname', '?')}",
-        f"Version:    {data.get('pkgver', '?')}-{data.get('pkgrel', '1')}",
-        f"Description: {data.get('pkgdesc', '')}",
+        f"Package:    {name}",
+        f"Version:    {version}-{release}",
+        f"Description: {description}",
     ]
     arch = data.get("arch")
     if arch:
@@ -656,6 +1006,12 @@ def _format_pkg_info(data, installed=False):
     depends = data.get("depends", [])
     if depends:
         lines.append(f"Depends on: {', '.join(depends)}")
+    provides = data.get("provides", [])
+    if provides:
+        lines.append(f"Provides: {', '.join(provides)}")
+    conflicts = data.get("conflicts", [])
+    if conflicts:
+        lines.append(f"Conflicts: {', '.join(conflicts)}")
     lines.append(f"Status: {'installed' if installed else 'in cache'}")
     files = data.get("files")
     if files is not None:
@@ -664,16 +1020,19 @@ def _format_pkg_info(data, installed=False):
 
 
 @register("pkg",
-          usage="pkg install|remove|list|info [args]",
+          usage=("pkg install <name|file.pkg.json> [--dry-run] | "
+                 "pkg remove <name> [--force] [--dry-run] | "
+                 "pkg list | pkg info <name>"),
           summary="Управление пакетами",
           category="system")
 def cmd_pkg(ctx, args, stdin):
     """Управление пакетами pyOS.
 
     Подкоманды:
-      pkg install <pkgname>   — установить пакет из кэша
+      pkg install <path>      — установить локальный .pkg.json из виртуальной ФС
+      pkg install <pkgname>   — установить пакет из кэша makepkg
       pkg remove <pkgname>    — удалить пакет
-      pkg list                 — показать установленные пакеты
+      pkg list                — показать установленные пакеты
       pkg info <pkgname>      — информация о пакете
     """
     if ctx.user.uid != 0:
@@ -686,9 +1045,23 @@ def cmd_pkg(ctx, args, stdin):
     cmd_args = args[1:]
 
     if subcmd == "install":
-        if not cmd_args:
-            raise InvalidArgument("pkg install: missing package name")
-        pkgname = cmd_args[0]
+        dry_run = "--dry-run" in cmd_args
+        unknown = [a for a in cmd_args
+                   if a.startswith("--") and a != "--dry-run"]
+        if unknown:
+            raise InvalidArgument(f"pkg install: unknown option '{unknown[0]}'")
+
+        positional = [a for a in cmd_args if not a.startswith("--")]
+        if not positional:
+            raise InvalidArgument("pkg install: missing package name or file")
+        if len(positional) > 1:
+            raise InvalidArgument("pkg install: too many arguments")
+
+        target = positional[0]
+        if "/" in target or target.endswith(".json"):
+            return _install_package_file(ctx, target, dry_run=dry_run)
+
+        pkgname = target
 
         # Ищем в кэше: точное совпадение <name>-<ver> или последнюю версию
         try:
@@ -725,12 +1098,22 @@ def cmd_pkg(ctx, args, stdin):
             ver = pkgname
             pkgname = chosen
 
-        return _install_from_cache(ctx, pkgname, ver)
+        return _install_from_cache(ctx, pkgname, ver, dry_run=dry_run)
 
     elif subcmd == "remove":
-        if not cmd_args:
+        allowed = {"--force", "--dry-run"}
+        unknown = [a for a in cmd_args
+                   if a.startswith("--") and a not in allowed]
+        if unknown:
+            raise InvalidArgument(f"pkg remove: unknown option '{unknown[0]}'")
+        positional = [a for a in cmd_args if not a.startswith("--")]
+        if not positional:
             raise InvalidArgument("pkg remove: missing package name")
-        return _remove_package(ctx, cmd_args[0])
+        if len(positional) > 1:
+            raise InvalidArgument("pkg remove: too many arguments")
+        return _remove_package(ctx, positional[0],
+                               force="--force" in cmd_args,
+                               dry_run="--dry-run" in cmd_args)
 
     elif subcmd == "list":
         return _list_packages(ctx)

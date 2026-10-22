@@ -109,9 +109,45 @@ python -m pyos
   выполняются командами шелла pyOS;
 - `makepkg [PKGBUILD]` — сборка пакета в `/var/cache/packages`
   (только root; внутри шагов доступны `$srcdir` и `$pkgdir`);
-- `pkg install|remove|list|info` — установка из кэша (выбирается старшая
-  версия по числовому сравнению), манифесты хранятся в `/var/lib/packages`
-  (управление — только root).
+- `pkg install <name>` — установка из кэша (выбирается старшая версия по
+  числовому сравнению);
+- `pkg install <path.pkg.json>` — установка локального пакета из виртуальной
+  ФС;
+- `pkg remove <name> [--force]`, `pkg list`, `pkg info <name>`;
+- `--dry-run` для `pkg install` и `pkg remove` показывает план без изменений
+  ФС;
+- установленные пакеты хранятся в `/var/lib/packages/installed/<name>.json`,
+  владельцы файлов — в `/var/lib/packages/file-owners.json` (управление —
+  только root).
+
+Формат `.pkg.json` (version 1):
+
+```json
+{
+  "format": 1,
+  "name": "example",
+  "version": "1.0",
+  "release": 1,
+  "arch": "any",
+  "description": "Example package",
+  "depends": [],
+  "provides": [],
+  "conflicts": [],
+  "files": [
+    {
+      "path": "/usr/bin/example",
+      "mode": "0755",
+      "owner": "root",
+      "group": "root",
+      "encoding": "utf-8",
+      "content": "#!/bin/sh\necho example\n"
+    }
+  ]
+}
+```
+
+Пути файлов должны быть абсолютными, `..` запрещены. Поддерживается только
+`encoding: "utf-8"`.
 
 ### Состояние и лимиты
 - `save <файл>` — сохраняет ФС и пользователей в JSON **на реальном хосте**
@@ -239,6 +275,10 @@ pyos/
 - `pkg install` выбирает версию по числовому сравнению (`1.10` новее `1.9`);
   сравнение упрощённое — числовые и буквенные сегменты, epoch и release,
   без полной семантики alpm.
+- `.pkg.json` поддерживает только `encoding: "utf-8"`; base64 и бинарные
+  файлы не реализованы. Зависимости проверяются по имени пакета, без
+  ограничений версий и без учёта `provides`; `pkg remove --force` может
+  оставить сломанные зависимости.
 - `clear` очищает реальный терминал хоста, а не виртуальный экран.
 - Пароли хранятся как SHA-256 без «соли»; это учебный код, не для продакшена.
 - `df`/`free` показывают условные значения.

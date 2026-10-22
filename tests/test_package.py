@@ -1,8 +1,12 @@
 """Тесты пакетного менеджера pyOS: makepkg и pkg."""
 
+import json
+import os
+import tempfile
+
 import pytest
 
-from pyos.errors import InvalidArgument, PyOSError
+from pyos.errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
 from pyos.shell import Shell
 
 
@@ -390,3 +394,379 @@ def test_pkg_install_selects_highest_version_not_alphabetical(kernel, root):
 
     data = kernel.fs.read_file("/usr/share/hello-version.txt", root, "/", "/")
     assert data.strip() == "1.10"
+
+
+# -- .pkg.json: установка локального пакета ----------------------------------
+
+
+def _make_package(name="demo", version="1.0", files=None, **meta):
+    data = {
+        "format": 1,
+        "name": name,
+        "version": version,
+        "release": 1,
+        "arch": "any",
+        "description": f"{name} package",
+        "depends": [],
+        "provides": [],
+        "conflicts": [],
+        "files": files if files is not None else [
+            {
+                "path": f"/usr/bin/{name}",
+                "mode": "0755",
+                "owner": "root",
+                "group": "root",
+                "encoding": "utf-8",
+                "content": f"#!/bin/sh\necho {name}\n",
+            },
+        ],
+    }
+    data.update(meta)
+    return data
+
+
+def _write_pkg(kernel, root, data, path="/root/pkg.json"):
+    kernel.fs.write_file(path, json.dumps(data), root, "/", "/")
+    return path
+
+
+def _ctx(kernel, root):
+    from pyos.context import Context
+    return Context(kernel, root, "/root", shell=Shell(kernel, root))
+
+
+def test_install_valid_package_creates_files(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    path = _write_pkg(kernel, root, _make_package())
+
+    result = cmd_pkg(ctx, ["install", path], "")
+    assert "installed" in result
+    assert "demo" in result
+
+    data = kernel.fs.read_file("/usr/bin/demo", root, "/", "/")
+    assert data == "#!/bin/sh\necho demo\n"
+
+
+def test_install_sets_mode_owner_group(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    files = [{
+        "path": "/usr/bin/tool",
+        "mode": "0750",
+        "owner": "user",
+        "group": "users",
+        "encoding": "utf-8",
+        "content": "tool",
+    }]
+    _write_pkg(kernel, root, _make_package(name="tool", files=files))
+
+    cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+    node = kernel.fs.lookup("/usr/bin/tool", root, "/", "/")
+    assert node.mode == 0o750
+    assert node.uid == 1000  # user
+    assert node.gid == 100   # users
+
+
+def test_install_rejects_relative_path(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    files = [{
+        "path": "usr/bin/demo",
+        "mode": "0644",
+        "owner": "root",
+        "group": "root",
+        "encoding": "utf-8",
+        "content": "x",
+    }]
+    _write_pkg(kernel, root, _make_package(files=files))
+
+    with pytest.raises(InvalidArgument, match="absolute"):
+        cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+
+def test_install_rejects_path_traversal(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    files = [{
+        "path": "/etc/../tmp/evil",
+        "mode": "0644",
+        "owner": "root",
+        "group": "root",
+        "encoding": "utf-8",
+        "content": "x",
+    }]
+    _write_pkg(kernel, root, _make_package(files=files))
+
+    with pytest.raises(InvalidArgument, match="traversal"):
+        cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+
+def test_install_rejects_unknown_format(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package(format=2))
+
+    with pytest.raises(InvalidArgument, match="format"):
+        cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+
+def test_install_checks_dependency(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package(depends=["base"]))
+
+    with pytest.raises(InvalidArgument, match="missing dependency 'base'"):
+        cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/usr/bin/demo", root, "/", "/")
+
+
+def test_install_detects_file_conflict(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    files = [{
+        "path": "/usr/bin/shared",
+        "mode": "0644",
+        "owner": "root",
+        "group": "root",
+        "encoding": "utf-8",
+        "content": "one",
+    }]
+    _write_pkg(kernel, root, _make_package(name="one", files=files),
+               "/root/one.pkg.json")
+    cmd_pkg(ctx, ["install", "/root/one.pkg.json"], "")
+
+    files[0]["content"] = "two"
+    _write_pkg(kernel, root, _make_package(name="two", files=files),
+               "/root/two.pkg.json")
+    with pytest.raises(InvalidArgument, match="file conflict") as excinfo:
+        cmd_pkg(ctx, ["install", "/root/two.pkg.json"], "")
+    assert "owned by one" in str(excinfo.value)
+
+    assert kernel.fs.read_file("/usr/bin/shared", root, "/", "/") == "one"
+
+
+def test_remove_deletes_owned_files(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package())
+    cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+    result = cmd_pkg(ctx, ["remove", "demo"], "")
+    assert "removed" in result
+
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/usr/bin/demo", root, "/", "/")
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/var/lib/packages/installed/demo.json", root, "/", "/")
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/var/lib/packages/demo", root, "/", "/")
+
+    owners = json.loads(
+        kernel.fs.read_file("/var/lib/packages/file-owners.json", root, "/", "/")
+    )
+    assert "/usr/bin/demo" not in owners
+
+
+def test_remove_refuses_if_reverse_dependency_exists(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package(name="base"), "/root/base.pkg.json")
+    cmd_pkg(ctx, ["install", "/root/base.pkg.json"], "")
+
+    _write_pkg(kernel, root, _make_package(name="app", depends=["base"]),
+               "/root/app.pkg.json")
+    cmd_pkg(ctx, ["install", "/root/app.pkg.json"], "")
+
+    with pytest.raises(InvalidArgument, match="required by app"):
+        cmd_pkg(ctx, ["remove", "base"], "")
+
+    assert kernel.fs.lookup("/usr/bin/base", root, "/", "/").is_file()
+
+
+def test_remove_force_allows_broken_dependency(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package(name="base"), "/root/base.pkg.json")
+    cmd_pkg(ctx, ["install", "/root/base.pkg.json"], "")
+
+    _write_pkg(kernel, root, _make_package(name="app", depends=["base"]),
+               "/root/app.pkg.json")
+    cmd_pkg(ctx, ["install", "/root/app.pkg.json"], "")
+
+    result = cmd_pkg(ctx, ["remove", "base", "--force"], "")
+    assert "removed" in result
+
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/usr/bin/base", root, "/", "/")
+    # app остаётся установленным, хотя зависимость сломана
+    manifest = json.loads(
+        kernel.fs.read_file("/var/lib/packages/installed/app.json",
+                            root, "/", "/")
+    )
+    assert manifest["name"] == "app"
+
+
+def test_list_shows_installed_packages(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package(name="alpha", version="1.0"),
+               "/root/alpha.pkg.json")
+    _write_pkg(kernel, root, _make_package(name="beta", version="2.5"),
+               "/root/beta.pkg.json")
+    cmd_pkg(ctx, ["install", "/root/alpha.pkg.json"], "")
+    cmd_pkg(ctx, ["install", "/root/beta.pkg.json"], "")
+
+    result = cmd_pkg(ctx, ["list"], "")
+    assert "alpha" in result
+    assert "beta" in result
+    assert "1.0" in result
+    assert "2.5" in result
+
+
+def test_info_shows_package_metadata(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package(
+        description="Demo description",
+        depends=[],
+        provides=["virtual-demo"],
+    ))
+    cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+    result = cmd_pkg(ctx, ["info", "demo"], "")
+    assert "Package:    demo" in result
+    assert "Version:    1.0-1" in result
+    assert "Demo description" in result
+    assert "Provides: virtual-demo" in result
+    assert "installed" in result
+
+
+def test_installed_manifest_persisted(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package())
+    cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+    manifest = json.loads(
+        kernel.fs.read_file("/var/lib/packages/installed/demo.json",
+                            root, "/", "/")
+    )
+    assert manifest["format"] == 1
+    assert manifest["name"] == "demo"
+    assert manifest["version"] == "1.0"
+    assert manifest["release"] == "1"
+    assert manifest["files"] == ["/usr/bin/demo"]
+
+
+def test_file_owners_updated(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    files = [
+        {
+            "path": "/usr/bin/demo",
+            "mode": "0755",
+            "owner": "root",
+            "group": "root",
+            "encoding": "utf-8",
+            "content": "bin",
+        },
+        {
+            "path": "/etc/demo.conf",
+            "mode": "0644",
+            "owner": "root",
+            "group": "root",
+            "encoding": "utf-8",
+            "content": "conf",
+        },
+    ]
+    _write_pkg(kernel, root, _make_package(files=files))
+    cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+    owners = json.loads(
+        kernel.fs.read_file("/var/lib/packages/file-owners.json", root, "/", "/")
+    )
+    assert owners["/usr/bin/demo"] == "demo"
+    assert owners["/etc/demo.conf"] == "demo"
+
+
+def test_save_load_preserves_installed_package_db(kernel, root):
+    from pyos.commands.memory_cmds import cmd_load, cmd_save
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package())
+    cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+    with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False) as f:
+        tmpname = f.name
+
+    try:
+        cmd_save(ctx, [tmpname], "")
+        cmd_load(ctx, [tmpname], "")
+
+        data = kernel.fs.read_file("/usr/bin/demo", root, "/", "/")
+        assert data == "#!/bin/sh\necho demo\n"
+
+        manifest = json.loads(
+            kernel.fs.read_file("/var/lib/packages/installed/demo.json",
+                                root, "/", "/")
+        )
+        assert manifest["name"] == "demo"
+
+        owners = json.loads(
+            kernel.fs.read_file("/var/lib/packages/file-owners.json",
+                                root, "/", "/")
+        )
+        assert owners["/usr/bin/demo"] == "demo"
+    finally:
+        os.unlink(tmpname)
+
+
+def test_install_dry_run_does_not_write(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package())
+
+    result = cmd_pkg(ctx, ["install", "/root/pkg.json", "--dry-run"], "")
+    assert "would install" in result
+
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/usr/bin/demo", root, "/", "/")
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/var/lib/packages/installed/demo.json",
+                         root, "/", "/")
+
+
+def test_remove_dry_run_does_not_delete(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package())
+    cmd_pkg(ctx, ["install", "/root/pkg.json"], "")
+
+    result = cmd_pkg(ctx, ["remove", "demo", "--dry-run"], "")
+    assert "would remove" in result
+
+    assert kernel.fs.lookup("/usr/bin/demo", root, "/", "/").is_file()
+    assert kernel.fs.lookup("/var/lib/packages/installed/demo.json",
+                            root, "/", "/").is_file()
