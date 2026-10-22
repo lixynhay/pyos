@@ -144,6 +144,30 @@ python -m pyos
 `utf8`; base64, tar, zip и двоичные вложения не поддерживаются. `signature`
 может присутствовать в индексе, но не проверяется.
 
+#### Сборка через `pkg pack`
+
+`pkg pack` — предпочтительный простой способ собрать `.pkg.json` из каталога
+виртуальной ФС. Он не читает `PKGBUILD`, не выполняет `build()`/`package()` и
+не запускает код из каталога.
+
+```text
+mkdir -p /tmp/hello-root/usr/bin
+echo 'echo hello' > /tmp/hello-root/usr/bin/hello
+chmod 755 /tmp/hello-root/usr/bin/hello
+
+pkg pack /tmp/hello-root /var/cache/packages/hello-1.0.0-1-any.pkg.json \
+  --name hello --version 1.0.0 --release 1 --arch any \
+  --depends libc --description "Hello utility"
+
+pkg install /var/cache/packages/hello-1.0.0-1-any.pkg.json
+```
+
+Каталоги в `files[]` не перечисляются: `pkg install` создаёт их неявно.
+`mode`, `owner` и `group` берутся из виртуальной ФС. `--depends` можно повторять;
+`--release` по умолчанию `1`, `--arch` — `any`. `--dry-run` печатает файлы,
+которые попадут в пакет, но не создаёт выходной файл. `pkg pack` работает
+только от root.
+
 #### Команды
 
 ```text
@@ -151,6 +175,10 @@ pkg install <name> [--dry-run]
 pkg install <name>@<repo> [--dry-run]
 pkg install <name>=<version> [--dry-run]     # также >=, <=, >, <
 pkg install <path/to/file.pkg.json> [--dry-run]
+
+pkg pack <root-dir> <output-pkg> --name <name> --version <version> \
+  [--release <n>] [--arch <arch>] [--depends <dep>]... \
+  [--description <text>] [--license <text>] [--dry-run]
 
 pkg upgrade [<name>...] [--dry-run] [--force]
 pkg remove <name> [--force] [--dry-run]
@@ -183,7 +211,7 @@ pkg repo disable <name>
 
 | Команда | Кто может выполнять |
 |---|---|
-| `pkg install`, `pkg upgrade`, `pkg remove` | root |
+| `pkg install`, `pkg upgrade`, `pkg remove`, `pkg pack` | root |
 | `pkg list`, `pkg info` | root (текущее поведение) |
 | `pkg repo add`, `remove`, `update`, `enable`, `disable` | root |
 | `pkg search` | все пользователи |
@@ -297,8 +325,8 @@ priority и одинаковом имени пакета установка не
 
 #### Полный workflow
 
-1. Создать `.pkg.json` вручную (в будущем — через `pkg pack`) или собрать
-   пакет через существующий `makepkg`.
+1. Собрать `.pkg.json` через `pkg pack` (предпочтительно), создать вручную
+   или собрать пакет через legacy `makepkg`.
 2. Положить файл в `pyos-packages/packages/`.
 3. Сгенерировать `index.json` через `tools/gen_repo_index.py`.
 4. Залить `index.json` и `packages/` в GitHub.
@@ -340,6 +368,9 @@ priority и одинаковом имени пакета установка не
 
 #### Ограничения
 
+- `pkg pack` включает только regular-файлы с текстом в UTF-8. Симлинки,
+  hardlinks, special files, бинарники и base64 не поддерживаются.
+  `makepkg` остаётся legacy-путём.
 - Поддерживаются только текстовые пакеты в UTF-8. Base64, двоичные файлы,
   tar/zip-архивы и scriptlets/hooks не поддерживаются.
 - `provides` парсится, но не используется для разрешения зависимостей.

@@ -16,6 +16,7 @@ from ..errors import (
     PermissionDenied,
     PyOSError,
 )
+from ..fs import VirtualFile
 from .registry import register
 
 # -- пути в виртуальной ФС -------------------------------------------------
@@ -35,7 +36,10 @@ PKG_USAGE = (
     "pkg repo add <name> <url> [--type http|path] [--priority N] | "
     "pkg repo remove <name> | pkg repo list | "
     "pkg repo update [<name>...] | pkg repo enable <name> | "
-    "pkg repo disable <name>")
+    "pkg repo disable <name> | "
+    "pkg pack <root-dir> <output-pkg> --name <name> --version <version> "
+    "[--release <n>] [--arch <arch>] [--depends <dep>]... "
+    "[--description <text>] [--license <text>] [--dry-run]")
 
 # -- сравнение версий -------------------------------------------------------
 
@@ -821,6 +825,282 @@ def _validate_pkg(ctx, data, source):
         "files": files,
         **meta,
     }
+
+
+# -- pkg pack ---------------------------------------------------------------
+
+_PACK_OPTIONS = {
+    "--name": "name",
+    "--version": "version",
+    "--release": "release",
+    "--arch": "arch",
+    "--depends": "depends",
+    "--description": "description",
+    "--license": "license",
+}
+
+_PACK_USAGE = (
+    "usage: pkg pack <root-dir> <output-pkg> --name <name> "
+    "--version <version> [--release <n>] [--arch <arch>] "
+    "[--depends <dep>]... [--description <text>] [--license <text>] "
+    "[--dry-run]")
+
+
+def _pack_usage_error(message):
+    raise InvalidArgument(f"pkg pack: {message} ({_PACK_USAGE})")
+
+
+def _pack_normalize_path(raw, label):
+    if not isinstance(raw, str) or not raw.startswith("/"):
+        raise InvalidArgument(
+            f"pkg pack: {label} must be absolute: {raw!r}")
+    if raw == "/":
+        return "/"
+
+    try:
+        return _normalize_pkg_path(raw)
+    except InvalidArgument as exc:
+        text = str(exc)
+        if text.startswith("pkg: "):
+            text = text[len("pkg: "):]
+        raise InvalidArgument(f"pkg pack: {label}: {text}")
+
+
+def _parse_pack_args(args):
+    positional = []
+    options = {
+        "name": None,
+        "version": None,
+        "release": None,
+        "arch": None,
+        "description": None,
+        "license": None,
+        "depends": [],
+    }
+    dry_run = False
+    index = 0
+
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dry-run":
+            dry_run = True
+            index += 1
+            continue
+
+        if arg.startswith("--"):
+            option, sep, inline_value = arg.partition("=")
+            if option not in _PACK_OPTIONS:
+                _pack_usage_error(f"unknown option '{option}'")
+
+            if sep:
+                value = inline_value
+            else:
+                if index + 1 >= len(args):
+                    _pack_usage_error(f"option '{option}' requires a value")
+                value = args[index + 1]
+                index += 1
+
+            if option == "--depends":
+                if not value:
+                    _pack_usage_error("--depends requires a non-empty value")
+                options["depends"].append(value)
+            else:
+                options[_PACK_OPTIONS[option]] = value
+            index += 1
+            continue
+
+        positional.append(arg)
+        index += 1
+
+    if len(positional) != 2:
+        _pack_usage_error("expected <root-dir> and <output-pkg>")
+    if not options["name"]:
+        _pack_usage_error("--name is required")
+    if not options["version"]:
+        _pack_usage_error("--version is required")
+
+    return positional[0], positional[1], options, dry_run
+
+
+def _pack_path_label(parts):
+    return "/" + "/".join(parts) if parts else "/"
+
+
+def _pack_validate_component(name, parts):
+    if (not isinstance(name, str) or not name
+            or name in (".", "..") or "/" in name or "\\" in name):
+        raise InvalidArgument(
+            f"pkg pack: path traversal or unsafe path component "
+            f"{name!r} at '{_pack_path_label(parts)}'")
+
+
+def _pack_read_text(path, content):
+    if isinstance(content, bytes):
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise InvalidArgument(
+                f"pkg pack: file is not valid utf-8 text: '{path}'")
+    if not isinstance(content, str):
+        raise InvalidArgument(
+            f"pkg pack: file content is not text: '{path}'")
+    try:
+        content.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InvalidArgument(
+            f"pkg pack: file is not valid utf-8 text: '{path}'")
+    return content
+
+
+def _pack_collect(ctx, node, parts, root_path, output_path, files):
+    path = _pack_path_label(parts)
+    source_path = root_path.rstrip("/") + path
+    if source_path == output_path:
+        return
+
+    if node.is_link():
+        raise InvalidArgument(
+            f"pkg pack: symlink is not supported: '{path}'")
+
+    if node.is_dir():
+        if getattr(node, "refresh", None) is not None:
+            raise InvalidArgument(
+                f"pkg pack: special directory is not supported: '{path}'")
+        for name in sorted(node.children):
+            _pack_validate_component(name, parts)
+            _pack_collect(ctx, node.children[name], parts + [name],
+                          root_path, output_path, files)
+        return
+
+    if not node.is_file():
+        raise InvalidArgument(
+            f"pkg pack: unsupported file type: '{path}'")
+    if isinstance(node, VirtualFile):
+        raise InvalidArgument(
+            f"pkg pack: special file is not supported: '{path}'")
+    if node.nlink > 1:
+        raise InvalidArgument(
+            f"pkg pack: hardlink is not supported: '{path}'")
+
+    content = _pack_read_text(path, node.data)
+    owner = ctx.users.get_by_uid(node.uid)
+    if owner is None:
+        raise InvalidArgument(
+            f"pkg pack: unknown owner uid {node.uid} for '{path}'")
+    group = ctx.users.groups.get(node.gid)
+    if group is None:
+        raise InvalidArgument(
+            f"pkg pack: unknown group gid {node.gid} for '{path}'")
+
+    files.append({
+        "path": path,
+        "mode": f"{node.mode & 0o7777:04o}",
+        "owner": owner.name,
+        "group": group.name,
+        "encoding": "utf-8",
+        "content": content,
+    })
+
+
+def _pack_package(ctx, args):
+    if ctx.user is None or ctx.user.uid != 0:
+        raise PermissionDenied(message="pkg pack: only root can create packages")
+    root_raw, output_raw, options, dry_run = _parse_pack_args(args)
+    if output_raw != "/" and output_raw.endswith("/"):
+        _pack_usage_error("output path must name a file, not a directory")
+
+    root_path = _pack_normalize_path(root_raw, "root directory")
+    output_path = _pack_normalize_path(output_raw, "output path")
+    if output_path == "/":
+        raise InvalidArgument("pkg pack: output path cannot be '/'")
+
+    try:
+        root_node = ctx.fs.lookup(
+            root_path, "/", "/", follow=False, user=ctx.user)
+    except NoSuchFileOrDirectory:
+        raise InvalidArgument(
+            f"pkg pack: root directory not found: '{root_path}'")
+    if root_node.is_link():
+        raise InvalidArgument(
+            f"pkg pack: root directory is a symlink: '{root_path}'")
+    if not root_node.is_dir():
+        raise InvalidArgument(
+            f"pkg pack: root directory is not a directory: '{root_path}'")
+
+    try:
+        output_node = ctx.fs.lookup(
+            output_path, "/", "/", follow=False, user=ctx.user)
+    except NoSuchFileOrDirectory:
+        output_node = None
+    if output_node is not None:
+        if output_node.is_dir():
+            raise InvalidArgument(
+                f"pkg pack: output path is a directory: '{output_path}'")
+        if output_node.is_link():
+            raise InvalidArgument(
+                f"pkg pack: output path is a symlink: '{output_path}'")
+        if not output_node.is_file() or isinstance(output_node, VirtualFile):
+            raise InvalidArgument(
+                f"pkg pack: output path is not a regular file: "
+                f"'{output_path}'")
+
+    parent_path = output_path.rsplit("/", 1)[0] or "/"
+    try:
+        parent_node = ctx.fs.lookup(
+            parent_path, "/", "/", follow=False, user=ctx.user)
+    except NoSuchFileOrDirectory:
+        parent_node = None
+    if parent_node is not None and not parent_node.is_dir():
+        raise InvalidArgument(
+            f"pkg pack: output parent is not a directory: '{parent_path}'")
+
+    files = []
+    _pack_collect(ctx, root_node, [], root_path, output_path, files)
+
+    release_raw = options["release"]
+    if release_raw is None:
+        release_raw = "1"
+    if not release_raw.isdigit():
+        _pack_usage_error("--release must be a non-negative integer")
+    release = int(release_raw)
+
+    arch = options["arch"]
+    if arch is None:
+        arch = "any"
+    if not arch:
+        _pack_usage_error("--arch must not be empty")
+
+    data = {
+        "format": PKG_FORMAT,
+        "name": options["name"],
+        "version": options["version"],
+        "release": release,
+        "arch": arch,
+        "description": options["description"] or "",
+        "license": options["license"] or "",
+        "depends": list(options["depends"]),
+        "provides": [],
+        "conflicts": [],
+        "files": files,
+    }
+
+    # The same validator used by pkg install guarantees a usable format.
+    _validate_pkg(ctx, data, output_path)
+
+    if dry_run:
+        lines = [
+            f"pkg pack: would create '{output_path}' "
+            f"({len(files)} files)"
+        ]
+        lines.extend(entry["path"] for entry in files)
+        return "\n".join(lines)
+
+    _ensure_dir(ctx.fs, parent_path, ctx.user)
+    ctx.fs.write_file(
+        output_path,
+        json.dumps(data, indent=2, ensure_ascii=False),
+        ctx.user, "/", "/", create=True)
+    return f"pkg pack: created '{output_path}' ({len(files)} files)"
 
 
 def _dep_name(spec):
@@ -1958,8 +2238,11 @@ def cmd_pkg(ctx, args, stdin):
                 "pkg info: missing package name (usage: pkg info <name>)")
         return _show_package_info(ctx, cmd_args[0])
 
+    elif subcmd == "pack":
+        return _pack_package(ctx, cmd_args)
+
     else:
         raise InvalidArgument(
             f"pkg: unknown subcommand '{subcmd}' "
             "(use: install, upgrade, search, remove, list, info, repo, "
-            "help)")
+            "pack, help)")
