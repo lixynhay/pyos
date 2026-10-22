@@ -707,10 +707,11 @@ class Shell:
                 segments = [(rest, segments[0][1])] + list(segments[1:])
         first_tokens = segments[0][0] if segments else []
         first_argv = []
+        first_parsed = []
         try:
-            parsed = parse_pipeline(first_tokens)
-            if parsed:
-                first_argv = parsed[0][0]
+            first_parsed = parse_pipeline(first_tokens)
+            if first_parsed:
+                first_argv = first_parsed[0][0]
         except PyOSError:
             first_argv = first_tokens
         name = str(first_argv[0]) if first_argv else "job"
@@ -725,8 +726,18 @@ class Shell:
         self._next_job += 1
         self.jobs.append(job)
 
-        is_sleep = (len(segments) == 1 and segments[0][1] is None
-                    and len(first_argv) >= 2 and str(first_argv[0]) == "sleep")
+        # Специальный sleep-путь только для ровно одной команды ``sleep N``
+        # без пайпов, редиректов и логических операторов. Во всех остальных
+        # случаях фон идёт общим путём и исполняет pipeline/redirects целиком.
+        sleep_ticks = None
+        if (len(segments) == 1 and segments[0][1] is None
+                and len(first_parsed) == 1):
+            argv, redirects = first_parsed[0]
+            if (not redirects and len(argv) == 2
+                    and str(argv[0]) == "sleep"
+                    and str(argv[1]).isdigit()):
+                sleep_ticks = int(str(argv[1])) * TICKS_PER_SECOND
+        is_sleep = sleep_ticks is not None
 
         def worker(p):
             if is_sleep:
@@ -750,13 +761,9 @@ class Shell:
             self.write_stdout(f"[{job['id']}] Done    {cmdline}")
 
         if is_sleep:
-            try:
-                ticks = int(float(str(first_argv[1])) * TICKS_PER_SECOND)
-            except ValueError:
-                ticks = TICKS_PER_SECOND
             proc.remaining = 0
             proc.worker = worker
-            self.kernel.scheduler.block(proc, ticks, "sleep")
+            self.kernel.scheduler.block(proc, sleep_ticks, "sleep")
         else:
             proc.remaining = 10
             proc.worker = worker

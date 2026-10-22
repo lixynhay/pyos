@@ -3,7 +3,9 @@
 from ..errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
 from ..process import ProcessState
 from ..scheduler import TICKS_PER_SECOND
-from ..signals import SIGNAL_BY_NAME, signal_name, signal_number
+from ..signals import (
+    DEFAULT_ACTION, SIGNAL_BY_NAME, signal_name, signal_number,
+)
 from .registry import register
 
 
@@ -135,12 +137,19 @@ def cmd_kill(ctx, args, stdin):
     signum = _parse_kill_signal(opts)
     if not pids:
         raise InvalidArgument("kill: usage: kill [-signum] pid ...")
+    # Сигналы с игнорируемым действием доставляются, но процесс не завершают.
+    ignore = DEFAULT_ACTION.get(signum) == "ign"
     errs = []
     for pid_s in pids:
         if not pid_s.lstrip("-").isdigit():
             errs.append(f"kill: {pid_s}: arguments must be process IDs")
             continue
         pid = int(pid_s)
+        if ignore:
+            proc = ctx.kernel.get_process(pid)
+            if proc is None or not proc.is_alive:
+                errs.append(f"kill: ({pid}) - No such process")
+            continue
         if not ctx.kernel.kill(pid, signum):
             errs.append(f"kill: ({pid}) - No such process")
     if errs:

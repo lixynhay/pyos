@@ -7,7 +7,6 @@
 
 import pytest
 
-from pyos.errors import NoSuchFileOrDirectory
 from pyos.process import ProcessState
 from pyos.signals import SIGCHLD, SIGTERM
 from pyos.shell import Shell
@@ -108,16 +107,116 @@ def test_kill_sets_128_plus_signum_and_reaps_immediately(kernel):
     assert len(kernel.processes) == 1
 
 
-def test_kill_allows_ign_signals_but_still_terminates(kernel):
-    proc = kernel.create_process(name="victim", remaining=100)
+def test_kill_allows_ign_signals_but_still_terminates(kernel, root, capsys):
+    # Stage 2a: expectation inverted (the name is kept from stage 1 for
+    # traceability). The shell kill now reads DEFAULT_ACTION and does not
+    # deliver ign signals to kernel.kill, so the process stays alive.
+    sh = Shell(kernel, root)
+    sh.handle_line("sleep 100 &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+    proc = job["proc"]
 
-    assert kernel.kill(proc.pid, SIGCHLD) is True
-    # CHARACTERIZATION: SIGCHLD has DEFAULT_ACTION "ign", but kernel.kill()
-    # terminates the process and reports 128+signum anyway. Signal semantics
-    # are separate debt.
-    assert proc.exit_code == 128 + SIGCHLD == 145
-    assert proc.state is ProcessState.TERMINATED
+    sh.handle_line(f"kill -CHLD {proc.pid}")
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert proc.is_alive is True
+    assert proc.exit_code == 0
+    assert kernel.get_process(proc.pid) is proc
+    assert job["done"] is False
+
+    # kernel.kill is intentionally unchanged: a signal that reaches the
+    # kernel still terminates the process with 128+signum.
+    victim = kernel.create_process(name="victim", remaining=100)
+    assert kernel.kill(victim.pid, SIGCHLD) is True
+    assert victim.exit_code == 128 + SIGCHLD == 145
+    assert victim.state is ProcessState.TERMINATED
+    assert kernel.get_process(victim.pid) is None
+
+
+def test_kill_ign_signal_does_not_terminate(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("sleep 100 &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+    proc = job["proc"]
+
+    sh.handle_line(f"kill -CHLD {proc.pid}")
+    capsys.readouterr()
+
+    assert kernel.get_process(proc.pid) is proc
+    assert proc.is_alive is True
+    assert proc.exit_code == 0
+    assert job["done"] is False
+
+    sh.handle_line("jobs")
+    out = capsys.readouterr().out
+    assert "Running" in out
+    assert "Done" not in out
+
+
+def test_kill_ign_returns_zero(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("sleep 100 &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+
+    sh.handle_line(f"kill -CHLD {job['pid']}")
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert sh.exit_code == 0
+    assert job["proc"].is_alive is True
+
+
+def test_kill_winch_does_not_terminate(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("sleep 100 &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+    proc = job["proc"]
+
+    sh.handle_line(f"kill -WINCH {proc.pid}")
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert kernel.get_process(proc.pid) is proc
+    assert proc.is_alive is True
+    assert proc.exit_code == 0
+
+
+def test_kill_term_still_terminates(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("sleep 100 &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+    proc = job["proc"]
+
+    sh.handle_line(f"kill -TERM {proc.pid}")
+    capsys.readouterr()
+
     assert kernel.get_process(proc.pid) is None
+    assert proc.is_alive is False
+    assert proc.exit_code == 143
+
+
+def test_kill_kill_still_terminates(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("sleep 100 &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+    proc = job["proc"]
+
+    sh.handle_line(f"kill -KILL {proc.pid}")
+    capsys.readouterr()
+
+    assert kernel.get_process(proc.pid) is None
+    assert proc.is_alive is False
+    assert proc.exit_code == 137
 
 
 def test_zombie_state_is_never_assigned_today(kernel, root, capsys):
@@ -318,21 +417,29 @@ def test_wait_waitpid_absent_today(kernel, root, capsys):
 # ---------------------------------------------------------------------------
 
 def test_background_sleep_pipeline_current_behavior(kernel, root, capsys):
+    # Stage 2a: expectation inverted (the name is kept from stage 1 for
+    # traceability). A background pipeline now runs through the general path.
     sh = Shell(kernel, root)
 
-    sh.handle_line("sleep 1 | touch /tmp/pipeline_marker &")
+    sh.handle_line("echo hello | cat &")
     capsys.readouterr()
     job = sh.jobs[0]
-    assert job["proc"].state is ProcessState.BLOCKED
+
+    kernel.scheduler.drain()
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if not line.startswith("[")]
+    assert lines == ["hello"]
+    assert job["done"] is True
+    assert job["proc"].exit_code == 0
+
+    sh.handle_line("sleep 1 > /tmp/pipeline_marker &")
+    capsys.readouterr()
+    job = sh.jobs[1]
 
     kernel.scheduler.drain()
     capsys.readouterr()
 
-    # CHARACTERIZATION: is_sleep looks only at the first argv and does not
-    # check that the job is a single-command pipeline, so the rest of the
-    # pipeline never executes. separate debt (not part of stage 2 by default).
-    with pytest.raises(NoSuchFileOrDirectory):
-        kernel.fs.lookup("/tmp/pipeline_marker", user=root)
+    assert kernel.fs.lookup("/tmp/pipeline_marker", user=root).is_file()
     assert job["done"] is True
     assert job["proc"].exit_code == 0
     assert len(kernel.processes) == 1
