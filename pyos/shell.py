@@ -411,7 +411,7 @@ class Shell:
                 try:
                     cmds = parse_pipeline(seg_tokens)
                 except PyOSError as exc:
-                    self.write_stderr(f"pyos: {exc.label}")
+                    self.write_stderr(f"pyos: {exc.message}")
                     code = 2
                 else:
                     code = self.execute_pipeline(cmds, user)
@@ -466,8 +466,10 @@ class Shell:
                         try:
                             stdin_data = self._read_redirect(target, user)
                         except PyOSError as exc:
-                            self.write_stderr(f"{argv[0]}: {target}: {exc.label}")
+                            self.write_stderr(
+                                f"{argv[0]}: {target}: {exc.message}")
                             self.last_code = 1
+                            self.exit_code = 1
                             return 1
                 argv = self._glob_argv(argv, user)
                 out, err, code = self.run_single(argv, stdin_data, user)
@@ -483,7 +485,7 @@ class Shell:
                         wrote_file = True
                     except PyOSError as exc:
                         self.write_stderr(
-                            f"{argv[0] if argv else 'pyos'}: {target}: {exc.label}")
+                            f"{argv[0] if argv else 'pyos'}: {target}: {exc.message}")
                         code = 1
 
             if err:
@@ -560,6 +562,8 @@ class Shell:
             proc.state = ProcessState.TERMINATED
             proc.cpu_ticks += 1
             if self._in_worker:
+                # Фоновый worker выполняется вне тика планировщика; время
+                # двигаем вручную (хрупко, см. README «Ограничения»).
                 self.kernel.scheduler.clock += 1
             else:
                 self.kernel.idle(1)
@@ -580,9 +584,14 @@ class Shell:
 
     @staticmethod
     def _format_error(name, exc):
+        prefix = f"{name}: "
+        message = exc.message
+        if message.startswith(prefix):
+            # сообщение уже содержит имя команды (например "save: ...")
+            return message
         if exc.path:
-            return f"{name}: {exc.path}: {exc.label}"
-        return f"{name}: {exc.label}"
+            return f"{name}: {exc.path}: {message}"
+        return f"{name}: {message}"
 
     # -- фоновые задания -----------------------------------------------------
     @staticmethod

@@ -9,7 +9,7 @@ import random
 from collections import deque
 
 from . import KERNEL_NAME, KERNEL_RELEASE, __version__
-from .errors import NoSpaceLeft
+from .errors import NoSpaceLeft, NoSuchFileOrDirectory
 from .fs import Dir, FileSystem, VirtualFile
 from .process import Process, ProcessState
 from .scheduler import Scheduler, TICKS_PER_SECOND
@@ -131,6 +131,24 @@ class Kernel:
         self.log_buffer.append(f"[{self.scheduler.clock:>6}] {message}")
 
     # -- /proc и /dev --------------------------------------------------------
+    def reset_virtual_fs(self):
+        """Пересоздаёт /dev и /proc как виртуальные подсистемы.
+
+        Используется после ``load``: виртуальные узлы не сериализуются,
+        поэтому их нужно восстановить поверх загруженного дерева ФС.
+        """
+        fs = self.fs
+        for path in ("/dev", "/proc"):
+            try:
+                fs.lookup(path, None, "/", "/")
+            except NoSuchFileOrDirectory:
+                pass
+            else:
+                fs.unlink(path, None, "/", "/", recursive=True)
+            fs.mkdir(path, None, "/", "/")
+        self._setup_dev()
+        self._setup_proc()
+
     def _tree_size(self, node) -> int:
         if node.is_file():
             return node.size

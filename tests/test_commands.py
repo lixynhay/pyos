@@ -58,3 +58,38 @@ def test_top_header_has_nice_column(kernel, root, capsys):
     out = capsys.readouterr().out
     assert "NI" in out
     assert "CPU" not in out
+
+
+def test_error_message_reaches_stderr(kernel, root, capsys):
+    """Ошибка пути печатает текст, а не безликое 'Error'."""
+    Shell(kernel, root).handle_line("cat /tmp/no-such-file.txt")
+    err = capsys.readouterr().err
+    assert "No such file or directory" in err
+    assert "Error" not in err
+
+
+def test_generic_error_message_visible(kernel, user, capsys):
+    """PyOSError(message) доходит до пользователя без искажения."""
+    Shell(kernel, user).handle_line("load /tmp/snapshot.json")
+    err = capsys.readouterr().err
+    assert "only root can load state" in err
+    assert "Error" not in err
+
+
+def test_syntax_error_message_visible(kernel, root, capsys):
+    """Ошибка разбора печатает своё сообщение."""
+    Shell(kernel, root).handle_line("cat >")
+    err = capsys.readouterr().err
+    assert "syntax error" in err
+
+
+def test_input_redirect_error_sets_exit_code(kernel, root, capsys):
+    """Неудачный '<' возвращает 1 и обновляет $?"""
+    sh = Shell(kernel, root)
+    sh.handle_line("cat < /tmp/no-such-input.txt")
+    capsys.readouterr()
+    assert sh.last_code == 1
+    assert sh.exit_code == 1
+
+    sh.handle_line("echo $?")
+    assert capsys.readouterr().out.strip() == "1"

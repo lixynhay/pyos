@@ -642,7 +642,7 @@ class FileSystem:
         if snode.is_dir():
             raise PermissionDenied(src)
         if not snode.is_file():
-            raise InvalidArgument(src)
+            raise InvalidArgument(f"{src}: not a regular file")
         parent, name, norm = self._parent_and_name(dst, cwd, home, user)
         if not parent.is_dir():
             raise NotADirectory(norm)
@@ -668,7 +668,7 @@ class FileSystem:
             self.write_file(dnorm, snode.data, user, cwd, home)
             return self._walk(dnorm, "/", "/", True, 0, user)
         if not snode.is_dir():
-            raise InvalidArgument(src)
+            raise InvalidArgument(f"{src}: unsupported file type")
         try:
             dnode = self._walk(dnorm, "/", "/", True, 0, user)
         except NoSuchFileOrDirectory:

@@ -17,6 +17,16 @@ from .registry import register
 # ============================================================================
 
 
+# /proc и /dev наполняются ядром при загрузке: в снапшот они не попадают,
+# а после load пересоздаются через Kernel.reset_virtual_fs().
+VOLATILE_ROOTS = ("/dev", "/proc")
+
+
+def _is_virtual_path(path):
+    return any(path == root or path.startswith(root + "/")
+               for root in VOLATILE_ROOTS)
+
+
 def _serialize_node(path, node):
     """Сериализует один узел ФС в словарь."""
     entry = {
@@ -37,6 +47,8 @@ def _walk_and_serialize(fs):
     entries = {}
 
     def walk(node, prefix=""):
+        if prefix and _is_virtual_path(prefix):
+            return
         if node.is_dir():
             entries[prefix] = _serialize_node(prefix, node)
             for name in sorted(node.children):
@@ -165,6 +177,10 @@ def _restore_fs(fs, entries):
     # Сохраняем старый root для восстановления при ошибке
     old_root = fs.root
 
+    # /proc и /dev не восстанавливаем из снапшота (в т.ч. старые снапшоты,
+    # где они могли оказаться обычными файлами) — их пересоздаёт ядро.
+    entries = {p: e for p, e in entries.items() if not _is_virtual_path(p)}
+
     try:
         # Создаём новое пустое дерево
         from ..fs import Dir, File, Symlink
@@ -281,6 +297,7 @@ def cmd_load(ctx, args, stdin):
     # Файловая система
     if "filesystem" in state:
         _restore_fs(ctx.fs, state["filesystem"])
+        ctx.kernel.reset_virtual_fs()
 
     node_count = len(state.get("filesystem", {}))
     return f"load: loaded ({node_count} nodes) from '{filename}'"

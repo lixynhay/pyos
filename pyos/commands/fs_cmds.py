@@ -48,14 +48,14 @@ def cmd_ls(ctx, args, stdin):
         try:
             node = ctx.fs.lookup(path, ctx.cwd, ctx.home)
         except PyOSError as exc:
-            out_lines.append(f"ls: cannot access '{path}': {exc.label}")
+            out_lines.append(f"ls: cannot access '{path}': {exc.message}")
             continue
 
         if node.is_dir():
             try:
                 entries = ctx.fs.listdir(path, ctx.user, ctx.cwd, ctx.home)
             except PyOSError as exc:
-                out_lines.append(f"ls: cannot open directory '{path}': {exc.label}")
+                out_lines.append(f"ls: cannot open directory '{path}': {exc.message}")
                 continue
             if not show_all:
                 entries = [e for e in entries if not e.name.startswith(".")]
@@ -203,7 +203,7 @@ def cmd_rm(ctx, args, stdin):
             if not force:
                 errors.append(f"rm: cannot remove '{path}': No such file or directory")
         except PyOSError as exc:
-            errors.append(f"rm: cannot remove '{path}': {exc.label}")
+            errors.append(f"rm: cannot remove '{path}': {exc.message}")
     if errors:
         return ("\n".join(errors), 1)
     return None

@@ -312,7 +312,7 @@ def cmd_makepkg(ctx, args, stdin):
     depends = pkg_vars.get("depends", [])
 
     if ctx.user.uid != 0:
-        raise PermissionDenied("makepkg: only root can build packages")
+        raise PermissionDenied(message="makepkg: only root can build packages")
 
     build_dir = f"{BUILD_ROOT}/{pkgname}-{pkgver}"
     pkgdir = build_dir + "/pkg"
@@ -604,7 +604,7 @@ def cmd_pkg(ctx, args, stdin):
       pkg info <pkgname>      — информация о пакете
     """
     if ctx.user.uid != 0:
-        raise PermissionDenied("pkg: only root can manage packages")
+        raise PermissionDenied(message="pkg: only root can manage packages")
 
     if not args:
         return "Usage: pkg install|remove|list|info [args]"

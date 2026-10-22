@@ -8,6 +8,7 @@ import pytest
 
 from pyos.context import Context
 from pyos.errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
+from pyos.fs import VirtualFile
 from pyos.shell import Shell
 
 
@@ -225,6 +226,98 @@ def test_load_replace_current_state(kernel, root):
 
     with pytest.raises(NoSuchFileOrDirectory):
         kernel.fs.lookup("/extra.txt", root, "/", "/")
+
+
+# ============================================================================
+# /proc и /dev: снапшот и восстановление
+# ============================================================================
+
+
+def test_save_excludes_virtual_fs(kernel, root):
+    """/proc и /dev не попадают в снапшот."""
+    from pyos.commands.memory_cmds import cmd_save
+
+    ctx = Context(kernel, root, "/root")
+    tmpname = _create_snapshot(kernel, root)
+    try:
+        with open(tmpname, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        paths = state["filesystem"]
+        assert all(not (p == "/dev" or p.startswith("/dev/")) for p in paths)
+        assert all(not (p == "/proc" or p.startswith("/proc/")) for p in paths)
+    finally:
+        os.unlink(tmpname)
+
+
+def test_load_restores_dev_as_virtual(kernel, root, capsys):
+    """После load /dev/null снова устройство, а не обычный файл."""
+    from pyos.commands.memory_cmds import cmd_load
+
+    ctx = Context(kernel, root, "/root")
+    tmpname = _create_snapshot(kernel, root)
+    try:
+        cmd_load(ctx, [tmpname], "")
+
+        assert isinstance(kernel.fs.lookup("/dev/null", root, "/", "/"),
+                          VirtualFile)
+        sh = Shell(kernel, root)
+        sh.handle_line("echo payload > /dev/null")
+        capsys.readouterr()
+        assert kernel.fs.read_file("/dev/null", root, "/", "/") == ""
+    finally:
+        os.unlink(tmpname)
+
+
+def test_load_restores_proc_as_dynamic(kernel, root):
+    """После load /proc/uptime снова меняется со временем."""
+    from pyos.commands.memory_cmds import cmd_load
+
+    ctx = Context(kernel, root, "/root")
+    tmpname = _create_snapshot(kernel, root)
+    try:
+        cmd_load(ctx, [tmpname], "")
+
+        node = kernel.fs.lookup("/proc/uptime", root, "/", "/")
+        assert isinstance(node, VirtualFile)
+
+        before = kernel.fs.read_file("/proc/uptime", root, "/", "/")
+        kernel.scheduler.tick(10)
+        after = kernel.fs.read_file("/proc/uptime", root, "/", "/")
+        assert before != after
+    finally:
+        os.unlink(tmpname)
+
+
+def test_load_ignores_static_proc_dev_from_old_snapshot(kernel, root):
+    """Старые снапшоты со статическими /proc и /dev игнорируются."""
+    from pyos.commands.memory_cmds import cmd_load
+
+    ctx = Context(kernel, root, "/root")
+    tmpname = _create_snapshot(kernel, root)
+    try:
+        with open(tmpname, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        state["filesystem"]["/dev/null"] = {
+            "type": "file", "uid": 0, "gid": 0, "mode": 0o666,
+            "data": "stale",
+        }
+        state["filesystem"]["/proc/uptime"] = {
+            "type": "file", "uid": 0, "gid": 0, "mode": 0o444,
+            "data": "stale",
+        }
+        with open(tmpname, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+        cmd_load(ctx, [tmpname], "")
+
+        assert isinstance(kernel.fs.lookup("/dev/null", root, "/", "/"),
+                          VirtualFile)
+        assert isinstance(kernel.fs.lookup("/proc/uptime", root, "/", "/"),
+                          VirtualFile)
+        assert kernel.fs.read_file("/dev/null", root, "/", "/") == ""
+        assert kernel.fs.read_file("/proc/uptime", root, "/", "/") != "stale"
+    finally:
+        os.unlink(tmpname)
 
 
 # ============================================================================
