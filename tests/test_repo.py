@@ -2,13 +2,17 @@
 
 import hashlib
 import json
+import os
+import tempfile
 from unittest import mock
 
 import pytest
 
+from pyos.commands.memory_cmds import cmd_load, cmd_save
 from pyos.commands.package_cmds import cmd_pkg
 from pyos.context import Context
 from pyos.errors import InvalidArgument, NoSuchFileOrDirectory, PermissionDenied, PyOSError
+from pyos.kernel import Kernel
 from pyos.repo import (
     REPOS_CONFIG,
     REPO_INDEX_MAX_BYTES,
@@ -171,6 +175,39 @@ def _manifest(kernel, root, name):
         return None
 
 
+def _make_source_repo(kernel, root, packages, name="local", url=None):
+    """Создаёт path-репозиторий с настоящим source index.json для update."""
+    repo = _make_repo(kernel, root, name=name, packages=packages, url=url)
+    cached = kernel.fs.read_file(
+        f"/var/cache/repos/{name}/index.json", root, "/", "/")
+    _ensure(kernel, root, repo["url"].rstrip("/"))
+    kernel.fs.write_file(repo["url"] + "index.json", cached, root, "/", "/")
+    for path in (f"/var/cache/repos/{name}/index.json",
+                 f"/var/cache/repos/{name}/index.meta.json"):
+        try:
+            kernel.fs.unlink(path, root, "/", "/")
+        except PyOSError:
+            pass
+    return repo
+
+
+def _save_load(kernel, root):
+    """Сохраняет состояние на хост и загружает его в новый Kernel."""
+    fd, path = tempfile.mkstemp(prefix="pyos-state-", suffix=".json")
+    os.close(fd)
+    try:
+        cmd_save(_ctx(kernel, root), [path], "")
+        new_kernel = Kernel()
+        new_root = new_kernel.users.get_by_name("root")
+        cmd_load(_ctx(new_kernel, new_root), [path], "")
+        return new_kernel, new_root
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 # -- pkg repo add/remove/list -----------------------------------------------
 
 
@@ -257,6 +294,69 @@ def test_repo_list_shows_entries(kernel, root, user):
     for expected in ("core", "local", "https", "/srv/repo/", "path",
                      "True", "5", "100"):
         assert expected in result
+
+
+# -- pkg repo enable/disable ------------------------------------------------
+
+
+def test_repo_enable_disables_and_enables(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [_repo("core"), _repo("local")])
+
+    result = cmd_pkg(ctx, ["repo", "disable", "core"], "")
+    assert "disabled 'core'" in result
+    config = json.loads(kernel.fs.read_file(REPOS_CONFIG, root, "/", "/"))
+    assert config["repos"][0]["enabled"] is False
+
+    result = cmd_pkg(ctx, ["repo", "enable", "core"], "")
+    assert "enabled 'core'" in result
+    config = json.loads(kernel.fs.read_file(REPOS_CONFIG, root, "/", "/"))
+    assert config["repos"][0]["enabled"] is True
+
+
+def test_repo_disable_excludes_from_update_and_install(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_source_repo(kernel, root, [
+        {"name": "hello", "version": "1.0"},
+    ])
+    _write_config(kernel, root, [
+        _repo(repo["name"], repo["url"], "path", enabled=False),
+    ])
+
+    result = cmd_pkg(ctx, ["repo", "update"], "")
+    assert "no enabled repositories" in result
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup(
+            "/var/cache/repos/local/index.json", root, "/", "/")
+
+    with pytest.raises(InvalidArgument, match="no enabled repositories"):
+        cmd_pkg(ctx, ["install", "hello"], "")
+    with pytest.raises(InvalidArgument, match="disabled"):
+        cmd_pkg(ctx, ["install", "hello@local"], "")
+    assert _manifest(kernel, root, "hello") is None
+
+
+def test_repo_enable_requires_root(kernel, root, user):
+    _write_config(kernel, root, [_repo("core")])
+    ctx = _ctx(kernel, user)
+
+    with pytest.raises(PermissionDenied):
+        cmd_pkg(ctx, ["repo", "disable", "core"], "")
+    with pytest.raises(PermissionDenied):
+        cmd_pkg(ctx, ["repo", "enable", "core"], "")
+
+
+def test_repo_list_shows_enabled_state(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [
+        _repo("core", enabled=True),
+        _repo("local", enabled=False),
+    ])
+
+    result = cmd_pkg(ctx, ["repo", "list"], "")
+
+    assert "core" in result and "True" in result
+    assert "local" in result and "False" in result
 
 
 # -- чтение index.json ------------------------------------------------------
@@ -1678,3 +1778,275 @@ def test_upgrade_topological_order_with_chain(kernel, root):
         cmd_pkg(ctx, ["upgrade"], "")
 
     assert calls == ["c", "b", "a"]
+
+
+# -- context in error messages ----------------------------------------------
+
+
+def test_error_message_missing_index_cache_includes_repo_and_update_hint(
+        kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [_repo("local", "/srv/local/")])
+
+    with pytest.raises(InvalidArgument) as exc:
+        cmd_pkg(ctx, ["install", "hello"], "")
+
+    message = str(exc.value)
+    assert "local" in message
+    assert "pkg repo update" in message
+
+
+def test_error_message_sha_mismatch_includes_expected_and_actual(
+        kernel, root):
+    ctx = _ctx(kernel, root)
+    package_data = _package_json(name="hello", version="1.0")
+    actual = hashlib.sha256(
+        json.dumps(package_data).encode("utf-8")).hexdigest()
+    expected = "b" * 64
+    repo = _make_repo(kernel, root, packages=[{
+        "name": "hello", "version": "1.0",
+        "data": package_data, "sha256": expected,
+    }])
+    _use_repos(kernel, root, [repo])
+
+    with pytest.raises(PyOSError) as exc:
+        cmd_pkg(ctx, ["install", "hello"], "")
+
+    message = str(exc.value)
+    assert "local" in message
+    assert expected in message
+    assert actual in message
+    assert "/var/cache/packages/local/hello-1.0.pkg.json" in message
+
+
+def test_error_message_file_conflict_includes_path_and_owners(kernel, root):
+    ctx = _ctx(kernel, root)
+    shared = _file("/usr/bin/shared", "one")
+    kernel.fs.write_file(
+        "/root/one.pkg.json",
+        json.dumps(_package_json(name="one", files=[shared])),
+        root, "/", "/")
+    kernel.fs.write_file(
+        "/root/two.pkg.json",
+        json.dumps(_package_json(name="two", files=[shared])),
+        root, "/", "/")
+    cmd_pkg(ctx, ["install", "/root/one.pkg.json"], "")
+
+    with pytest.raises(InvalidArgument) as exc:
+        cmd_pkg(ctx, ["install", "/root/two.pkg.json"], "")
+
+    message = str(exc.value)
+    assert "/usr/bin/shared" in message
+    assert "one" in message
+    assert "two" in message
+
+
+def test_error_message_reverse_dependency_includes_dependent_and_spec(
+        kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("gvim", "1.0", depends=["lib=1.0"]),
+    ])
+    _switch_repo(kernel, root, [_upgrade_spec("lib", "2.0")])
+
+    with pytest.raises(InvalidArgument) as exc:
+        cmd_pkg(ctx, ["upgrade", "lib"], "")
+
+    message = str(exc.value)
+    assert "gvim" in message
+    assert "lib=1.0" in message
+
+
+def test_error_message_downgrade_refused_includes_versions(kernel, root):
+    ctx = _install_old(kernel, root, [
+        _upgrade_spec("lib", "2.0"),
+        _upgrade_spec("app", "1.0"),
+    ])
+    _switch_repo(kernel, root, [
+        _upgrade_spec("lib", "1.0"),
+        _upgrade_spec("app", "2.0", depends=["lib=1.0"]),
+    ])
+
+    with pytest.raises(InvalidArgument) as exc:
+        cmd_pkg(ctx, ["upgrade", "app"], "")
+
+    message = str(exc.value)
+    assert "lib" in message
+    assert "installed 2.0-1" in message
+    assert "candidate 1.0-1" in message
+
+
+# -- offline save/load of package state -------------------------------------
+
+
+def test_save_load_preserves_repo_index_cache(kernel, root):
+    repo = _make_source_repo(kernel, root, [
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+    cmd_pkg(_ctx(kernel, root), ["repo", "update"], "")
+
+    cached_before = kernel.fs.read_file(
+        "/var/cache/repos/local/index.json", root, "/", "/")
+    meta_before = kernel.fs.read_file(
+        "/var/cache/repos/local/index.meta.json", root, "/", "/")
+    new_kernel, new_root = _save_load(kernel, root)
+
+    assert new_kernel.fs.read_file(
+        "/var/cache/repos/local/index.json", new_root, "/", "/"
+    ) == cached_before
+    assert new_kernel.fs.read_file(
+        "/var/cache/repos/local/index.meta.json", new_root, "/", "/"
+    ) == meta_before
+
+
+def test_save_load_preserves_package_cache(kernel, root):
+    repo = _make_source_repo(kernel, root, [
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+    ctx = _ctx(kernel, root)
+    cmd_pkg(ctx, ["repo", "update"], "")
+    cmd_pkg(ctx, ["install", "hello"], "")
+
+    cache_path = _package_cache("local", "hello", "1.0")
+    cached_before = kernel.fs.read_file(cache_path, root, "/", "/")
+    new_kernel, new_root = _save_load(kernel, root)
+
+    assert new_kernel.fs.read_file(
+        cache_path, new_root, "/", "/") == cached_before
+
+
+def test_save_load_preserves_installed_db(kernel, root):
+    repo = _make_source_repo(kernel, root, [
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+    ctx = _ctx(kernel, root)
+    cmd_pkg(ctx, ["repo", "update"], "")
+    cmd_pkg(ctx, ["install", "hello"], "")
+
+    manifest_before = kernel.fs.read_file(
+        "/var/lib/packages/installed/hello.json", root, "/", "/")
+    new_kernel, new_root = _save_load(kernel, root)
+
+    assert new_kernel.fs.read_file(
+        "/var/lib/packages/installed/hello.json", new_root, "/", "/"
+    ) == manifest_before
+    assert "hello" in cmd_pkg(
+        _ctx(new_kernel, new_root), ["list"], "")
+
+
+def test_save_load_preserves_file_owners_db(kernel, root):
+    repo = _make_source_repo(kernel, root, [
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+    ctx = _ctx(kernel, root)
+    cmd_pkg(ctx, ["repo", "update"], "")
+    cmd_pkg(ctx, ["install", "hello"], "")
+
+    owners_before = kernel.fs.read_file(
+        "/var/lib/packages/file-owners.json", root, "/", "/")
+    new_kernel, new_root = _save_load(kernel, root)
+
+    assert new_kernel.fs.read_file(
+        "/var/lib/packages/file-owners.json", new_root, "/", "/"
+    ) == owners_before
+    assert json.loads(owners_before)["/usr/bin/hello"] == "hello"
+
+
+def test_offline_install_from_cache_after_load(kernel, root):
+    repo = _make_source_repo(kernel, root, [
+        {"name": "hello", "version": "1.0"},
+        {"name": "cached", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+    ctx = _ctx(kernel, root)
+    cmd_pkg(ctx, ["repo", "update"], "")
+    cmd_pkg(ctx, ["install", "hello"], "")
+    cmd_pkg(ctx, ["install", "cached"], "")
+    cmd_pkg(ctx, ["remove", "cached"], "")
+
+    new_kernel, new_root = _save_load(kernel, root)
+    assert new_kernel.fs.read_file(
+        _package_cache("local", "cached", "1.0"), new_root, "/", "/")
+
+    for path in ("/srv/local/index.json",
+                 "/srv/local/packages/cached-1.0.pkg.json"):
+        new_kernel.fs.unlink(path, new_root, "/", "/")
+
+    result = cmd_pkg(
+        _ctx(new_kernel, new_root), ["install", "cached"], "")
+
+    assert "installed 'cached'" in result
+    assert _manifest(new_kernel, new_root, "cached")["version"] == "1.0"
+
+
+def test_offline_upgrade_dry_run_after_load(kernel, root):
+    repo = _make_source_repo(kernel, root, [
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+    ctx = _ctx(kernel, root)
+    cmd_pkg(ctx, ["repo", "update"], "")
+    cmd_pkg(ctx, ["install", "hello"], "")
+
+    _make_source_repo(kernel, root, [
+        {"name": "hello", "version": "2.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+    cmd_pkg(ctx, ["repo", "update"], "")
+
+    new_kernel, new_root = _save_load(kernel, root)
+    for path in ("/srv/local/index.json",
+                 "/srv/local/packages/hello-2.0.pkg.json"):
+        new_kernel.fs.unlink(path, new_root, "/", "/")
+
+    result = cmd_pkg(
+        _ctx(new_kernel, new_root), ["upgrade", "--dry-run"], "")
+
+    assert "upgrade hello 1.0-1 -> 2.0-1" in result
+    assert _manifest(new_kernel, new_root, "hello")["version"] == "1.0"
+
+
+# -- pkg help/usage ---------------------------------------------------------
+
+
+def test_pkg_usage_mentions_repo_subcommands(kernel, root):
+    result = cmd_pkg(_ctx(kernel, root), [], "")
+
+    for expected in ("pkg repo add", "pkg repo remove", "pkg repo list",
+                     "pkg repo update", "pkg repo enable",
+                     "pkg repo disable"):
+        assert expected in result
+
+
+def test_pkg_upgrade_usage_exists(kernel, root):
+    ctx = _ctx(kernel, root)
+    assert "pkg upgrade" in cmd_pkg(ctx, [], "")
+    assert "pkg upgrade [<name>...] [--dry-run] [--force]" in cmd_pkg(
+        ctx, ["help"], "")
+
+    with pytest.raises(InvalidArgument, match="usage: pkg upgrade"):
+        cmd_pkg(ctx, ["upgrade", "--bogus"], "")
+
+
+def test_pkg_search_usage_exists(kernel, root):
+    ctx = _ctx(kernel, root)
+    assert "pkg search <query>" in cmd_pkg(ctx, [], "")
+
+    with pytest.raises(InvalidArgument, match="usage: pkg search"):
+        cmd_pkg(ctx, ["search"], "")
+
+
+def test_invalid_repo_subcommand_gives_usage_error_not_traceback(
+        kernel, root):
+    with pytest.raises(InvalidArgument) as exc:
+        cmd_pkg(_ctx(kernel, root), ["repo", "bogus"], "")
+
+    message = str(exc.value)
+    assert "unknown action" in message
+    assert "usage" in message
+    assert "enable" in message
+    assert "disable" in message

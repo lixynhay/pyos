@@ -26,6 +26,17 @@ INSTALLED_ROOT = f"{LIB_ROOT}/installed"
 OWNERS_FILE = f"{LIB_ROOT}/file-owners.json"
 PKG_FORMAT = 1
 
+PKG_USAGE = (
+    "Usage: pkg install <name|name@repo|name[op]version|file.pkg.json> "
+    "[--dry-run] | "
+    "pkg upgrade [<name>...] [--dry-run] [--force] | "
+    "pkg remove <name> [--force] [--dry-run] | "
+    "pkg list | pkg info <name> | pkg search <query> | "
+    "pkg repo add <name> <url> [--type http|path] [--priority N] | "
+    "pkg repo remove <name> | pkg repo list | "
+    "pkg repo update [<name>...] | pkg repo enable <name> | "
+    "pkg repo disable <name>")
+
 # -- сравнение версий -------------------------------------------------------
 
 
@@ -511,14 +522,34 @@ def _read_manifest(fs, user, pkgname):
         f"{LIB_ROOT}/{pkgname}/manifest",
     ):
         try:
-            return json.loads(fs.read_file(path, user, "/", "/"))
-        except (NoSuchFileOrDirectory, json.JSONDecodeError, PyOSError):
+            text = fs.read_file(path, user, "/", "/")
+        except NoSuchFileOrDirectory:
             continue
+        except PyOSError as exc:
+            raise InvalidArgument(
+                f"pkg: cannot read installed DB for '{pkgname}' "
+                f"('{path}'): {exc}")
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise InvalidArgument(
+                f"pkg: invalid installed DB for '{pkgname}' "
+                f"('{path}'): {exc.msg}")
+        if not isinstance(data, dict):
+            raise InvalidArgument(
+                f"pkg: installed DB for '{pkgname}' ('{path}') "
+                "must be a JSON object")
+        return data
     return None
 
 
 def _write_manifest(fs, user, pkgname, manifest):
     """Пишет manifest в новую базу и в старый путь для совместимости."""
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise InvalidArgument(
+            f"pkg: installed DB for '{pkgname}' is missing a files list")
     _ensure_dir(fs, LIB_ROOT, user)
     _ensure_dir(fs, INSTALLED_ROOT, user)
     data = json.dumps(manifest, indent=2, ensure_ascii=False)
@@ -532,11 +563,21 @@ def _write_manifest(fs, user, pkgname, manifest):
 def _read_owners(fs, user):
     """Читает базу владельцев файлов: путь -> имя пакета."""
     try:
-        data = json.loads(fs.read_file(OWNERS_FILE, user, "/", "/"))
-    except (NoSuchFileOrDirectory, json.JSONDecodeError, PyOSError):
+        text = fs.read_file(OWNERS_FILE, user, "/", "/")
+    except NoSuchFileOrDirectory:
         return {}
+    except PyOSError as exc:
+        raise InvalidArgument(
+            f"pkg: cannot read file owners DB '{OWNERS_FILE}': {exc}")
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InvalidArgument(
+            f"pkg: invalid file owners DB '{OWNERS_FILE}': {exc.msg}")
     if not isinstance(data, dict):
-        return {}
+        raise InvalidArgument(
+            f"pkg: file owners DB '{OWNERS_FILE}' must be a JSON object")
     return {str(path): str(name) for path, name in data.items()}
 
 
@@ -885,9 +926,16 @@ def _install_package_file(ctx, path, dry_run=False):
 
     existing = _read_manifest(ctx.fs, ctx.user, name)
     if existing is not None:
+        installed_version, installed_release = _manifest_identity(existing)
+        installed_full = f"{installed_version}-{installed_release}"
+        candidate_full = f"{version}-{release}"
+        if pkgvercmp(candidate_full, installed_full) < 0:
+            raise PyOSError(
+                f"pkg: downgrade refused for '{name}': installed "
+                f"{installed_full}, candidate {candidate_full}")
         raise PyOSError(
             f"pkg: '{name}' is already installed "
-            f"(version {existing.get('pkgver', existing.get('version', '?'))})"
+            f"(installed {installed_full}, candidate {candidate_full})"
         )
 
     installed = set(_get_installed_packages(ctx.fs, ctx.user))
@@ -896,7 +944,8 @@ def _install_package_file(ctx, path, dry_run=False):
         dep_name = _dep_name(dep)
         if dep_name and dep_name not in installed:
             raise InvalidArgument(
-                f"pkg: missing dependency '{dep}' for '{name}'")
+                f"pkg: missing dependency '{dep}' for '{name}': "
+                f"package '{dep_name}' is not installed")
 
     for conflict in pkg["conflicts"]:
         conflict_name = _dep_name(conflict)
@@ -911,7 +960,8 @@ def _install_package_file(ctx, path, dry_run=False):
         target = entry["path"]
         owner = owners.get(target)
         if owner:
-            file_conflicts.append(f"  {target} (owned by {owner})")
+            file_conflicts.append(
+                f"  {target} (owned by {owner}, requested by {name})")
             continue
         try:
             node = ctx.fs.lookup(target, ctx.user, "/", "/")
@@ -1138,10 +1188,11 @@ def _plan_upgrade(ctx, names, force):
                 _package_full_version(package), state["full"])
             if comparison < 0:
                 raise InvalidArgument(
-                    f"pkg upgrade: downgrade refused for dependency "
+                    f"pkg upgrade: downgrade refused for package "
                     f"'{dep_name}': installed {state['full']}, candidate "
                     f"{_package_full_version(package)} "
-                    f"(required by '{required_by}')")
+                    f"(required by '{required_by}', repository "
+                    f"'{repo['name']}')")
             if comparison == 0:
                 raise InvalidArgument(
                     f"pkg upgrade: dependency '{raw}' required by "
@@ -1228,8 +1279,8 @@ def _plan_upgrade(ctx, names, force):
                 planned_dep = planned[dep_name]["package"]
                 if not _version_matches(
                         planned_dep, dep["op"], dep["version"], pkgvercmp):
-                    return (f"dependency '{raw}' is not satisfied by "
-                            f"planned '{dep_name}' "
+                    return (f"dependency '{raw}' required by '{name}' is "
+                            f"not satisfied by planned '{dep_name}' "
                             f"{_package_full_version(planned_dep)}")
                 continue
 
@@ -1238,10 +1289,12 @@ def _plan_upgrade(ctx, names, force):
                 if _state_matches(
                         state, dep["op"], dep["version"], pkgvercmp):
                     continue
-                return (f"dependency '{raw}' is not installed or does "
-                        f"not satisfy the requirement")
+                return (f"dependency '{raw}' required by '{name}' is not "
+                        f"installed or does not satisfy the requirement "
+                        f"(installed {state['full']})")
 
-            return f"dependency '{raw}' is not installed"
+            return (f"dependency '{raw}' required by '{name}' is not "
+                    "installed")
         return None
 
     warned = set()
@@ -1436,7 +1489,7 @@ def _upgrade_precheck_files(ctx, targets, owners):
             if owner is not None and owner != name and owner not in transaction:
                 raise InvalidArgument(
                     f"pkg upgrade: file conflict for '{name}': '{path}' "
-                    f"is owned by '{owner}'")
+                    f"is owned by '{owner}' (requested by '{name}')")
             if owner is None:
                 try:
                     node = ctx.fs.lookup(path, ctx.user, "/", "/")
@@ -1642,21 +1695,31 @@ def _remove_package(ctx, pkgname, force=False, dry_run=False):
     if dry_run:
         return f"pkg: would remove '{pkgname}'"
 
-    files = _manifest_paths(manifest)
     owners = _read_owners(ctx.fs, ctx.user)
+    if isinstance(manifest.get("files"), list):
+        files = _manifest_paths(manifest)
+    else:
+        files = [path for path, owner in owners.items() if owner == pkgname]
+        if not files:
+            raise InvalidArgument(
+                f"pkg: installed DB for '{pkgname}' is missing a files list "
+                "and has no owned files; refusing to remove")
     errors = []
     for fpath in files:
         owner = owners.get(fpath)
         if owner is not None and owner != pkgname:
             continue
+        removed = False
         try:
             # Удаляем только если файл существует
             ctx.fs.unlink(fpath, ctx.user, "/", "/")
+            removed = True
         except NoSuchFileOrDirectory:
-            pass
+            removed = True
         except PyOSError as exc:
             errors.append(str(exc))
-        owners.pop(fpath, None)
+        if removed:
+            owners.pop(fpath, None)
 
     # Удаляем manifest обоих форматов.
     try:
@@ -1765,12 +1828,7 @@ def _format_pkg_info(data, installed=False):
 
 
 @register("pkg",
-          usage=("pkg install <name|name@repo|name[op]version|file.pkg.json> "
-                 "[--dry-run] | "
-                 "pkg upgrade [<name>...] [--dry-run] [--force] | "
-                 "pkg remove <name> [--force] [--dry-run] | "
-                 "pkg list | pkg info <name> | pkg search <query> | "
-                 "pkg repo add|remove|list|update ..."),
+          usage=PKG_USAGE,
           summary="Управление пакетами",
           category="system")
 def cmd_pkg(ctx, args, stdin):
@@ -1789,17 +1847,20 @@ def cmd_pkg(ctx, args, stdin):
       pkg repo ...            — управление репозиториями
     """
     if not args:
-        return ("Usage: pkg install|upgrade|search|remove|list|info|repo "
-                "[args]")
+        return PKG_USAGE
 
     subcmd = args[0]
     cmd_args = args[1:]
 
     # pkg repo list и pkg search доступны всем, остальные pkg — только root.
     repo_list = subcmd == "repo" and cmd_args[:1] == ["list"]
-    read_only = repo_list or subcmd == "search"
+    read_only = (repo_list or subcmd == "search"
+                 or subcmd in ("help", "--help", "-h"))
     if not read_only and ctx.user.uid != 0:
         raise PermissionDenied(message="pkg: only root can manage packages")
+
+    if subcmd in ("help", "--help", "-h"):
+        return PKG_USAGE
 
     if subcmd == "repo":
         # Ленивый импорт: разрывает цикл repo -> commands.network_cmds ->
@@ -1832,9 +1893,13 @@ def cmd_pkg(ctx, args, stdin):
 
         positional = [a for a in cmd_args if not a.startswith("--")]
         if not positional:
-            raise InvalidArgument("pkg install: missing package name or file")
+            raise InvalidArgument(
+                "pkg install: missing package name or file "
+                "(usage: pkg install <name|file.pkg.json> [--dry-run])")
         if len(positional) > 1:
-            raise InvalidArgument("pkg install: too many arguments")
+            raise InvalidArgument(
+                "pkg install: too many arguments "
+                "(usage: pkg install <name|file.pkg.json> [--dry-run])")
 
         target = positional[0]
         if "/" in target or target.endswith(".json"):
@@ -1847,7 +1912,9 @@ def cmd_pkg(ctx, args, stdin):
         unknown = [a for a in cmd_args
                    if a.startswith("--") and a not in allowed]
         if unknown:
-            raise InvalidArgument(f"pkg upgrade: unknown option '{unknown[0]}'")
+            raise InvalidArgument(
+                f"pkg upgrade: unknown option '{unknown[0]}' "
+                "(usage: pkg upgrade [<name>...] [--dry-run] [--force])")
 
         positional = [a for a in cmd_args if not a.startswith("--")]
         for name in positional:
@@ -1866,12 +1933,18 @@ def cmd_pkg(ctx, args, stdin):
         unknown = [a for a in cmd_args
                    if a.startswith("--") and a not in allowed]
         if unknown:
-            raise InvalidArgument(f"pkg remove: unknown option '{unknown[0]}'")
+            raise InvalidArgument(
+                f"pkg remove: unknown option '{unknown[0]}' "
+                "(usage: pkg remove <name> [--force] [--dry-run])")
         positional = [a for a in cmd_args if not a.startswith("--")]
         if not positional:
-            raise InvalidArgument("pkg remove: missing package name")
+            raise InvalidArgument(
+                "pkg remove: missing package name "
+                "(usage: pkg remove <name> [--force] [--dry-run])")
         if len(positional) > 1:
-            raise InvalidArgument("pkg remove: too many arguments")
+            raise InvalidArgument(
+                "pkg remove: too many arguments "
+                "(usage: pkg remove <name> [--force] [--dry-run])")
         return _remove_package(ctx, positional[0],
                                force="--force" in cmd_args,
                                dry_run="--dry-run" in cmd_args)
@@ -1881,11 +1954,12 @@ def cmd_pkg(ctx, args, stdin):
 
     elif subcmd == "info":
         if not cmd_args:
-            raise InvalidArgument("pkg info: missing package name")
+            raise InvalidArgument(
+                "pkg info: missing package name (usage: pkg info <name>)")
         return _show_package_info(ctx, cmd_args[0])
 
     else:
         raise InvalidArgument(
             f"pkg: unknown subcommand '{subcmd}' "
-            "(use: install, upgrade, search, remove, list, info, repo)"
-        )
+            "(use: install, upgrade, search, remove, list, info, repo, "
+            "help)")

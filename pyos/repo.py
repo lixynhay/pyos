@@ -200,18 +200,40 @@ def remove_repo(ctx, name):
     return f"repo: removed '{name}'"
 
 
+def set_repo_enabled(ctx, name, enabled):
+    """Включает или выключает репозиторий в repos.json."""
+    config = read_repos(ctx.fs, ctx.user)
+    matches = [repo for repo in config["repos"] if repo["name"] == name]
+    if not matches:
+        raise InvalidArgument(f"repo: '{name}' not found")
+
+    repo = matches[0]
+    state = "enabled" if enabled else "disabled"
+    if repo["enabled"] == enabled:
+        return f"repo: '{name}' is already {state}"
+
+    repo["enabled"] = enabled
+    _write_repos(ctx.fs, ctx.user, config)
+    return f"repo: {state} '{name}'"
+
+
 def list_repos(ctx):
     """Печатает репозитории из конфига."""
     config = read_repos(ctx.fs, ctx.user)
     if not config["repos"]:
         return "repo: no repositories configured"
 
-    lines = [f"{'NAME':<16} {'TYPE':<5} {'ENABLED':<8} {'PRIORITY':<9} URL"]
-    lines.append("-" * 72)
+    lines = [
+        f"{'NAME':<16} {'TYPE':<5} {'ENABLED':<8} {'STATE':<9} "
+        f"{'PRIORITY':<9} URL"
+    ]
+    lines.append("-" * 82)
     for repo in config["repos"]:
+        state = "enabled" if repo["enabled"] else "disabled"
         lines.append(
             f"{repo['name']:<16} {repo['type']:<5} "
-            f"{str(repo['enabled']):<8} {repo['priority']:<9} {repo['url']}")
+            f"{str(repo['enabled']):<8} {state:<9} "
+            f"{repo['priority']:<9} {repo['url']}")
     return "\n".join(lines)
 
 
@@ -357,42 +379,54 @@ def _validate_index_package(entry, repo):
 
 def _parse_index(text, source, repo):
     """Валидирует текст index.json и возвращает нормализованный индекс."""
+    repo_name = repo["name"]
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise InvalidArgument(
-            f"repo: invalid index '{source}': {exc.msg}")
+            f"repo: invalid index '{source}' for repository '{repo_name}': "
+            f"{exc.msg}")
 
     if not isinstance(data, dict):
         raise InvalidArgument(
-            f"repo: index '{source}' must be a JSON object")
+            f"repo: index '{source}' for repository '{repo_name}' "
+            "must be a JSON object")
 
     fmt = data.get("format")
     if fmt != 1:
         raise InvalidArgument(
-            f"repo: unsupported index format {fmt!r} (expected 1)")
+            f"repo: index '{source}' for repository '{repo_name}': "
+            f"unsupported format {fmt!r} (expected 1)")
 
     repo_field = data.get("repo")
     if repo_field is not None and not isinstance(repo_field, str):
         raise InvalidArgument(
-            f"repo: index '{source}': 'repo' must be a string")
+            f"repo: index '{source}' for repository '{repo_name}': "
+            "'repo' must be a string")
 
     raw_packages = data.get("packages", [])
     if not isinstance(raw_packages, list):
         raise InvalidArgument(
-            f"repo: index '{source}': 'packages' must be a list")
+            f"repo: index '{source}' for repository '{repo_name}': "
+            "'packages' must be a list")
 
     packages = []
-    seen = set()
-    for entry in raw_packages:
-        package = _validate_index_package(entry, repo)
+    seen = {}
+    for position, entry in enumerate(raw_packages, 1):
+        try:
+            package = _validate_index_package(entry, repo)
+        except InvalidArgument as exc:
+            raise InvalidArgument(
+                f"repo: index '{source}' for repository '{repo_name}', "
+                f"package entry #{position}: {_clean_error(exc)}")
         key = (package["name"], package["version"],
                package["release"], package["arch"])
         if key in seen:
             raise InvalidArgument(
-                f"repo: index '{source}': duplicate package "
-                f"{key[0]}-{key[1]}-{key[2]}-{key[3]}")
-        seen.add(key)
+                f"repo: index '{source}' for repository '{repo_name}': "
+                f"duplicate package {key[0]}-{key[1]}-{key[2]}-{key[3]} "
+                f"(entries #{seen[key]} and #{position})")
+        seen[key] = position
         packages.append(package)
 
     return {
@@ -412,9 +446,13 @@ def read_index(fs, user, repo):
     try:
         text = fs.read_file(source, user, "/", "/")
     except NoSuchFileOrDirectory:
-        raise InvalidArgument(f"repo: index not found: '{source}'")
+        raise InvalidArgument(
+            f"repo: index not found for repository '{repo['name']}': "
+            f"'{source}'")
     except PyOSError as exc:
-        raise InvalidArgument(f"repo: cannot read index '{source}': {exc}")
+        raise InvalidArgument(
+            f"repo: cannot read index for repository '{repo['name']}' "
+            f"'{source}': {exc}")
 
     return _parse_index(text, source, repo), text
 
@@ -422,7 +460,7 @@ def read_index(fs, user, repo):
 def _clean_error(exc):
     """Убирает служебный префикс из сообщения для warning-строки."""
     text = str(exc)
-    for prefix in ("curl: ", "repo: "):
+    for prefix in ("curl: ", "repo: index: ", "repo: "):
         if text.startswith(prefix):
             return text[len(prefix):]
     return text
@@ -464,8 +502,15 @@ def update_repos(ctx, names=None):
         if missing:
             raise InvalidArgument(f"repo: '{missing[0]}' not found")
         targets = [known[name] for name in names]
+        disabled = [repo["name"] for repo in targets if not repo["enabled"]]
+        if disabled:
+            raise InvalidArgument(
+                f"repo: '{disabled[0]}' is disabled "
+                f"(use pkg repo enable {disabled[0]})")
     else:
-        targets = config["repos"]
+        targets = [repo for repo in config["repos"] if repo["enabled"]]
+        if config["repos"] and not targets:
+            return "repo: no enabled repositories"
 
     if not targets:
         return "repo: no repositories configured"
@@ -900,12 +945,14 @@ def _safe_package_url(repo, package):
             or _SCHEME_RE.match(relative)
             or ".." in relative.split("/")):
         raise InvalidArgument(
-            f"pkg: unsafe package url '{relative}' for '{name}'")
+            f"pkg: unsafe package url '{relative}' for '{name}' in "
+            f"repository '{repo['name']}'")
 
     resolved = base + relative
     if not resolved.startswith(base):
         raise InvalidArgument(
-            f"pkg: package url escapes repository base: '{relative}'")
+            f"pkg: package url escapes repository '{repo['name']}' base: "
+            f"'{relative}'")
     return resolved
 
 
@@ -916,7 +963,8 @@ def _package_cache_path(repo, package):
             or "/" in filename or "\\" in filename
             or filename in (".", "..")):
         raise InvalidArgument(
-            f"pkg: unsafe package filename {filename!r}")
+            f"pkg: unsafe package filename {filename!r} for "
+            f"'{package.get('name', '?')}' in repository '{repo['name']}'")
     return f"{PACKAGE_CACHE_ROOT}/{repo['name']}/{filename}"
 
 
@@ -930,15 +978,20 @@ def _fetch_package_text(ctx, repo, package, url):
                 raise_for_status=True)
         except (PyOSError, InvalidArgument) as exc:
             raise PyOSError(
-                f"pkg: failed to download '{package['name']}': "
+                f"pkg: failed to download '{package['name']}' from "
+                f"repository '{repo['name']}' ({url}): "
                 f"{_clean_error(exc)}")
 
     try:
         return ctx.fs.read_file(url, ctx.user, "/", "/")
     except NoSuchFileOrDirectory:
-        raise InvalidArgument(f"pkg: package file not found: '{url}'")
+        raise InvalidArgument(
+            f"pkg: package file not found for '{package['name']}' in "
+            f"repository '{repo['name']}': '{url}'")
     except PyOSError as exc:
-        raise InvalidArgument(f"pkg: cannot read package '{url}': {exc}")
+        raise InvalidArgument(
+            f"pkg: cannot read package '{package['name']}' from "
+            f"repository '{repo['name']}' ({url}): {exc}")
 
 
 def _remove_cached_file(ctx, path):
@@ -976,8 +1029,10 @@ def _cache_package(ctx, repo, package, with_status=False):
         if size is not None and cached_size > size:
             _remove_cached_file(ctx, cache_path)
             raise PyOSError(
-                f"pkg: package '{package['name']}' exceeds declared size "
-                f"({cached_size} > {size})")
+                f"pkg: package '{package['name']}' from repository "
+                f"'{repo['name']}' exceeds declared size "
+                f"(expected at most {size} bytes, actual {cached_size} "
+                f"bytes; cache '{cache_path}')")
         return (cache_path, True) if with_status else cache_path
 
     text = _fetch_package_text(ctx, repo, package, url)
@@ -989,16 +1044,19 @@ def _cache_package(ctx, repo, package, with_status=False):
     if actual_sha.lower() != expected_sha:
         _remove_cached_file(ctx, cache_path)
         raise PyOSError(
-            f"pkg: sha256 mismatch for '{package['name']}': "
-            f"expected {expected_sha}, got {actual_sha}")
+            f"pkg: sha256 mismatch for '{package['name']}' from repository "
+            f"'{repo['name']}' (cache '{cache_path}'): expected "
+            f"{expected_sha}, got {actual_sha}")
 
     size = package.get("size")
     actual_size = len(text.encode("utf-8"))
     if size is not None and actual_size > size:
         _remove_cached_file(ctx, cache_path)
         raise PyOSError(
-            f"pkg: package '{package['name']}' exceeds declared size "
-            f"({actual_size} > {size})")
+            f"pkg: package '{package['name']}' from repository "
+            f"'{repo['name']}' exceeds declared size "
+            f"(expected at most {size} bytes, actual {actual_size} bytes; "
+            f"cache '{cache_path}')")
 
     return (cache_path, False) if with_status else cache_path
 
@@ -1078,9 +1136,14 @@ def _parse_priority(value):
 
 def handle_repo_command(ctx, args):
     """Обрабатывает ``pkg repo ...``."""
+    usage = (
+        "Usage: pkg repo add <name> <url> [--type http|path] "
+        "[--priority N] | pkg repo remove <name> | pkg repo list | "
+        "pkg repo update [<name>...] | pkg repo enable <name> | "
+        "pkg repo disable <name>")
+
     if not args:
-        return ("Usage: pkg repo add <name> <url> [--type http|path] "
-                "[--priority N] | remove <name> | list | update [<name>...]")
+        return usage
 
     action = args[0]
     rest = args[1:]
@@ -1088,7 +1151,10 @@ def handle_repo_command(ctx, args):
     if action == "add":
         positional, options = _parse_options(rest, {"type", "priority"})
         if len(positional) != 2:
-            raise InvalidArgument("pkg repo add: expected <name> <url>")
+            raise InvalidArgument(
+                "pkg repo add: expected <name> <url> "
+                "(usage: pkg repo add <name> <url> [--type http|path] "
+                "[--priority N])")
         repo_type = options.get("type", "http")
         priority = _parse_priority(options.get("priority", "10"))
         return add_repo(ctx, positional[0], positional[1],
@@ -1099,12 +1165,16 @@ def handle_repo_command(ctx, args):
         if options:
             raise InvalidArgument("pkg repo remove: unexpected option")
         if len(positional) != 1:
-            raise InvalidArgument("pkg repo remove: expected <name>")
+            raise InvalidArgument(
+                "pkg repo remove: expected <name> "
+                "(usage: pkg repo remove <name>)")
         return remove_repo(ctx, positional[0])
 
     if action == "list":
         if rest:
-            raise InvalidArgument("pkg repo list: unexpected arguments")
+            raise InvalidArgument(
+                "pkg repo list: unexpected arguments "
+                "(usage: pkg repo list)")
         return list_repos(ctx)
 
     if action == "update":
@@ -1113,5 +1183,16 @@ def handle_repo_command(ctx, args):
             raise InvalidArgument("pkg repo update: unexpected option")
         return update_repos(ctx, positional or None)
 
+    if action in ("enable", "disable"):
+        positional, options = _parse_options(rest, set())
+        if options:
+            raise InvalidArgument(
+                f"pkg repo {action}: unexpected option")
+        if len(positional) != 1:
+            raise InvalidArgument(
+                f"pkg repo {action}: expected <name> "
+                f"(usage: pkg repo {action} <name>)")
+        return set_repo_enabled(ctx, positional[0], action == "enable")
+
     raise InvalidArgument(
-        f"pkg repo: unknown action '{action}' (use: add, remove, list, update)")
+        f"pkg repo: unknown action '{action}' (usage: {usage})")

@@ -104,227 +104,262 @@ python -m pyos
   определяется по содержимому).
 
 ### Пакетный менеджер
-- PKGBUILD-подход (как в Arch): переменные `pkgname`, `pkgver`, `pkgrel`,
-  `pkgdesc`, `arch`, `depends` и функции `build()` / `package()`, которые
-  выполняются командами шелла pyOS;
-- `makepkg [PKGBUILD]` — сборка пакета в `/var/cache/packages`
-  (только root; внутри шагов доступны `$srcdir` и `$pkgdir`);
-- `pkg install <name>` — установка из репозиториев вместе с зависимостями,
-  если настроен `/etc/pyos/repos.json` (иначе — старый путь из кэша `makepkg`);
-- `pkg install <name>@<repo>` — корневой пакет только из указанного
-  репозитория (зависимости ищутся по всем enabled-репозиториям);
-- `pkg install <name>=<version>`, `>=`, `<=`, `>`, `<` — version-spec
-  (сравнение через `pkgvercmp`; `~=` не поддерживается);
-- зависимости из `depends` резолвятся рекурсивно: `name`, `name=ver`,
-  `name>=ver`, `name<=ver`, `name>ver`, `name<ver`; зависимости
-  устанавливаются раньше пакета, который от них зависит;
-- `pkg install <path.pkg.json>` — установка локального пакета из виртуальной
-  ФС;
-- `pkg remove <name> [--force]`, `pkg list`, `pkg info <name>`;
-- `pkg upgrade [<name>...] [--dry-run] [--force]` — обновление установленных
-  пакетов из репозиториев с проверкой зависимостей, обратных зависимостей,
-  sha256 и файловых конфликтов (только root);
-- `pkg search <query>` — регистронезависимый поиск по `name`/`description`
-  в кэшированных индексах enabled-репозиториев (read-only, доступен всем);
-- `--dry-run` для `pkg install`, `pkg upgrade` и `pkg remove` показывает план
-  без изменений ФС;
-- установленные пакеты хранятся в `/var/lib/packages/installed/<name>.json`,
-  владельцы файлов — в `/var/lib/packages/file-owners.json` (управление —
-  только root).
 
-Формат `.pkg.json` (version 1):
+`pkg` — основной путь установки пакетов в pyOS. `makepkg` и `PKGBUILD` остаются
+для совместимости и локальной сборки, но для репозиториев используется
+`.pkg.json` + `pkg install`.
+
+Пакет — это текстовый JSON-файл. Код из пакета не выполняется: pyOS только
+проверяет JSON, зависимости, пути, владельцев, sha256 и размер, после чего
+записывает файлы в виртуальную ФС.
+
+#### Формат `.pkg.json`
 
 ```json
 {
   "format": 1,
-  "name": "example",
+  "name": "hello",
   "version": "1.0",
   "release": 1,
   "arch": "any",
-  "description": "Example package",
-  "depends": [],
-  "provides": [],
-  "conflicts": [],
+  "description": "A friendly greeting",
+  "depends": ["base>=1.0"],
+  "provides": ["hello"],
+  "conflicts": ["hello-old"],
   "files": [
     {
-      "path": "/usr/bin/example",
+      "path": "/usr/bin/hello",
       "mode": "0755",
       "owner": "root",
       "group": "root",
       "encoding": "utf-8",
-      "content": "#!/bin/sh\necho example\n"
+      "content": "#!/bin/sh\necho Hello\n"
     }
   ]
 }
 ```
 
-Пути файлов должны быть абсолютными, `..` запрещены. Поддерживается только
-`encoding: "utf-8"`.
+Обязательные поля: `format`, `name`, `version`, `files`. `release` по
+умолчанию `1`, `arch` — `any`. Для файлов поддерживаются только `utf-8` и
+`utf8`; base64, tar, zip и двоичные вложения не поддерживаются. `signature`
+может присутствовать в индексе, но не проверяется.
+
+#### Команды
+
+```text
+pkg install <name> [--dry-run]
+pkg install <name>@<repo> [--dry-run]
+pkg install <name>=<version> [--dry-run]     # также >=, <=, >, <
+pkg install <path/to/file.pkg.json> [--dry-run]
+
+pkg upgrade [<name>...] [--dry-run] [--force]
+pkg remove <name> [--force] [--dry-run]
+pkg list
+pkg info <name>
+pkg search <query>
+
+pkg repo add <name> <url> [--type http|path] [--priority N]
+pkg repo remove <name>
+pkg repo list
+pkg repo update [<name>...]
+pkg repo enable <name>
+pkg repo disable <name>
+```
+
+`pkg install <name>` ищет пакет в кэше включённых репозиториев, рекурсивно
+разрешает зависимости и устанавливает их в порядке от зависимостей к
+зависимому пакету. `@repo` ограничивает только корневой пакет; его зависимости
+могут быть взяты из других включённых репозиториев.
+
+`pkg upgrade` обновляет только на более новые версии. `--dry-run` печатает
+план, `held back` и предупреждения, ничего не записывая. `--force` разрешает
+обновление, ломающее обратную зависимость, но выводит предупреждение; файловые
+конфликты `--force` не обходит.
+
+`pkg remove` отказывается удалять пакет, от которого зависят другие пакеты.
+`--force` снимает эту проверку.
+
+#### Права доступа
+
+| Команда | Кто может выполнять |
+|---|---|
+| `pkg install`, `pkg upgrade`, `pkg remove` | root |
+| `pkg list`, `pkg info` | root (текущее поведение) |
+| `pkg repo add`, `remove`, `update`, `enable`, `disable` | root |
+| `pkg search` | все пользователи |
+| `pkg repo list` | все пользователи |
+| `pkg help` / `pkg` без аргументов | все пользователи |
+| `makepkg` | root |
+
+Read-only командам (`pkg search`, `pkg repo list`) сеть и installed DB не нужны:
+они читают только кэш индексов.
+
+#### Установка по имени и кэш
+
+Перед `pkg install <name>` нужен кэш индекса. Если его нет:
+
+```text
+repo: no cached index for 'core', run pkg repo update first
+```
+
+`pkg install` не запускает `pkg repo update` автоматически. Скачанный индекс
+лежит в `/var/cache/repos/<repo>/index.json`, метаданные — в
+`/var/cache/repos/<repo>/index.meta.json`. Скачанный пакет лежит в
+`/var/cache/packages/<repo>/<filename>`.
+
+При установке проверяются:
+
+- `sha256` индекса пакета и фактического содержимого;
+- заявленный `size` (превышение — ошибка);
+- зависимости и их version-spec;
+- файловые конфликты с текущими владельцами;
+- запрет downgrade;
+- абсолютность и отсутствие `..` в путях.
+
+Повторная установка уже установленной версии отклоняется. Для обновления
+используйте `pkg upgrade`; для установки другой версии — явный version-spec,
+если это не downgrade.
 
 ### Репозитории пакетов
-Конфигурация: `/etc/pyos/repos.json`.
+
+Репозиторий — это каталог с `index.json` и пакетами. Поддерживаются два типа:
+
+- `http` — только `https://`, URL обязан заканчиваться `/`;
+- `path` — абсолютный путь внутри виртуальной ФС, тоже с `/` на конце.
+
+`http://` запрещён. Автоматического обновления индекса нет: `pkg repo update`
+нужно вызывать явно.
+
+#### Формат `repos.json`
+
+Файл: `/etc/pyos/repos.json`.
 
 ```json
 {
   "format": 1,
   "repos": [
     {
-      "name": "local",
-      "url": "/var/cache/repos/local/",
-      "type": "path",
+      "name": "core",
+      "url": "https://raw.githubusercontent.com/OWNER/pyos-packages/main/",
+      "type": "http",
       "enabled": true,
+      "priority": 10
+    },
+    {
+      "name": "local",
+      "url": "/srv/local/",
+      "type": "path",
+      "enabled": false,
       "priority": 100
     }
   ]
 }
 ```
 
-- `name` — lowercase-имя через дефисы, уникальное;
-- `type` — `http` (по умолчанию) или `path`; `http://` запрещён, для
-  сетевых репозиториев допускается только `https://` с завершающим `/`;
-- `url` для `type: "path"` — абсолютный путь виртуальной ФС с завершающим `/`;
-- `priority` — целое, больше = главнее (по умолчанию `10`);
-- `enabled` — по умолчанию `true`.
+`priority` сравнивается как целое: большее значение важнее. При одинаковом
+priority и одинаковом имени пакета установка не выбирает репозиторий наугад, а
+завершается ошибкой `ambiguous package`. `enabled: false` исключает репозиторий
+из `update`, `search`, `install` и `upgrade`; `pkg repo list` показывает
+состояние.
 
-Индекс репозитория: `<url>index.json`.
+#### Формат `index.json`
 
 ```json
 {
   "format": 1,
-  "repo": "local",
+  "repo": "core",
   "generated": "2026-10-23T22:40:00Z",
   "packages": [
     {
-      "name": "example",
+      "name": "hello",
       "version": "1.0",
       "release": 1,
       "arch": "any",
-      "filename": "example-1.0.pkg.json",
-      "url": "packages/example-1.0.pkg.json",
-      "sha256": "...",
-      "size": 1234,
-      "depends": [],
-      "provides": [],
-      "conflicts": [],
-      "description": "...",
+      "filename": "hello-1.0.pkg.json",
+      "url": "packages/hello-1.0.pkg.json",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "size": 512,
+      "description": "A friendly greeting",
       "license": "MIT",
+      "depends": ["base>=1.0"],
+      "provides": ["hello"],
+      "conflicts": ["hello-old"],
       "signature": null
     }
   ]
 }
 ```
 
-Команды:
+`url` и `filename` обязаны быть относительными; абсолютные URL, `..` и выход за
+базовый URL репозитория запрещены. `sha256` обязателен. `repo` в индексе должен
+совпадать с именем репозитория в `repos.json`; несовпадение даёт warning при
+`update`, но индекс всё равно кэшируется.
 
-- `pkg repo add <name> <url> [--type http|path] [--priority N]` — добавить
-  репозиторий (только root);
-- `pkg repo remove <name>` — удалить (только root);
-- `pkg repo list` — показать репозитории (доступно всем);
-- `pkg repo update [<name>...]` — обновить кэш индексов (только root).
+#### Полный workflow
 
-`pkg repo update` для `type: "path"` читает и валидирует индекс, для
-`type: "http"` скачивает `<url>index.json` через общий сетевой helper
-(тот же, что используют `curl`/`wget`). Для http:
+1. Создать `.pkg.json` вручную (в будущем — через `pkg pack`) или собрать
+   пакет через существующий `makepkg`.
+2. Положить файл в `pyos-packages/packages/`.
+3. Сгенерировать `index.json` через `tools/gen_repo_index.py`.
+4. Залить `index.json` и `packages/` в GitHub.
+5. В pyOS:
 
-- редиректы включены (`follow_redirects=True`), как у `wget`;
-- таймаут — `REQUEST_TIMEOUT` (10 секунд);
-- 429/5xx и сетевые ошибки дают warning по репозиторию, без retry; остальные
-  репозитории продолжают обновляться;
-- индекс больше 4 MiB (`REPO_INDEX_MAX_BYTES`) не парсится — ошибка
-  `index too large`;
-- ETag/Last-Modified/TTL не используются: индекс скачивается целиком при
-  каждом явном `pkg repo update`;
-- кэш (`/var/cache/repos/<name>/index.json` и `index.meta.json` с `fetched_at`,
-  `source_url`, `type`, `index_sha256`, `package_count`) обновляется только
-  после успешной валидации; при ошибке старый кэш не трогается.
+   ```text
+   pkg repo add core https://raw.githubusercontent.com/OWNER/pyos-packages/main/
+   pkg repo update
+   pkg search hello
+   pkg install hello
+   pkg upgrade --dry-run
+   pkg upgrade
+   pkg list
+   pkg info hello
+   pkg remove hello
+   ```
 
-Поиск по репозиториям:
+6. Для локальной проверки без сети использовать `type=path`:
 
-- `pkg search <query>` — регистронезависимый substring-match по `name` и
-  `description` в кэшированных индексах enabled-репозиториев; сеть не
-  используется, команда доступна всем;
-- вывод: `repo  name  version-release  arch  description`, по одной строке
-  на совпадение; сортировка по repo, затем name, затем версия по
-  `pkgvercmp` (по убыванию);
-- репозиторий без кэша индекса пропускается с warning
-  `run pkg repo update`; остальные репозитории продолжают искаться;
-- installed DB не читается и не меняется: установленные пакеты смотрите
-  через `pkg list`.
+   ```text
+   pkg repo add local /srv/local/ --type path
+   pkg repo update
+   pkg install hello
+   ```
 
-Установка по имени:
+#### save/load и оффлайн-кэш
 
-- `pkg install <name>` использует **только кэшированные** индексы; если кэша
-  нет — ошибка `run pkg repo update first`, автоматического скачивания нет;
-- enabled-репозитории сортируются по `priority` (больше = главнее), внутри
-  репозитория выбирается максимальная версия через `pkgvercmp`;
-- `pkg install <name>@<repo>` ограничивает поиск одним репозиторием **только
-  для корневого пакета**; его зависимости ищутся по всем enabled-репозиториям;
-- version-spec: `=`, `>=`, `<=`, `>`, `<`; `~=` пока не поддерживается;
-- если у нескольких репозиториев одинаковый максимальный `priority` и пакет
-  есть в них обоих — ошибка ambiguity со списком репозиториев и версий;
-- зависимости резолвятся жадно через DFS: версия выбирается по version-spec
-  зависимости, повторно уже разрешённый пакет не дублируется; цикл даёт
-  ошибку `dependency cycle` с цепочкой (`a -> b -> a`), отсутствующая
-  зависимость — `unsatisfied dependency` с именем и `required by`;
-- установка идёт в post-order: сначала зависимости, затем зависящий пакет;
-  каждая зависимость проходит тот же путь (индекс → скачивание → sha256 →
-  file-installer), код из пакета не исполняется;
-- если пакет уже установлен с версией, удовлетворяющей зависимости, он не
-  скачивается и не переустанавливается (проверка через `pkgvercmp` по
-  installed DB);
-- пакет скачивается в `/var/cache/packages/<repo>/<filename>`; если файл уже
-  есть и его sha256 совпадает с индексом, он переиспользуется;
-- sha256 скачанного пакета обязательно сверяется с индексом; при несовпадении
-  файл удаляется, установка не выполняется;
-- если в индексе указан `size`, превышение размера — ошибка;
-- после проверок путь кэша передаётся существующему file-installer
-  (`pkg install <path.pkg.json>`), установка файлов/owners/installed DB не
-  дублируется; код из пакета не исполняется;
-- `--dry-run` печатает полный план в порядке установки (включая зависимости)
-  и не оставляет установленных файлов и скачанного кэша.
+`save` сериализует виртуальную ФС, кроме `/dev` и `/proc`. Поэтому в снапшот
+попадают:
 
-Обновление пакетов:
+- `/var/cache/repos/<repo>/index.json` и `index.meta.json`;
+- `/var/cache/packages/<repo>/<filename>`;
+- `/var/lib/packages/installed/<name>.json`;
+- `/var/lib/packages/file-owners.json`.
 
-- `pkg upgrade` без имён пытается обновить все установленные пакеты,
-  `pkg upgrade <name>...` — только указанные; version-spec и `@repo` для
-  upgrade не поддерживаются;
-- кандидат выбирается по кэшированным индексам enabled-репозиториев: сначала
-  учитывается `priority` (больше = главнее), затем максимальный NVR через
-  `pkgvercmp`; одинаковый лучший NVR в нескольких репозиториях с равным
-  `priority` — ошибка ambiguity;
-- обновление выполняется только если NVR строго выше установленного
-  (`version`, затем `release`); даунгрейды не поддерживаются, в том числе с
-  `--force`;
-- `depends` нового пакета резолвятся рекурсивно: отсутствующая зависимость
-  ставится, установленная неудовлетворяющая — обновляется, цикл даёт ошибку;
-  `provides`/`conflicts` по-прежнему не резолвятся;
-- обратные зависимости проверяются по installed DB: при массовом upgrade
-  ломающий пакет пропускается как `held back`, при явном имени — ошибка,
-  а `--force` разрешает только это с предупреждением;
-- `--force` **не** обходит файловые конфликты, несовпадение sha256,
-  отсутствующие зависимости, даунгрейды, `http://` и path traversal;
-- весь план сначала скачивается в `/var/cache/packages/<repo>/<filename>`,
-  проверяется sha256/size и валидируется как `.pkg.json`; при ошибке ничего
-  не применяется;
-- файловые конфликты проверяются по owners DB до записи: новый файл не может
-  принадлежать чужому пакету вне транзакции, два пакета не могут ставить один
-  путь, а upgrade своего пакета может заменять собственные файлы;
-- пакеты применяются в топологическом порядке (зависимости первыми); для
-  нового install используется существующий file-installer, для upgrade —
-  отдельное безопасное применение;
-- после upgrade удаляются только старые файлы этого же пакета, которых нет в
-  новом списке, если владельцем остаётся он же; каталоги и файлы, ставшие
-  чужими, не удаляются;
-- `pkg repo update` автоматически не запускается: без кэша индекса команда
-  завершается ошибкой с подсказкой `run pkg repo update`.
+После `load` можно устанавливать пакеты из уже скачанного кэша без обращения к
+источнику. Для получения нового индекса или пакета, которых нет в кэше, всё
+равно нужен `pkg repo update` и доступ к репозиторию.
 
-Ограничения: при чтении индекса проверяются `format`, обязательные поля,
-`sha256`, дубли `(name, version, release, arch)` и отсутствие `..`/абсолютных
-URL. `provides` и `conflicts` в индексе парсятся, но repo-слой их не
-резолвит: виртуальные пакеты не удовлетворяют зависимости, а конфликты между
-пакетами из индекса не проверяются. File-installer при установке `.pkg.json`
-по-прежнему проверяет прямые `conflicts` из самого пакета. Код из индекса
-или пакета не исполняется.
+#### Ограничения
+
+- Поддерживаются только текстовые пакеты в UTF-8. Base64, двоичные файлы,
+  tar/zip-архивы и scriptlets/hooks не поддерживаются.
+- `provides` парсится, но не используется для разрешения зависимостей.
+  `conflicts` проверяется только по точным именам установленных пакетов, без
+  виртуальных provides и version-spec.
+- Подписи не проверяются; `signature` — заглушка.
+- `http://` запрещён; `--allow-http` отсутствует.
+- Нет автоматического `pkg repo update`, ETag/Last-Modified и TTL индекса.
+- Нет транзакционного rollback/journal при частичном сбое применения.
+- Нет downgrade: ни через `pkg upgrade`, ни через `pkg install` более старой
+  версии.
+- Файловые конфликты не обходятся `--force`.
+- `sha256` обязателен для пакетов из индекса; локальный
+  `pkg install <path.pkg.json>` работает без sha256, потому что файл не
+  скачивается.
+- `pkg repo update` обновляет только включённые репозитории, если имена не
+  указаны явно. Явное обновление disabled-репозитория даёт ошибку с подсказкой
+  `pkg repo enable`.
+- Ошибка в одном репозитории при `pkg repo update` превращается в warning; другие
+  репозитории продолжают обновляться.
 
 ### Состояние и лимиты
 - `save <файл>` — сохраняет ФС и пользователей в JSON **на реальном хосте**
@@ -454,12 +489,12 @@ pyos/
   сравнение упрощённое — числовые и буквенные сегменты, без полной
   семантики alpm.
 - `.pkg.json` поддерживает только `encoding: "utf-8"`; base64 и бинарные
-  файлы не реализованы. Зависимости проверяются по имени пакета, без
-  ограничений версий и без учёта `provides`; `pkg remove --force` может
+  файлы не реализованы. Зависимости проверяются по имени и version-spec, но
+  `provides` не используется. `conflicts` проверяется только по точным именам
+  установленных пакетов, без version-spec; `pkg remove --force` может
   оставить сломанные зависимости.
 - `pkg upgrade` не делает даунгрейдов; обратные зависимости проверяются, но
   `--force` может их сломать; файловые конфликты и sha256 им не обходятся.
-  `provides`/`conflicts` при upgrade, как и при install, не резолвятся, а
   `pkg repo update` нужно запускать явно.
 - `pkg repo update` для `type: "http"` использует реальную сеть хоста:
   `http://` запрещён, допускается только `https://`; редиректы и таймаут
