@@ -86,10 +86,10 @@ def test_foreground_command_sets_last_code_but_not_proc_exit_code(
     assert sh.exit_code == 1
     assert len(captured) == 1
     proc = captured[0]
-    # CHARACTERIZATION: foreground run_single() never stores the command
-    # status in the process; exit_code stays at the constructor default 0.
-    # fixed in stage 2.
-    assert proc.exit_code == 0
+    # Stage 2: expectation inverted (the name is kept from stage 1 for
+    # traceability). Foreground run_single() now writes the real status into
+    # proc.exit_code before reap().
+    assert proc.exit_code == 1
     assert proc.state is ProcessState.TERMINATED
     assert kernel.get_process(proc.pid) is None
     assert len(kernel.processes) == 1
@@ -188,7 +188,10 @@ def test_background_completion_sets_proc_exit_code_asynchronously(
     assert job["done"] is True
     assert job["proc"].exit_code == 1
     assert kernel.get_process(pid) is None
-    assert sh.last_code == 1
+    # Stage 2: the worker no longer writes the global $? asynchronously.
+    # (This assertion changed even though stage 1 listed this test as correct:
+    # the old last_code == 1 was exactly the worker-overwrites-global bug.)
+    assert sh.last_code == 0
     assert len(kernel.processes) == 1
 
 
@@ -207,10 +210,11 @@ def test_worker_overwrites_global_last_code_currently(kernel, root, capsys):
     kernel.scheduler.drain()
     capsys.readouterr()
 
-    # CHARACTERIZATION: the background worker runs _execute_segments() and
-    # writes the global last_code/exit_code as a side effect, overwriting the
-    # status of the later foreground command. fixed in stage 2.
-    assert sh.last_code == 1
+    # Stage 2: expectation inverted (the name is kept from stage 1 for
+    # traceability). The worker restores the global last_code/exit_code; it
+    # only publishes its real status through job["proc"].exit_code.
+    assert sh.last_code == 0
+    assert sh.exit_code == 0
     assert job["proc"].exit_code == 1
 
 
@@ -226,10 +230,11 @@ def test_fg_returns_zero_for_failed_job(kernel, root, capsys):
 
     assert job["done"] is True
     assert job["proc"].exit_code == 1
-    # CHARACTERIZATION: fg is not a real wait and always returns code 0,
-    # even when the job failed. fixed in stage 2.
-    assert sh.last_code == 0
-    assert sh.exit_code == 0
+    # Stage 2: expectation inverted (the name is kept from stage 1 for
+    # traceability). fg waits for the job and propagates its exit code.
+    assert sh.last_code == 1
+    assert sh.exit_code == 1
+    assert sh.env["?"] == "1"
 
 
 def test_jobs_killed_job_still_reports_running(kernel, root, capsys):
@@ -243,17 +248,17 @@ def test_jobs_killed_job_still_reports_running(kernel, root, capsys):
     sh.handle_line(f"kill {job['pid']}")
     capsys.readouterr()
 
-    # CHARACTERIZATION: kill removes the process and sets exit_code, but the
-    # job bookkeeping is never updated, so jobs still prints Running.
-    # fixed in stage 2.
+    # Stage 2: expectation inverted (the name is kept from stage 1 for
+    # traceability). jobs derives the finished state from
+    # job["done"] or not job["proc"].is_alive and prints the exit code.
     assert job["done"] is False
     assert job["proc"].exit_code == 143
     assert kernel.get_process(job["pid"]) is None
 
     sh.handle_line("jobs")
     out = capsys.readouterr().out
-    assert "Running" in out
-    assert "Done" not in out
+    assert "Running" not in out
+    assert "Done(143)" in out
 
 
 def test_bg_only_prints_and_does_not_resume(kernel, root, capsys):
@@ -282,22 +287,30 @@ def test_bg_only_prints_and_does_not_resume(kernel, root, capsys):
 
 
 def test_wait_waitpid_absent_today(kernel, root, capsys):
+    # Stage 2: expectation inverted (the name is kept from stage 1 for
+    # traceability). wait/waitpid now exist and return the job status.
     sh = Shell(kernel, root)
 
-    assert "wait" not in sh.builtins
-    assert "waitpid" not in sh.builtins
+    assert "wait" in sh.builtins
+    assert "waitpid" in sh.builtins
+
+    sh.handle_line("false &")
+    capsys.readouterr()
+    job = sh.jobs[0]
 
     sh.handle_line("wait")
-    err = capsys.readouterr().err
-    assert "wait: command not found" in err
-    assert sh.last_code == 127
+    capsys.readouterr()
+    assert job["done"] is True
+    assert job["proc"].exit_code == 1
+    assert sh.last_code == 1
 
-    sh.handle_line("waitpid")
-    err = capsys.readouterr().err
-    assert "waitpid: command not found" in err
-    assert sh.last_code == 127
-    # CHARACTERIZATION: wait/waitpid are not implemented at all. fixed in
-    # stage 2.
+    sh.handle_line("true &")
+    capsys.readouterr()
+    second = sh.jobs[1]
+    sh.handle_line(f"waitpid {second['pid']}")
+    capsys.readouterr()
+    assert second["done"] is True
+    assert sh.last_code == 0
 
 
 # ---------------------------------------------------------------------------
@@ -409,33 +422,37 @@ def test_scheduler_drain_and_run_until_have_tick_limit(kernel):
     assert proc.is_alive
 
     # CHARACTERIZATION: both helpers silently stop at their tick limit and do
-    # not report whether the predicate became true. fg relies on this.
+    # not report whether the predicate became true. fg no longer relies on
+    # that (it uses the wait helper); the limit itself is separate debt.
     assert sched.run_until(lambda: False, limit=9) == 9
     assert kernel.clock == 16
     assert proc.is_alive
 
 
 def test_fg_run_until_may_return_before_completion(kernel, root, capsys):
+    # Stage 2: expectation inverted (the name is kept from stage 1 for
+    # traceability). fg no longer trusts a blind run_until(limit): it waits
+    # until the job is really finished, even past the old 100000-tick limit.
     sh = Shell(kernel, root)
 
     sh.handle_line("false")
     capsys.readouterr()
     assert sh.last_code == 1
 
-    sh.handle_line("sleep 20000 &")
+    sh.handle_line("sleep 10001 &")
     capsys.readouterr()
     job = sh.jobs[0]
     proc = job["proc"]
     assert proc.state is ProcessState.BLOCKED
 
+    clock_before = kernel.scheduler.clock
     sh.handle_line("fg")
     capsys.readouterr()
 
-    # CHARACTERIZATION: fg uses run_until(default limit=100000) but never
-    # checks that the predicate became true. The job is still blocked, yet fg
-    # returns success and resets last_code to 0. separate debt / stage 2.
-    assert job["done"] is False
-    assert proc.is_alive is True
-    assert proc.state is ProcessState.BLOCKED
+    assert job["done"] is True
+    assert proc.is_alive is False
+    assert proc.state is ProcessState.TERMINATED
+    assert proc.exit_code == 0
+    assert kernel.scheduler.clock - clock_before > 100000
     assert sh.last_code == 0
     assert sh.exit_code == 0

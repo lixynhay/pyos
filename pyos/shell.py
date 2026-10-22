@@ -23,7 +23,8 @@ from .scheduler import TICKS_PER_SECOND
 
 BUILTIN_NAMES = {
     "exit", "export", "unset", "alias", "unalias", "history",
-    "jobs", "fg", "bg", "su", "sudo", "source", "set", "nice",
+    "jobs", "fg", "bg", "wait", "waitpid",
+    "su", "sudo", "source", "set", "nice",
 }
 
 
@@ -559,6 +560,7 @@ class Shell:
         except Exception as exc:  # noqa: BLE001 - защита REPL от падений команд
             out, code, err = "", 1, f"{name}: internal error: {exc}"
         finally:
+            proc.exit_code = code
             proc.state = ProcessState.TERMINATED
             proc.cpu_ticks += 1
             if self._in_worker:
@@ -642,6 +644,53 @@ class Shell:
 
         return value, rest
 
+    # -- завершение заданий -----------------------------------------------
+    @staticmethod
+    def _job_finished(job):
+        """Задание завершено: worker успел или процесс уже мёртв (kill)."""
+        return job["done"] or not job["proc"].is_alive
+
+    def _wait_job(self, job):
+        """Крутит тики, пока задание не завершится, и возвращает его код."""
+        while not self._job_finished(job):
+            self.kernel.scheduler.tick(1)
+        return job["proc"].exit_code
+
+    def _wait_all_jobs(self):
+        """Ждёт все активные задания; код последнего завершённого или 0."""
+        active = [j for j in self.jobs if not self._job_finished(j)]
+        code = 0
+        for job in active:
+            code = self._wait_job(job)
+        return code
+
+    def _find_job(self, spec):
+        """Находит job по ``%N`` или по PID. None — если такого нет."""
+        text = str(spec)
+        if text.startswith("%"):
+            try:
+                job_id = int(text[1:])
+            except ValueError:
+                return None
+            for job in self.jobs:
+                if job["id"] == job_id:
+                    return job
+            return None
+        try:
+            pid = int(text)
+        except ValueError:
+            return None
+        for job in self.jobs:
+            if job["pid"] == pid:
+                return job
+        return None
+
+    def _set_job_code(self, code):
+        """Делает код задания текущим $? (только явный wait/fg)."""
+        self.last_code = code
+        self.exit_code = code
+        self.env["?"] = str(code)
+
     def execute_background(self, tokens):
         segments = split_and_or(tokens)
         nice = 0
@@ -680,14 +729,23 @@ class Shell:
                     and len(first_argv) >= 2 and str(first_argv[0]) == "sleep")
 
         def worker(p):
-            if not is_sleep:
+            if is_sleep:
+                # Ветка sleep не исполняет segments (см. ограничение is_sleep),
+                # поэтому собственного кода команды у неё нет.
+                p.exit_code = 0
+            else:
                 prev = self._in_worker
+                saved_last = self.last_code
+                saved_exit = self.exit_code
                 self._in_worker = True
                 try:
-                    self._execute_segments(segments)
+                    code = self._execute_segments(segments)
                 finally:
                     self._in_worker = prev
-            p.exit_code = self.last_code
+                    # worker не должен асинхронно менять глобальный $?.
+                    self.last_code = saved_last
+                    self.exit_code = saved_exit
+                p.exit_code = code
             job["done"] = True
             self.write_stdout(f"[{job['id']}] Done    {cmdline}")
 
@@ -800,20 +858,38 @@ class Shell:
 
     def _bi_jobs(self, args, stdin, user):
         for job in self.jobs:
-            status = "Done" if job["done"] else "Running"
+            if self._job_finished(job):
+                status = f"Done({job['proc'].exit_code})"
+            else:
+                status = "Running"
             self.write_stdout(f"[{job['id']}] {status:<7} {job['cmdline']}")
         return None
 
+    def _bi_wait(self, args, stdin, user):
+        if not args:
+            code = self._wait_all_jobs()
+        else:
+            code = 0
+            for spec in args:
+                job = self._find_job(spec)
+                if job is None:
+                    raise UserError(f"{spec}: no such job")
+                code = self._wait_job(job)
+        self._set_job_code(code)
+        return None, code
+
+    def _bi_waitpid(self, args, stdin, user):
+        return self._bi_wait(args, stdin, user)
+
     def _bi_fg(self, args, stdin, user):
-        active = [j for j in self.jobs if not j["done"]]
+        active = [j for j in self.jobs if not self._job_finished(j)]
         if not active:
             self.write_stderr("fg: no current job")
-            return 1
+            return None, 1
         job = active[-1]
-        proc = job["proc"]
-        # дожидаемся завершения
-        self.kernel.scheduler.run_until(lambda: job["done"] or not proc.is_alive)
-        return None
+        code = self._wait_job(job)
+        self._set_job_code(code)
+        return None, code
 
     def _bi_bg(self, args, stdin, user):
         active = [j for j in self.jobs if not j["done"]]
