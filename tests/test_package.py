@@ -342,13 +342,13 @@ def test_pkgvercmp_1_0_vs_1_0_1():
     assert pkgvercmp("1.0", "1.0.1") == -1
 
 
-def test_pkgvercmp_release():
+def test_pkgvercmp_release_1_0_1_vs_1_0_2():
     from pyos.commands.package_cmds import pkgvercmp
     assert pkgvercmp("1.0-1", "1.0-2") == -1
     assert pkgvercmp("1.0-2", "1.0-2") == 0
 
 
-def test_pkgvercmp_epoch():
+def test_pkgvercmp_epoch_1_vs_2():
     from pyos.commands.package_cmds import pkgvercmp
     assert pkgvercmp("1:1.0", "2:0.1") == -1
     assert pkgvercmp("2:0.1", "1:9.9") == 1
@@ -394,6 +394,24 @@ def test_pkg_install_selects_highest_version_not_alphabetical(kernel, root):
 
     data = kernel.fs.read_file("/usr/share/hello-version.txt", root, "/", "/")
     assert data.strip() == "1.10"
+
+
+def test_pkg_info_selects_highest_cached_version(kernel, root):
+    """pkg info тоже берёт старшую версию из кэша, а не первую по порядку."""
+    from pyos.commands.package_cmds import cmd_makepkg, cmd_pkg
+    from pyos.context import Context
+
+    shell = Shell(kernel, root)
+    ctx = Context(kernel, root, "/root", shell=shell)
+
+    for version in ("1.9", "1.10"):
+        kernel.fs.write_file("/root/PKGBUILD",
+                             _versioned_pkgbuild(version), root, "/", "/")
+        cmd_makepkg(ctx, [], "")
+
+    result = cmd_pkg(ctx, ["info", "hello"], "")
+    assert "Version:    1.10-1" in result
+    assert "1.9" not in result
 
 
 # -- .pkg.json: установка локального пакета ----------------------------------

@@ -99,6 +99,27 @@ def pkgvercmp(a, b):
     return _compare_version_parts(release_a, release_b)
 
 
+def _cached_version_of(pkgname, dirname):
+    """Извлекает версию из имени каталога кэша ``<pkgname>-<ver>``."""
+    prefix = pkgname + "-"
+    return dirname[len(prefix):] if dirname.startswith(prefix) else ""
+
+
+def _choose_cached_package(pkgname, candidates):
+    """Выбирает каталог кэша с максимальной версией через pkgvercmp.
+
+    Возвращает ``(имя_каталога, версия)``.
+    """
+    chosen = candidates[0]
+    for name in candidates[1:]:
+        if pkgvercmp(_cached_version_of(pkgname, name),
+                     _cached_version_of(pkgname, chosen)) > 0:
+            chosen = name
+    if chosen.startswith(pkgname + "-"):
+        return chosen, chosen[len(pkgname) + 1:]
+    return chosen, pkgname
+
+
 # -- парсер PKGBUILD --------------------------------------------------------
 
 
@@ -972,17 +993,19 @@ def _show_package_info(ctx, pkgname):
     if manifest:
         return _format_pkg_info(manifest, installed=True)
 
-    # Потом смотрим в кэше
+    # Потом смотрим в кэше — выбираем самую новую версию.
     try:
         node = ctx.fs.lookup(f"{CACHE_ROOT}", ctx.user, "/", "/")
         if node.is_dir():
-            for name in node.children:
-                if name.startswith(pkgname + "-"):
-                    meta_text = ctx.fs.read_file(
-                        f"{CACHE_ROOT}/{name}/METADATA", ctx.user, "/", "/"
-                    )
-                    metadata = json.loads(meta_text)
-                    return _format_pkg_info(metadata, installed=False)
+            candidates = [name for name in node.children
+                          if name.startswith(pkgname + "-")]
+            if candidates:
+                name, _ = _choose_cached_package(pkgname, candidates)
+                meta_text = ctx.fs.read_file(
+                    f"{CACHE_ROOT}/{name}/METADATA", ctx.user, "/", "/"
+                )
+                metadata = json.loads(meta_text)
+                return _format_pkg_info(metadata, installed=False)
     except (NoSuchFileOrDirectory, PyOSError, json.JSONDecodeError):
         pass
 
@@ -1080,22 +1103,9 @@ def cmd_pkg(ctx, args, stdin):
                 f"pkg: package '{pkgname}' not found in cache"
             )
 
-        # Сравниваем версии численно: 1.10 новее 1.9.
-        def candidate_version(name):
-            prefix = pkgname + "-"
-            return name[len(prefix):] if name.startswith(prefix) else ""
-
-        chosen = candidates[0]
-        for name in candidates[1:]:
-            if pkgvercmp(candidate_version(name),
-                         candidate_version(chosen)) > 0:
-                chosen = name
-        # Извлекаем версию из имени
-        ver = chosen
-        if chosen.startswith(pkgname + "-"):
-            ver = chosen[len(pkgname) + 1:]
-        else:
-            ver = pkgname
+        chosen, ver = _choose_cached_package(pkgname, candidates)
+        if not chosen.startswith(pkgname + "-"):
+            # Каталог без версии: сохраняем прежнюю трактовку имени.
             pkgname = chosen
 
         return _install_from_cache(ctx, pkgname, ver, dry_run=dry_run)
