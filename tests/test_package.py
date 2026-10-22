@@ -311,3 +311,82 @@ def test_pkg_requires_root(kernel, user):
     ctx = Context(kernel, user, "/home/user")
     with pytest.raises(PyOSError, match="only root"):
         cmd_pkg(ctx, ["list"], "")
+
+
+# -- Сравнение версий --------------------------------------------------------
+
+def test_pkgvercmp_basic_equal():
+    from pyos.commands.package_cmds import pkgvercmp
+    assert pkgvercmp("1.0", "1.0") == 0
+
+
+def test_pkgvercmp_numeric_segments():
+    from pyos.commands.package_cmds import pkgvercmp
+    assert pkgvercmp("1.2", "1.10") == -1
+    assert pkgvercmp("10.0", "2.0") == 1
+    assert pkgvercmp("1.0", "1.0.0") == 0
+
+
+def test_pkgvercmp_1_9_vs_1_10():
+    from pyos.commands.package_cmds import pkgvercmp
+    assert pkgvercmp("1.9", "1.10") == -1
+    assert pkgvercmp("1.10", "1.9") == 1
+
+
+def test_pkgvercmp_1_0_vs_1_0_1():
+    from pyos.commands.package_cmds import pkgvercmp
+    assert pkgvercmp("1.0", "1.0.1") == -1
+
+
+def test_pkgvercmp_release():
+    from pyos.commands.package_cmds import pkgvercmp
+    assert pkgvercmp("1.0-1", "1.0-2") == -1
+    assert pkgvercmp("1.0-2", "1.0-2") == 0
+
+
+def test_pkgvercmp_epoch():
+    from pyos.commands.package_cmds import pkgvercmp
+    assert pkgvercmp("1:1.0", "2:0.1") == -1
+    assert pkgvercmp("2:0.1", "1:9.9") == 1
+
+
+def _versioned_pkgbuild(version):
+    return (
+        "pkgname=hello\n"
+        f"pkgver={version}\n"
+        "pkgrel=1\n"
+        'pkgdesc="versioned hello"\n'
+        'arch=("all")\n'
+        "depends=()\n"
+        "package() {\n"
+        '    mkdir -p "$pkgdir/usr/share"\n'
+        f'    echo "{version}" > "$pkgdir/usr/share/hello-version.txt"\n'
+        "}\n"
+    )
+
+
+def test_pkg_install_selects_highest_version_not_alphabetical(kernel, root):
+    """1.10 должна побеждать 1.9, хотя по алфавиту 1.9 идёт позже."""
+    import json
+
+    from pyos.commands.package_cmds import cmd_makepkg, cmd_pkg
+    from pyos.context import Context
+
+    shell = Shell(kernel, root)
+    ctx = Context(kernel, root, "/root", shell=shell)
+
+    for version in ("1.9", "1.10"):
+        kernel.fs.write_file("/root/PKGBUILD",
+                             _versioned_pkgbuild(version), root, "/", "/")
+        cmd_makepkg(ctx, [], "")
+
+    result = cmd_pkg(ctx, ["install", "hello"], "")
+    assert "1.10" in result
+
+    manifest = json.loads(
+        kernel.fs.read_file("/var/lib/packages/hello/manifest", root, "/", "/")
+    )
+    assert manifest["pkgver"] == "1.10"
+
+    data = kernel.fs.read_file("/usr/share/hello-version.txt", root, "/", "/")
+    assert data.strip() == "1.10"

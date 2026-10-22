@@ -23,6 +23,79 @@ CACHE_ROOT = "/var/cache/packages"
 LIB_ROOT = "/var/lib/packages"
 BUILD_ROOT = "/var/tmp/makepkg"
 
+# -- сравнение версий -------------------------------------------------------
+
+
+_VERSION_PART = re.compile(r"\d+|[A-Za-z]+")
+
+
+def _version_segments(text):
+    """Разбивает версию на числовые и нечисловые сегменты."""
+    return _VERSION_PART.findall(str(text))
+
+
+def _compare_segment(a, b):
+    """Сравнивает два сегмента: числа как числа, строки лексикографически."""
+    if a == b:
+        return 0
+    a_num = a.isdigit()
+    b_num = b.isdigit()
+    if a_num and b_num:
+        ai, bi = int(a), int(b)
+        return (ai > bi) - (ai < bi)
+    if a_num != b_num:
+        # Числовой сегмент считается новее буквенного (как в alpm).
+        return 1 if a_num else -1
+    return (a > b) - (a < b)
+
+
+def _compare_version_parts(a, b):
+    """Сравнивает version/release без epoch."""
+    left = _version_segments(a)
+    right = _version_segments(b)
+    for x, y in zip(left, right):
+        if x == y:
+            continue
+        return _compare_segment(x, y)
+    if len(left) == len(right):
+        return 0
+    longer = left if len(left) > len(right) else right
+    rest = longer[min(len(left), len(right)):]
+    # Хвостовые нули не делают версию новее: 1.0 == 1.0.0.
+    if all(part.isdigit() and int(part) == 0 for part in rest):
+        return 0
+    return 1 if len(left) > len(right) else -1
+
+
+def _split_epoch(text):
+    """Отделяет необязательный epoch ``N:``."""
+    if ":" in text:
+        head, tail = text.split(":", 1)
+        if head.isdigit():
+            return int(head), tail
+    return 0, text
+
+
+def pkgvercmp(a, b):
+    """Сравнивает версии формата ``[epoch:]version[-release]``.
+
+    Возвращает -1, 0 или 1. Числовые сегменты сравниваются как числа,
+    поэтому ``1.9 < 1.10``, ``1.0 < 1.0.1``, ``1.0-1 < 1.0-2``.
+    """
+    epoch_a, rest_a = _split_epoch(str(a))
+    epoch_b, rest_b = _split_epoch(str(b))
+    if epoch_a != epoch_b:
+        return 1 if epoch_a > epoch_b else -1
+
+    version_a, _, release_a = rest_a.partition("-")
+    version_b, _, release_b = rest_b.partition("-")
+
+    result = _compare_version_parts(version_a, version_b)
+    if result:
+        return result
+    return _compare_version_parts(release_a, release_b)
+
+
 # -- парсер PKGBUILD --------------------------------------------------------
 
 
@@ -634,8 +707,16 @@ def cmd_pkg(ctx, args, stdin):
                 f"pkg: package '{pkgname}' not found in cache"
             )
 
-        # Берём последний по алфавиту (версия отсортируется корректно для x.y.z)
-        chosen = sorted(candidates)[-1]
+        # Сравниваем версии численно: 1.10 новее 1.9.
+        def candidate_version(name):
+            prefix = pkgname + "-"
+            return name[len(prefix):] if name.startswith(prefix) else ""
+
+        chosen = candidates[0]
+        for name in candidates[1:]:
+            if pkgvercmp(candidate_version(name),
+                         candidate_version(chosen)) > 0:
+                chosen = name
         # Извлекаем версию из имени
         ver = chosen
         if chosen.startswith(pkgname + "-"):
