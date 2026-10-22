@@ -594,36 +594,66 @@ class Shell:
         return f"{name}: {message}"
 
     # -- фоновые задания -----------------------------------------------------
+    NICE_MIN = -20
+    NICE_MAX = 19
+
     @staticmethod
     def _parse_nice(argv):
-        """Разбирает необязательный префикс ``nice [-n N]``.
+        """Разбирает префикс ``nice [-n N]`` / ``nice N``.
 
-        Возвращает ``(nice, argv_без_префикса)``.
+        Возвращает ``(nice, argv_без_префикса)``. Некорректное значение или
+        выход за диапазон поднимает :class:`InvalidArgument`.
         """
-        if argv and str(argv[0]) == "nice":
-            rest = list(argv[1:])
-            adj = 10
-            if rest and str(rest[0]) == "-n":
-                if len(rest) >= 2:
-                    try:
-                        adj = int(str(rest[1]))
-                    except ValueError:
-                        adj = 10
-                    rest = rest[2:]
-            elif rest and str(rest[0]).startswith("-n") and len(str(rest[0])) > 2:
-                try:
-                    adj = int(str(rest[0])[2:])
-                except ValueError:
-                    adj = 10
-                rest = rest[1:]
-            return adj, rest
-        return 0, argv
+        if not argv or str(argv[0]) != "nice":
+            return 0, argv
+
+        operands = list(argv[1:])
+        if not operands:
+            # ``nice`` без аргументов — как и раньше, без ошибки.
+            return 10, []
+
+        first = str(operands[0])
+        if first == "-n":
+            if len(operands) < 2:
+                raise InvalidArgument("nice: option requires an argument -- 'n'")
+            raw = str(operands[1])
+            rest = operands[2:]
+        elif first.startswith("-n") and len(first) > 2:
+            raw = first[2:]
+            rest = operands[1:]
+        elif first.lstrip("+-").isdigit():
+            raw = first
+            rest = operands[1:]
+        else:
+            return 10, operands
+
+        try:
+            value = int(raw)
+        except ValueError:
+            raise InvalidArgument(f"nice: invalid adjustment '{raw}'")
+
+        if not Shell.NICE_MIN <= value <= Shell.NICE_MAX:
+            raise InvalidArgument(
+                f"nice: invalid adjustment '{raw}' "
+                f"(expected {Shell.NICE_MIN}..{Shell.NICE_MAX})")
+
+        if not rest:
+            raise InvalidArgument("nice: missing command operand")
+
+        return value, rest
 
     def execute_background(self, tokens):
         segments = split_and_or(tokens)
         nice = 0
         if segments:
-            nice, rest = self._parse_nice(segments[0][0])
+            try:
+                nice, rest = self._parse_nice(segments[0][0])
+            except PyOSError as exc:
+                # Ошибка разбора nice не должна ронять REPL и создавать job.
+                self.write_stderr(self._format_error("nice", exc))
+                self.last_code = exc.errno or 1
+                self.exit_code = self.last_code
+                return
             if len(rest) != len(segments[0][0]):
                 segments = [(rest, segments[0][1])] + list(segments[1:])
         first_tokens = segments[0][0] if segments else []
