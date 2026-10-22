@@ -1,0 +1,532 @@
+"""Конфигурация репозиториев пакетов и чтение index.json.
+
+Фаза 1: локальные репозитории (``type="path"``) читаются из виртуальной ФС.
+Сеть не используется: ``type="http"`` пока является заглушкой.
+"""
+
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
+
+from .errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
+
+REPOS_CONFIG = "/etc/pyos/repos.json"
+REPO_CACHE_ROOT = "/var/cache/repos"
+
+_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+_DEP_RE = re.compile(r"^([A-Za-z0-9@._+-]+)\s*(?:([<>=]+)\s*(\S+))?$")
+
+
+# -- утилиты ----------------------------------------------------------------
+
+
+def _ensure_dir(fs, path, user):
+    """Создаёт каталог и родителей, если их ещё нет."""
+    try:
+        node = fs.lookup(path, user, "/", "/")
+        if node.is_dir():
+            return
+        raise InvalidArgument(f"repo: '{path}' is not a directory")
+    except NoSuchFileOrDirectory:
+        pass
+    fs.mkdir(path, user, "/", "/", parents=True)
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# -- repos.json -------------------------------------------------------------
+
+
+def _validate_repo_name(name):
+    if not isinstance(name, str) or not _NAME_RE.match(name):
+        raise InvalidArgument(
+            f"repo: invalid name {name!r} "
+            "(expected lowercase letters, digits and dashes)")
+
+
+def _validate_repo_url(name, url, repo_type):
+    if not isinstance(url, str) or not url:
+        raise InvalidArgument(f"repo: missing url for '{name}'")
+
+    if repo_type == "http":
+        if url.startswith("http://"):
+            raise InvalidArgument(
+                f"repo: '{name}': http:// is not allowed, use https://")
+        if not url.startswith("https://"):
+            raise InvalidArgument(
+                f"repo: '{name}': URL must start with https://")
+        if not url.endswith("/"):
+            raise InvalidArgument(
+                f"repo: '{name}': URL must end with '/'")
+        return
+
+    if not url.startswith("/"):
+        raise InvalidArgument(
+            f"repo: '{name}': path URL must be an absolute virtual path")
+    if not url.endswith("/"):
+        raise InvalidArgument(
+            f"repo: '{name}': path URL must end with '/'")
+    if ".." in url.split("/"):
+        raise InvalidArgument(
+            f"repo: '{name}': path traversal is not allowed")
+
+
+def _validate_repo_entry(entry):
+    if not isinstance(entry, dict):
+        raise InvalidArgument("repo: repository entry must be a JSON object")
+
+    name = entry.get("name")
+    _validate_repo_name(name)
+
+    repo_type = entry.get("type", "http")
+    if not isinstance(repo_type, str) or repo_type not in ("http", "path"):
+        raise InvalidArgument(
+            f"repo: invalid type {repo_type!r} for '{name}' "
+            "(expected 'http' or 'path')")
+
+    url = entry.get("url")
+    _validate_repo_url(name, url, repo_type)
+
+    priority = entry.get("priority", 10)
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise InvalidArgument(
+            f"repo: invalid priority {priority!r} for '{name}' (expected integer)")
+
+    enabled = entry.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise InvalidArgument(
+            f"repo: invalid enabled {enabled!r} for '{name}' (expected boolean)")
+
+    return {
+        "name": name,
+        "url": url,
+        "type": repo_type,
+        "enabled": enabled,
+        "priority": priority,
+    }
+
+
+def read_repos(fs, user):
+    """Читает и валидирует repos.json. Отсутствие файла — пустой список."""
+    try:
+        text = fs.read_file(REPOS_CONFIG, user, "/", "/")
+    except NoSuchFileOrDirectory:
+        return {"format": 1, "repos": []}
+    except PyOSError as exc:
+        raise InvalidArgument(f"repo: cannot read '{REPOS_CONFIG}': {exc}")
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InvalidArgument(
+            f"repo: invalid '{REPOS_CONFIG}': {exc.msg}")
+
+    if not isinstance(data, dict):
+        raise InvalidArgument(f"repo: '{REPOS_CONFIG}' must be a JSON object")
+
+    fmt = data.get("format")
+    if fmt != 1:
+        raise InvalidArgument(
+            f"repo: unsupported repos.json format {fmt!r} (expected 1)")
+
+    raw_repos = data.get("repos", [])
+    if not isinstance(raw_repos, list):
+        raise InvalidArgument(f"repo: '{REPOS_CONFIG}': 'repos' must be a list")
+
+    repos = []
+    seen = set()
+    for entry in raw_repos:
+        repo = _validate_repo_entry(entry)
+        if repo["name"] in seen:
+            raise InvalidArgument(
+                f"repo: duplicate repository name '{repo['name']}'")
+        seen.add(repo["name"])
+        repos.append(repo)
+
+    return {"format": 1, "repos": repos}
+
+
+def _write_repos(fs, user, config):
+    _ensure_dir(fs, "/etc/pyos", user)
+    fs.write_file(REPOS_CONFIG, json.dumps(config, indent=2, ensure_ascii=False),
+                  user, "/", "/", create=True)
+
+
+def add_repo(ctx, name, url, repo_type="http", priority=10):
+    """Добавляет репозиторий в конфиг (сеть не используется)."""
+    repo = _validate_repo_entry({
+        "name": name,
+        "url": url,
+        "type": repo_type,
+        "priority": priority,
+    })
+
+    config = read_repos(ctx.fs, ctx.user)
+    if any(item["name"] == repo["name"] for item in config["repos"]):
+        raise InvalidArgument(f"repo: '{repo['name']}' already exists")
+
+    config["repos"].append(repo)
+    _write_repos(ctx.fs, ctx.user, config)
+    return f"repo: added '{repo['name']}'"
+
+
+def remove_repo(ctx, name):
+    """Удаляет репозиторий из конфига."""
+    config = read_repos(ctx.fs, ctx.user)
+    remaining = [repo for repo in config["repos"] if repo["name"] != name]
+    if len(remaining) == len(config["repos"]):
+        raise InvalidArgument(f"repo: '{name}' not found")
+
+    config["repos"] = remaining
+    _write_repos(ctx.fs, ctx.user, config)
+    return f"repo: removed '{name}'"
+
+
+def list_repos(ctx):
+    """Печатает репозитории из конфига."""
+    config = read_repos(ctx.fs, ctx.user)
+    if not config["repos"]:
+        return "repo: no repositories configured"
+
+    lines = [f"{'NAME':<16} {'TYPE':<5} {'ENABLED':<8} {'PRIORITY':<9} URL"]
+    lines.append("-" * 72)
+    for repo in config["repos"]:
+        lines.append(
+            f"{repo['name']:<16} {repo['type']:<5} "
+            f"{str(repo['enabled']):<8} {repo['priority']:<9} {repo['url']}")
+    return "\n".join(lines)
+
+
+# -- index.json -------------------------------------------------------------
+
+
+def parse_dep_spec(spec):
+    """Разбирает строку зависимости/провижена в структуру (без резолва)."""
+    text = str(spec).strip()
+    match = _DEP_RE.match(text)
+    if not match:
+        return {"raw": spec, "name": text, "op": None, "version": None}
+    return {
+        "raw": spec,
+        "name": match.group(1),
+        "op": match.group(2),
+        "version": match.group(3),
+    }
+
+
+def _validate_relative_ref(value, label, pkgname):
+    if not isinstance(value, str) or not value:
+        raise InvalidArgument(
+            f"repo: index: package '{pkgname}': missing {label}")
+    if _SCHEME_RE.match(value) or value.startswith("/"):
+        raise InvalidArgument(
+            f"repo: index: package '{pkgname}': {label} must be relative: "
+            f"'{value}'")
+    if ".." in value.split("/"):
+        raise InvalidArgument(
+            f"repo: index: package '{pkgname}': {label} traversal is not "
+            f"allowed: '{value}'")
+    return value
+
+
+def _join_package_url(base, relative):
+    base_norm = base.rstrip("/") + "/"
+    resolved = base_norm + relative
+    if not resolved.startswith(base_norm):
+        raise InvalidArgument(
+            f"repo: index: package url escapes repository base: '{relative}'")
+    return resolved
+
+
+def _dep_list(entry, field, pkgname):
+    value = entry.get(field, [])
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value):
+        raise InvalidArgument(
+            f"repo: index: package '{pkgname}': '{field}' must be a list of "
+            "strings")
+    return list(value)
+
+
+def _validate_index_package(entry, repo):
+    if not isinstance(entry, dict):
+        raise InvalidArgument(
+            f"repo: index: package entry must be a JSON object")
+
+    for field in ("name", "version", "sha256", "url", "filename"):
+        if field not in entry or entry[field] in (None, ""):
+            raise InvalidArgument(
+                f"repo: index: package entry missing '{field}'")
+
+    name = entry["name"]
+    if not isinstance(name, str):
+        raise InvalidArgument("repo: index: package 'name' must be a string")
+
+    version = entry["version"]
+    if isinstance(version, int) and not isinstance(version, bool):
+        version = str(version)
+    if not isinstance(version, str) or not version:
+        raise InvalidArgument(
+            f"repo: index: package '{name}': invalid version")
+
+    release = entry.get("release", 1)
+    if isinstance(release, int) and not isinstance(release, bool):
+        release = str(release)
+    if not isinstance(release, str) or not release.isdigit():
+        raise InvalidArgument(
+            f"repo: index: package '{name}': invalid release {release!r}")
+
+    arch = entry.get("arch", "any")
+    if not isinstance(arch, str) or not arch:
+        raise InvalidArgument(
+            f"repo: index: package '{name}': invalid arch {arch!r}")
+
+    sha256 = entry["sha256"]
+    if not isinstance(sha256, str) or not sha256.strip():
+        raise InvalidArgument(
+            f"repo: index: package '{name}': missing sha256")
+
+    url = _validate_relative_ref(entry["url"], "url", name)
+    filename = _validate_relative_ref(entry["filename"], "filename", name)
+
+    size = entry.get("size")
+    if size is not None and (
+            isinstance(size, bool) or not isinstance(size, int) or size < 0):
+        raise InvalidArgument(
+            f"repo: index: package '{name}': invalid size {size!r}")
+
+    description = entry.get("description", "")
+    if description is None:
+        description = ""
+    if not isinstance(description, str):
+        raise InvalidArgument(
+            f"repo: index: package '{name}': invalid description")
+
+    license_ = entry.get("license", "")
+    if license_ is None:
+        license_ = ""
+    if not isinstance(license_, str):
+        raise InvalidArgument(
+            f"repo: index: package '{name}': invalid license")
+
+    depends = _dep_list(entry, "depends", name)
+    provides = _dep_list(entry, "provides", name)
+    conflicts = _dep_list(entry, "conflicts", name)
+
+    return {
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": arch,
+        "filename": filename,
+        "url": url,
+        "resolved_url": _join_package_url(repo["url"], url),
+        "sha256": sha256,
+        "size": size,
+        "depends": depends,
+        "provides": provides,
+        "conflicts": conflicts,
+        "depends_parsed": [parse_dep_spec(item) for item in depends],
+        "provides_parsed": [parse_dep_spec(item) for item in provides],
+        "conflicts_parsed": [parse_dep_spec(item) for item in conflicts],
+        "description": description,
+        "license": license_,
+        "signature": entry.get("signature"),
+    }
+
+
+def read_index(fs, user, repo):
+    """Читает и валидирует ``<url>index.json``.
+
+    Возвращает ``(index, raw_text)``; raw_text нужен для sha256 в meta.
+    """
+    source = repo["url"] + "index.json"
+    try:
+        text = fs.read_file(source, user, "/", "/")
+    except NoSuchFileOrDirectory:
+        raise InvalidArgument(f"repo: index not found: '{source}'")
+    except PyOSError as exc:
+        raise InvalidArgument(f"repo: cannot read index '{source}': {exc}")
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InvalidArgument(
+            f"repo: invalid index '{source}': {exc.msg}")
+
+    if not isinstance(data, dict):
+        raise InvalidArgument(
+            f"repo: index '{source}' must be a JSON object")
+
+    fmt = data.get("format")
+    if fmt != 1:
+        raise InvalidArgument(
+            f"repo: unsupported index format {fmt!r} (expected 1)")
+
+    repo_field = data.get("repo")
+    if repo_field is not None and not isinstance(repo_field, str):
+        raise InvalidArgument(
+            f"repo: index '{source}': 'repo' must be a string")
+
+    raw_packages = data.get("packages", [])
+    if not isinstance(raw_packages, list):
+        raise InvalidArgument(
+            f"repo: index '{source}': 'packages' must be a list")
+
+    packages = []
+    seen = set()
+    for entry in raw_packages:
+        package = _validate_index_package(entry, repo)
+        key = (package["name"], package["version"],
+               package["release"], package["arch"])
+        if key in seen:
+            raise InvalidArgument(
+                f"repo: index '{source}': duplicate package "
+                f"{key[0]}-{key[1]}-{key[2]}-{key[3]}")
+        seen.add(key)
+        packages.append(package)
+
+    index = {
+        "format": 1,
+        "repo": repo_field if repo_field is not None else repo["name"],
+        "generated": data.get("generated"),
+        "packages": packages,
+    }
+    return index, text
+
+
+def update_repos(ctx, names=None):
+    """Обновляет кэш индексов. Для http — заглушка без сети."""
+    config = read_repos(ctx.fs, ctx.user)
+    if names:
+        known = {repo["name"]: repo for repo in config["repos"]}
+        missing = [name for name in names if name not in known]
+        if missing:
+            raise InvalidArgument(f"repo: '{missing[0]}' not found")
+        targets = [known[name] for name in names]
+    else:
+        targets = config["repos"]
+
+    if not targets:
+        return "repo: no repositories configured"
+
+    lines = []
+    for repo in targets:
+        if repo["type"] == "http":
+            lines.append(
+                f"repo: {repo['name']}: network repos not enabled yet")
+            continue
+
+        index, raw = read_index(ctx.fs, ctx.user, repo)
+        cache_dir = f"{REPO_CACHE_ROOT}/{repo['name']}"
+        _ensure_dir(ctx.fs, cache_dir, ctx.user)
+
+        ctx.fs.write_file(cache_dir + "/index.json", raw,
+                          ctx.user, "/", "/", create=True)
+
+        meta = {
+            "fetched_at": _utc_now(),
+            "source_url": repo["url"] + "index.json",
+            "type": repo["type"],
+            "index_sha256": hashlib.sha256(
+                raw.encode("utf-8")).hexdigest(),
+            "package_count": len(index["packages"]),
+            "repo": index["repo"],
+            "repo_matches": index["repo"] == repo["name"],
+        }
+        ctx.fs.write_file(cache_dir + "/index.meta.json",
+                          json.dumps(meta, indent=2, ensure_ascii=False),
+                          ctx.user, "/", "/", create=True)
+
+        lines.append(
+            f"repo: updated '{repo['name']}' "
+            f"({meta['package_count']} packages)")
+        if not meta["repo_matches"]:
+            lines.append(
+                f"repo: warning: index repo '{index['repo']}' does not match "
+                f"'{repo['name']}'")
+
+    return "\n".join(lines)
+
+
+# -- CLI pkg repo -----------------------------------------------------------
+
+
+def _parse_options(args, allowed):
+    """Разбирает позиционные аргументы и опции ``--key value``/``--key=value``."""
+    positional = []
+    options = {}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--"):
+            key = arg[2:]
+            if "=" in key:
+                key, value = key.split("=", 1)
+            else:
+                if i + 1 >= len(args):
+                    raise InvalidArgument(
+                        f"pkg repo: option '--{key}' requires an argument")
+                value = args[i + 1]
+                i += 1
+            if key not in allowed:
+                raise InvalidArgument(f"pkg repo: unknown option '--{key}'")
+            options[key] = value
+        else:
+            positional.append(arg)
+        i += 1
+    return positional, options
+
+
+def _parse_priority(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise InvalidArgument(f"repo: invalid priority {value!r} (expected integer)")
+
+
+def handle_repo_command(ctx, args):
+    """Обрабатывает ``pkg repo ...``."""
+    if not args:
+        return ("Usage: pkg repo add <name> <url> [--type http|path] "
+                "[--priority N] | remove <name> | list | update [<name>...]")
+
+    action = args[0]
+    rest = args[1:]
+
+    if action == "add":
+        positional, options = _parse_options(rest, {"type", "priority"})
+        if len(positional) != 2:
+            raise InvalidArgument("pkg repo add: expected <name> <url>")
+        repo_type = options.get("type", "http")
+        priority = _parse_priority(options.get("priority", "10"))
+        return add_repo(ctx, positional[0], positional[1],
+                        repo_type=repo_type, priority=priority)
+
+    if action == "remove":
+        positional, options = _parse_options(rest, set())
+        if options:
+            raise InvalidArgument("pkg repo remove: unexpected option")
+        if len(positional) != 1:
+            raise InvalidArgument("pkg repo remove: expected <name>")
+        return remove_repo(ctx, positional[0])
+
+    if action == "list":
+        if rest:
+            raise InvalidArgument("pkg repo list: unexpected arguments")
+        return list_repos(ctx)
+
+    if action == "update":
+        positional, options = _parse_options(rest, set())
+        if options:
+            raise InvalidArgument("pkg repo update: unexpected option")
+        return update_repos(ctx, positional or None)
+
+    raise InvalidArgument(
+        f"pkg repo: unknown action '{action}' (use: add, remove, list, update)")

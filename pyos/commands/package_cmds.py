@@ -16,6 +16,7 @@ from ..errors import (
     PermissionDenied,
     PyOSError,
 )
+from ..repo import handle_repo_command
 from .registry import register
 
 # -- пути в виртуальной ФС -------------------------------------------------
@@ -1045,7 +1046,8 @@ def _format_pkg_info(data, installed=False):
 @register("pkg",
           usage=("pkg install <name|file.pkg.json> [--dry-run] | "
                  "pkg remove <name> [--force] [--dry-run] | "
-                 "pkg list | pkg info <name>"),
+                 "pkg list | pkg info <name> | "
+                 "pkg repo add|remove|list|update ..."),
           summary="Управление пакетами",
           category="system")
 def cmd_pkg(ctx, args, stdin):
@@ -1057,15 +1059,21 @@ def cmd_pkg(ctx, args, stdin):
       pkg remove <pkgname>    — удалить пакет
       pkg list                — показать установленные пакеты
       pkg info <pkgname>      — информация о пакете
+      pkg repo ...            — управление репозиториями
     """
-    if ctx.user.uid != 0:
-        raise PermissionDenied(message="pkg: only root can manage packages")
-
     if not args:
-        return "Usage: pkg install|remove|list|info [args]"
+        return "Usage: pkg install|remove|list|info|repo [args]"
 
     subcmd = args[0]
     cmd_args = args[1:]
+
+    # pkg repo list доступен всем, остальные операции pkg — только root.
+    repo_list = subcmd == "repo" and cmd_args[:1] == ["list"]
+    if not repo_list and ctx.user.uid != 0:
+        raise PermissionDenied(message="pkg: only root can manage packages")
+
+    if subcmd == "repo":
+        return handle_repo_command(ctx, cmd_args)
 
     if subcmd == "install":
         dry_run = "--dry-run" in cmd_args
@@ -1136,5 +1144,5 @@ def cmd_pkg(ctx, args, stdin):
     else:
         raise InvalidArgument(
             f"pkg: unknown subcommand '{subcmd}' "
-            "(use: install, remove, list, info)"
+            "(use: install, remove, list, info, repo)"
         )
