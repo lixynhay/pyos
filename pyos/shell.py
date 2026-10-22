@@ -1,0 +1,834 @@
+"""Интерактивный шелл pyOS.
+
+Умеет:
+
+* разбирать командную строку с кавычками и экранированием;
+* конвейеры (``|``), редиректы (``>``, ``>>``, ``<``);
+* фоновые задания (``&``) и разделитель команд (``;``);
+* раскрывать переменные окружения (``$VAR``, ``${VAR}``);
+* выполнять встроенные команды (cd, export, alias, su, sudo, ...).
+
+Обычные команды запускаются как процессы: ядро заводит запись в таблице
+процессов и продвигает симулированное время.
+"""
+
+import sys
+
+from .commands import get
+from .commands.registry import all_commands
+from .context import Context
+from .errors import InvalidArgument, PyOSError, UserError
+from .process import ProcessState
+from .scheduler import TICKS_PER_SECOND
+
+BUILTIN_NAMES = {
+    "exit", "export", "unset", "alias", "unalias", "history",
+    "jobs", "fg", "bg", "su", "sudo", "source", "set", "nice",
+}
+
+
+# ---------------------------------------------------------------------------
+# Разбор командной строки
+# ---------------------------------------------------------------------------
+class Token(str):
+    """Токен командной строки.
+
+    Наследуется от ``str``, поэтому сравнения с операторами (``== "|"`` и
+    т.п.) продолжают работать. Флаг ``quoted`` отмечает, что токен был
+    закавычен или экранирован: такие токены не раскрываются как шаблоны.
+    """
+
+    __slots__ = ("quoted",)
+
+    def __new__(cls, text="", quoted=False):
+        obj = super().__new__(cls, text)
+        obj.quoted = quoted
+        return obj
+
+
+def _read_var(line: str, i: int, env: dict):
+    """Читает ``$NAME`` / ``${NAME}`` / ``${VAR:-word}`` / ``${VAR:=word}`` /
+    ``${VAR:+word}`` / ``${VAR:?word}`` / ``$?`` / ``$$`` начиная с ``i``.
+
+    Возвращает пару ``(новый_индекс, значение)``.
+    """
+    n = len(line)
+    if i + 1 >= n:
+        return i + 1, "$"
+    c = line[i + 1]
+    if c == "{":
+        end = line.find("}", i + 2)
+        if end == -1:
+            return i + 1, "$"
+        content = line[i + 2:end]
+
+        # Проверяем операторы значений по умолчанию
+        op = None
+        op_pos = -1
+        for operator in (":-", ":=", ":+", ":?"):
+            pos = content.find(operator)
+            if pos >= 0:
+                op = operator
+                op_pos = pos
+                break
+
+        if op is not None:
+            var_name = content[:op_pos]
+            word = content[op_pos + len(op):]
+            val = env.get(var_name, "")
+            if op == ":-":
+                result = word if not val else val
+            elif op == ":=":
+                if not val:
+                    env[var_name] = word
+                    result = word
+                else:
+                    result = val
+            elif op == ":+":
+                result = word if val else ""
+            elif op == ":?":
+                if not val:
+                    raise PyOSError(f"${var_name}: {word}")
+                result = val
+            return end + 1, str(result)
+
+        # Обычное раскрытие ${NAME}
+        return end + 1, str(env.get(content, ""))
+    if c == "?":
+        return i + 2, str(env.get("?", "0"))
+    if c == "$":
+        return i + 2, str(env.get("$", ""))
+    if c.isalpha() or c == "_":
+        j = i + 1
+        while j < n and (line[j].isalnum() or line[j] == "_"):
+            j += 1
+        return j, str(env.get(line[i + 1:j], ""))
+    return i + 1, "$"
+
+
+def tokenize(line: str, env: dict | None = None) -> list[Token]:
+    """Разбивает строку на токены, учитывая кавычки и экранирование.
+
+    Раскрывает ``$VAR`` / ``${VAR}`` / ``$?`` / ``$$``. Одинарные кавычки
+    делают содержимое литеральным, двойные допускают раскрытие, а
+    экранированный ``\\$`` не раскрывается.
+    """
+    if env is None:
+        env = {}
+    tokens: list[Token] = []
+    buf: list[str] = []
+    i = 0
+    n = len(line)
+    quote = None
+    quoted = False
+    started = False
+
+    def flush():
+        nonlocal quoted, started
+        if started:
+            tokens.append(Token("".join(buf), quoted))
+        buf.clear()
+        quoted = False
+        started = False
+
+    def append(text, is_quoted=False):
+        nonlocal quoted, started
+        if text:
+            buf.append(text)
+        started = True
+        if is_quoted:
+            quoted = True
+
+    while i < n:
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            else:
+                buf.append(c)
+            i += 1
+            continue
+        if quote == '"':
+            if c == '"':
+                quote = None
+                i += 1
+                continue
+            if c == "\\" and i + 1 < n and line[i + 1] in ('"', "\\", "$", "`"):
+                i += 1
+                append(line[i], is_quoted=True)
+                i += 1
+                continue
+            if c == "$":
+                i, val = _read_var(line, i, env)
+                append(val, is_quoted=True)
+                continue
+            append(c)
+            i += 1
+            continue
+
+        if c in ("'", '"'):
+            quote = c
+            quoted = True
+            started = True
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            i += 1
+            append(line[i], is_quoted=True)
+            i += 1
+            continue
+        if c == "$":
+            i, val = _read_var(line, i, env)
+            append(val)
+            continue
+        if c.isspace():
+            flush()
+            i += 1
+            continue
+        if c == "&":
+            flush()
+            if i + 1 < n and line[i + 1] == "&":
+                tokens.append(Token("&&", False))
+                i += 2
+            else:
+                tokens.append(Token("&", False))
+                i += 1
+            continue
+        if c == "|":
+            flush()
+            if i + 1 < n and line[i + 1] == "|":
+                tokens.append(Token("||", False))
+                i += 2
+            else:
+                tokens.append(Token("|", False))
+                i += 1
+            continue
+        if c in (";", "<"):
+            flush()
+            tokens.append(Token(c, False))
+            i += 1
+            continue
+        if c == ">":
+            flush()
+            if i + 1 < n and line[i + 1] == ">":
+                tokens.append(Token(">>", False))
+                i += 2
+            else:
+                tokens.append(Token(">", False))
+                i += 1
+            continue
+        append(c)
+        i += 1
+
+    flush()
+    return tokens
+
+
+def _is_quoted(token) -> bool:
+    return bool(getattr(token, "quoted", False))
+
+
+def split_jobs(tokens: list[Token]):
+    """Делит токены на задания по ``&`` и ``;``. Возвращает (tokens, background)."""
+    jobs = []
+    cur: list[Token] = []
+    for t in tokens:
+        if t in ("&", ";") and not _is_quoted(t):
+            jobs.append((cur, t == "&"))
+            cur = []
+        else:
+            cur.append(t)
+    if cur:
+        jobs.append((cur, False))
+    return jobs
+
+
+def parse_pipeline(tokens: list[Token]):
+    """Разбирает одну команду/конвейер в список (argv, redirects)."""
+    segments: list[list[Token]] = []
+    cur: list[Token] = []
+    for t in tokens:
+        if t == "|" and not _is_quoted(t):
+            segments.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    segments.append(cur)
+
+    cmds = []
+    for seg in segments:
+        argv: list[Token] = []
+        redirects: list[tuple[str, str]] = []
+        i = 0
+        while i < len(seg):
+            t = seg[i]
+            if t in (">", ">>", "<") and not _is_quoted(t):
+                if i + 1 >= len(seg):
+                    raise InvalidArgument(f"syntax error near unexpected token '{t}'")
+                redirects.append((str(t), str(seg[i + 1])))
+                i += 2
+            else:
+                argv.append(t)
+                i += 1
+        if argv or redirects:
+            cmds.append((argv, redirects))
+    if not cmds:
+        raise InvalidArgument("syntax error: empty command")
+    return cmds
+
+
+def split_and_or(tokens: list[Token]):
+    """Делит токены одного задания на конвейеры по ``&&`` и ``||``.
+
+    Возвращает список ``(tokens, connector)``, где ``connector`` — оператор,
+    идущий *после* конвейера (``"&&"``, ``"||"`` или ``None`` для последнего).
+    """
+    segments: list[tuple[list[Token], str | None]] = []
+    cur: list[Token] = []
+    for t in tokens:
+        if t in ("&&", "||") and not _is_quoted(t):
+            segments.append((cur, str(t)))
+            cur = []
+        else:
+            cur.append(t)
+    segments.append((cur, None))
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# Шелл
+# ---------------------------------------------------------------------------
+class Shell:
+    def __init__(self, kernel, user):
+        self.kernel = kernel
+        self.user = user
+        self.cwd = user.home
+        self.running = True
+        self.exit_code = 0
+        self.last_code = 0
+        self.history: list[str] = []
+        self.aliases: dict[str, str] = {}
+        self.jobs: list[dict] = []
+        self._next_job = 1
+        self._in_worker = False
+
+        self._locals: dict[str, str] = {}
+        self.ulimit: dict[str, int] = {"file_size": -1}  # -1 = unlimited
+        self.env = {
+            "PATH": "/bin:/usr/bin",
+            "HOME": user.home,
+            "USER": user.name,
+            "LOGNAME": user.name,
+            "SHELL": "/bin/pyos",
+            "PWD": user.home,
+            "HOSTNAME": kernel.hostname,
+            "TERM": "pyos-tty",
+        }
+
+    @property
+    def builtins(self):
+        return BUILTIN_NAMES
+
+    # -- утилиты -------------------------------------------------------------
+    def write_stdout(self, text):
+        if not text:
+            return
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+
+    def write_stderr(self, text):
+        if not text:
+            return
+        sys.stderr.write(text)
+        if not text.endswith("\n"):
+            sys.stderr.write("\n")
+
+    def prompt(self) -> str:
+        cwd = self.cwd
+        home = self.user.home
+        if cwd == home:
+            cwd = "~"
+        elif home != "/" and cwd.startswith(home + "/"):
+            cwd = "~" + cwd[len(home):]
+        sym = "#" if self.user.is_root else "$"
+        return f"{self.user.name}@{self.kernel.hostname}:{cwd}{sym} "
+
+    # -- главный цикл --------------------------------------------------------
+    def run(self):
+        while self.running:
+            self.kernel.idle(1)  # пусть фоновые задания продвигаются
+            try:
+                line = input(self.prompt())
+            except EOFError:
+                sys.stdout.write("\nexit\n")
+                break
+            except KeyboardInterrupt:
+                sys.stdout.write("\n^C\n")
+                continue
+            self.handle_line(line)
+        return self.exit_code
+
+    def handle_line(self, line: str):
+        self.env["PWD"] = self.cwd
+        self.env["HOME"] = self.user.home
+        self.env["USER"] = self.user.name
+        self.env["?"] = str(self.last_code)
+        self.env.setdefault("$", str(self.kernel.init.pid))
+        if not line.strip():
+            return
+        self.history.append(line)
+        # Мёрж локальных и экспортированных переменных для раскрытия $VAR
+        merged = {**self._locals, **self.env}
+        try:
+            tokens = tokenize(line, merged)
+        except PyOSError as exc:
+            self.write_stderr(f"pyos: {exc.message}")
+            self.last_code = 1
+            return
+        for job_tokens, background in split_jobs(tokens):
+            if not job_tokens:
+                continue
+            if background:
+                self.execute_background(job_tokens)
+            else:
+                self.run_and_or(job_tokens)
+
+    # -- выполнение цепочек && / || -----------------------------------------
+    def run_and_or(self, tokens, user=None):
+        """Выполняет цепочку конвейеров, связанных ``&&`` и ``||``.
+
+        Следующий конвейер запускается только если код возврата предыдущего
+        удовлетворяет связке: ``&&`` — успех (0), ``||`` — ошибка (≠0).
+        """
+        return self._execute_segments(split_and_or(tokens), user)
+
+    def _execute_segments(self, segments, user=None):
+        code = 0
+        run = True
+        for seg_tokens, connector in segments:
+            if run:
+                try:
+                    cmds = parse_pipeline(seg_tokens)
+                except PyOSError as exc:
+                    self.write_stderr(f"pyos: {exc.label}")
+                    code = 2
+                else:
+                    code = self.execute_pipeline(cmds, user)
+            if connector == "&&":
+                run = (code == 0)
+            elif connector == "||":
+                run = (code != 0)
+            else:
+                run = True
+        return code
+
+    # -- конвейеры и редиректы ----------------------------------------------
+    def _read_redirect(self, target, user):
+        return self.kernel.fs.read_file(target, user, self.cwd, self.user.home)
+
+    def _write_redirect(self, target, data, append, user):
+        # Проверка ulimit -f (максимальный размер файла)
+        limit = self.ulimit.get("file_size", -1)
+        if limit >= 0 and len(data.encode("utf-8")) > limit:
+            raise PyOSError(
+                f"File size exceeds ulimit ({len(data)} > {limit} bytes)")
+        self.kernel.fs.write_file(target, data, user, self.cwd, self.user.home,
+                                  append=append)
+
+    def _glob_argv(self, argv, user):
+        """Раскрывает шаблоны (``*``, ``?``, ``[...]``) в незакавыченных токенах."""
+        result = []
+        for tok in argv:
+            text = str(tok)
+            if not _is_quoted(tok) and any(ch in text for ch in "*?["):
+                try:
+                    matches = self.kernel.fs.glob(text, user, self.cwd,
+                                                  self.user.home)
+                except PyOSError:
+                    matches = []
+                if matches:
+                    result.extend(matches)
+                    continue
+            result.append(text)
+        return result
+
+    def execute_pipeline(self, cmds, user=None):
+        user = user or self.user
+        stdin_data = ""
+        out = err = ""
+        code = 0
+        total = len(cmds)
+        for idx, (argv, redirects) in enumerate(cmds):
+            if argv:
+                for op, target in redirects:
+                    if op == "<":
+                        try:
+                            stdin_data = self._read_redirect(target, user)
+                        except PyOSError as exc:
+                            self.write_stderr(f"{argv[0]}: {target}: {exc.label}")
+                            self.last_code = 1
+                            return 1
+                argv = self._glob_argv(argv, user)
+                out, err, code = self.run_single(argv, stdin_data, user)
+            else:
+                # команда из одних редиректов (например, ``> file``)
+                out, err, code = "", "", 0
+
+            wrote_file = False
+            for op, target in redirects:
+                if op in (">", ">>"):
+                    try:
+                        self._write_redirect(target, out, op == ">>", user)
+                        wrote_file = True
+                    except PyOSError as exc:
+                        self.write_stderr(
+                            f"{argv[0] if argv else 'pyos'}: {target}: {exc.label}")
+                        code = 1
+
+            if err:
+                self.write_stderr(err)
+            if idx < total - 1:
+                stdin_data = out
+            elif not wrote_file:
+                self.write_stdout(out)
+
+        self.last_code = code
+        self.exit_code = code
+        return code
+
+    # -- запуск одной команды -----------------------------------------------
+    def run_single(self, argv, stdin_data, user=None, nice=0):
+        user = user or self.user
+
+        # Извлекаем ведущие VAR=value (локальные присваивания)
+        assignments = {}
+        while argv and "=" in str(argv[0]):
+            raw = str(argv[0])
+            # Не путать с опцией --key=value или командой =foo
+            if raw.startswith("-") or raw.startswith("="):
+                break
+            key, sep, val = raw.partition("=")
+            if key.isidentifier():
+                assignments[key] = val
+                argv = argv[1:]
+            else:
+                break
+
+        if not argv:
+            # Голое присваивание — устанавливаем локальную переменную
+            for k, v in assignments.items():
+                self._locals[k] = v
+            return "", "", 0
+
+        name = str(argv[0])
+
+        # раскрытие алиаса
+        if name in self.aliases:
+            expansion = tokenize(self.aliases[name], self.env)
+            argv = list(expansion) + list(argv[1:])
+            name = str(argv[0]) if argv else ""
+
+        if name in BUILTIN_NAMES:
+            return self.run_builtin(name, argv[1:], stdin_data, user)
+
+        cmd = get(name)
+        if cmd is None:
+            return "", f"{name}: command not found", 127
+
+        args = [str(a) for a in argv[1:]]
+        cmdline = " ".join(str(a) for a in argv)
+        # Для команды создаём env с присваиваниями поверх обычного
+        cmd_env = dict(self.env)
+        cmd_env.update(assignments)
+        proc = self.kernel.create_process(
+            name=name, uid=user.uid, gid=user.gid, ppid=self.kernel.init.pid,
+            cwd=self.cwd, cmdline=cmdline, args=args, env=cmd_env, nice=nice,
+        )
+        proc.state = ProcessState.RUNNING
+        self.kernel.current_proc = proc  # для /proc/self
+        ctx = Context(self.kernel, user, self.cwd, self, proc, self.env)
+        try:
+            result = cmd.func(ctx, args, stdin_data)
+            out, code = self._normalize(result)
+            err = ""
+        except PyOSError as exc:
+            out, code, err = "", (exc.errno or 1), self._format_error(name, exc)
+        except Exception as exc:  # noqa: BLE001 - защита REPL от падений команд
+            out, code, err = "", 1, f"{name}: internal error: {exc}"
+        finally:
+            proc.state = ProcessState.TERMINATED
+            proc.cpu_ticks += 1
+            if self._in_worker:
+                self.kernel.scheduler.clock += 1
+            else:
+                self.kernel.idle(1)
+            self.kernel.reap(proc)
+        return out, err, code
+
+    @staticmethod
+    def _normalize(result):
+        if result is None:
+            return "", 0
+        if isinstance(result, str):
+            return result, 0
+        if isinstance(result, tuple):
+            out = result[0] if result[0] is not None else ""
+            code = result[1] if len(result) > 1 else 0
+            return out, code
+        return str(result), 0
+
+    @staticmethod
+    def _format_error(name, exc):
+        if exc.path:
+            return f"{name}: {exc.path}: {exc.label}"
+        return f"{name}: {exc.label}"
+
+    # -- фоновые задания -----------------------------------------------------
+    @staticmethod
+    def _parse_nice(argv):
+        """Разбирает необязательный префикс ``nice [-n N]``.
+
+        Возвращает ``(nice, argv_без_префикса)``.
+        """
+        if argv and str(argv[0]) == "nice":
+            rest = list(argv[1:])
+            adj = 10
+            if rest and str(rest[0]) == "-n":
+                if len(rest) >= 2:
+                    try:
+                        adj = int(str(rest[1]))
+                    except ValueError:
+                        adj = 10
+                    rest = rest[2:]
+            elif rest and str(rest[0]).startswith("-n") and len(str(rest[0])) > 2:
+                try:
+                    adj = int(str(rest[0])[2:])
+                except ValueError:
+                    adj = 10
+                rest = rest[1:]
+            return adj, rest
+        return 0, argv
+
+    def execute_background(self, tokens):
+        segments = split_and_or(tokens)
+        nice = 0
+        if segments:
+            nice, rest = self._parse_nice(segments[0][0])
+            if len(rest) != len(segments[0][0]):
+                segments = [(rest, segments[0][1])] + list(segments[1:])
+        first_tokens = segments[0][0] if segments else []
+        first_argv = []
+        try:
+            parsed = parse_pipeline(first_tokens)
+            if parsed:
+                first_argv = parsed[0][0]
+        except PyOSError:
+            first_argv = first_tokens
+        name = str(first_argv[0]) if first_argv else "job"
+        cmdline = " ".join(str(t) for seg, _ in segments for t in seg)
+
+        proc = self.kernel.create_process(
+            name=name, uid=self.user.uid, gid=self.user.gid,
+            ppid=self.kernel.init.pid, cwd=self.cwd, cmdline=cmdline, nice=nice,
+        )
+        job = {"id": self._next_job, "pid": proc.pid, "cmdline": cmdline,
+               "done": False, "proc": proc}
+        self._next_job += 1
+        self.jobs.append(job)
+
+        is_sleep = (len(segments) == 1 and segments[0][1] is None
+                    and len(first_argv) >= 2 and str(first_argv[0]) == "sleep")
+
+        def worker(p):
+            if not is_sleep:
+                prev = self._in_worker
+                self._in_worker = True
+                try:
+                    self._execute_segments(segments)
+                finally:
+                    self._in_worker = prev
+            p.exit_code = self.last_code
+            job["done"] = True
+            self.write_stdout(f"[{job['id']}] Done    {cmdline}")
+
+        if is_sleep:
+            try:
+                ticks = int(float(str(first_argv[1])) * TICKS_PER_SECOND)
+            except ValueError:
+                ticks = TICKS_PER_SECOND
+            proc.remaining = 0
+            proc.worker = worker
+            self.kernel.scheduler.block(proc, ticks, "sleep")
+        else:
+            proc.remaining = 10
+            proc.worker = worker
+            self.kernel.scheduler.add(proc)
+
+        self.write_stdout(f"[{job['id']}] {proc.pid}")
+
+    # -- встроенные команды --------------------------------------------------
+    def run_builtin(self, name, args, stdin_data, user):
+        handler = getattr(self, f"_bi_{name}", None)
+        if handler is None:
+            return "", f"{name}: builtin not implemented", 127
+        try:
+            result = handler(args, stdin_data, user)
+            out, code = self._normalize(result)
+            return out, "", code
+        except PyOSError as exc:
+            return "", self._format_error(name, exc), (exc.errno or 1)
+        except UserError as exc:
+            return "", f"{name}: {exc}", 1
+
+    def _bi_exit(self, args, stdin, user):
+        code = 0
+        if args:
+            try:
+                code = int(args[0])
+            except ValueError:
+                code = 0
+        self.exit_code = code
+        self.running = False
+        return None
+
+    def _bi_export(self, args, stdin, user):
+        if not args:
+            for k, v in sorted(self.env.items()):
+                self.write_stdout(f"export {k}={v}")
+            return None
+        for a in args:
+            key, sep, val = a.partition("=")
+            if sep:
+                self._locals.pop(key, None)
+                self.env[key] = val
+            else:
+                # export existing local or mark as exported
+                if key in self._locals:
+                    self.env[key] = self._locals.pop(key)
+                elif key not in self.env:
+                    self.env[key] = ""
+        return None
+
+    def _bi_unset(self, args, stdin, user):
+        for a in args:
+            self._locals.pop(a, None)
+            self.env.pop(a, None)
+        return None
+
+    def _bi_set(self, args, stdin, user):
+        for k, v in sorted(self._locals.items()):
+            self.write_stdout(f"{k}={v}")
+        for k, v in sorted(self.env.items()):
+            self.write_stdout(f"{k}={v}")
+        return None
+
+    def _bi_nice(self, args, stdin, user):
+        adjustment, rest = self._parse_nice(["nice"] + list(args))
+        if not rest:
+            return "0"
+        out, err, code = self.run_single(rest, stdin, user, nice=adjustment)
+        if err:
+            self.write_stderr(err)
+        return out, code
+
+    def _bi_alias(self, args, stdin, user):
+        if not args:
+            for k, v in sorted(self.aliases.items()):
+                self.write_stdout(f"alias {k}='{v}'")
+            return None
+        for a in args:
+            key, sep, val = a.partition("=")
+            if sep:
+                self.aliases[key] = val.strip("'\"")
+            else:
+                if key in self.aliases:
+                    self.write_stdout(f"alias {key}='{self.aliases[key]}'")
+                else:
+                    self.write_stderr(f"alias: {key}: not found")
+                    return 1
+        return None
+
+    def _bi_unalias(self, args, stdin, user):
+        for a in args:
+            self.aliases.pop(a, None)
+        return None
+
+    def _bi_history(self, args, stdin, user):
+        for i, line in enumerate(self.history, 1):
+            self.write_stdout(f"{i:>5}  {line}")
+        return None
+
+    def _bi_jobs(self, args, stdin, user):
+        for job in self.jobs:
+            status = "Done" if job["done"] else "Running"
+            self.write_stdout(f"[{job['id']}] {status:<7} {job['cmdline']}")
+        return None
+
+    def _bi_fg(self, args, stdin, user):
+        active = [j for j in self.jobs if not j["done"]]
+        if not active:
+            self.write_stderr("fg: no current job")
+            return 1
+        job = active[-1]
+        proc = job["proc"]
+        # дожидаемся завершения
+        self.kernel.scheduler.run_until(lambda: job["done"] or not proc.is_alive)
+        return None
+
+    def _bi_bg(self, args, stdin, user):
+        active = [j for j in self.jobs if not j["done"]]
+        if not active:
+            self.write_stderr("bg: no current job")
+            return 1
+        job = active[-1]
+        self.write_stdout(f"[{job['id']}] {job['cmdline']} &")
+        return None
+
+    def _bi_su(self, args, stdin, user):
+        target = args[0] if args else "root"
+        account = self.kernel.users.get_by_name(target)
+        if account is None:
+            raise UserError(f"su: user {target} does not exist")
+        if account.password_hash:
+            import getpass
+            try:
+                pw = getpass.getpass(f"Password: ")
+            except Exception:
+                pw = input("Password: ")
+            if not account.check_password(pw):
+                raise UserError("su: Authentication failure")
+        self.user = account
+        self.cwd = account.home
+        self.env["HOME"] = account.home
+        self.env["USER"] = account.name
+        self.env["LOGNAME"] = account.name
+        return None
+
+    def _bi_sudo(self, args, stdin, user):
+        if not args:
+            raise InvalidArgument("sudo: no command specified")
+        if args[0] == "-u":
+            if len(args) < 3:
+                raise InvalidArgument("sudo: option requires an argument -- 'u'")
+            target_name = args[1]
+            rest = args[2:]
+        else:
+            target_name = "root"
+            rest = args
+        target = self.kernel.users.get_by_name(target_name)
+        if target is None:
+            raise InvalidArgument(f"sudo: unknown user: {target_name}")
+        out, err, code = self.run_single(rest, stdin, user=target)
+        if err:
+            self.write_stderr(err)
+        return out, code
+
+    def _bi_source(self, args, stdin, user):
+        if not args:
+            raise InvalidArgument("source: filename argument required")
+        data = self.kernel.fs.read_file(args[0], user, self.cwd, self.user.home)
+        for line in data.splitlines():
+            if line.strip() and not line.lstrip().startswith("#"):
+                self.handle_line(line)
+        return None
