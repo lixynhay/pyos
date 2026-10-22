@@ -79,6 +79,84 @@ def _index(packages, repo="local", fmt=1):
     }
 
 
+def _package_json(name="hello", version="1.0", release=1, **extra):
+    data = {
+        "format": 1,
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": "any",
+        "description": "test package",
+        "depends": [],
+        "provides": [],
+        "conflicts": [],
+        "files": [{
+            "path": f"/usr/bin/{name}",
+            "mode": "0755",
+            "owner": "root",
+            "group": "root",
+            "encoding": "utf-8",
+            "content": name,
+        }],
+    }
+    data.update(extra)
+    return data
+
+
+def _make_repo(kernel, root, name="local", packages=None, priority=100,
+               url=None):
+    """Создаёт path-репо, пакеты и кэш индекса; возвращает описание репо."""
+    url = url or f"/srv/{name}/"
+    entries = []
+    for spec in packages or []:
+        pkgname = spec["name"]
+        version = spec["version"]
+        release = spec.get("release", 1)
+        filename = spec.get("filename", f"{pkgname}-{version}.pkg.json")
+        data = spec.get("data") or _package_json(
+            name=pkgname, version=version, release=release)
+        raw = json.dumps(data)
+        if not spec.get("skip_source"):
+            _ensure(kernel, root, url.rstrip("/") + "/packages")
+            kernel.fs.write_file(url + "packages/" + filename, raw,
+                                 root, "/", "/")
+        sha256 = spec.get(
+            "sha256", hashlib.sha256(raw.encode("utf-8")).hexdigest())
+        size = spec.get("size", len(raw.encode("utf-8")))
+        entries.append(_entry(
+            name=pkgname, version=version, release=release,
+            filename=filename, url="packages/" + filename,
+            sha256=sha256, size=size))
+
+    _cache_index(kernel, root, name, _index(entries, repo=name))
+    return {"name": name, "url": url, "priority": priority}
+
+
+def _cache_index(kernel, root, name, index_data):
+    _ensure(kernel, root, f"/var/cache/repos/{name}")
+    kernel.fs.write_file(f"/var/cache/repos/{name}/index.json",
+                         json.dumps(index_data), root, "/", "/")
+
+
+def _use_repos(kernel, root, repos):
+    _write_config(kernel, root, [
+        _repo(repo["name"], repo["url"], "path", priority=repo["priority"])
+        for repo in repos
+    ])
+
+
+def _package_cache(repo, name, version):
+    return f"/var/cache/packages/{repo}/{name}-{version}.pkg.json"
+
+
+def _manifest(kernel, root, name):
+    path = f"/var/lib/packages/installed/{name}.json"
+    try:
+        return json.loads(kernel.fs.read_file(path, root, "/", "/"))
+    except NoSuchFileOrDirectory:
+        return None
+
+
 # -- pkg repo add/remove/list -----------------------------------------------
 
 
@@ -483,3 +561,255 @@ def test_installed_and_owners_db_untouched_by_repo_commands(kernel, root):
     assert kernel.fs.read_file(manifest_path, root, "/", "/") == manifest_before
     assert kernel.fs.read_file(owners_path, root, "/", "/") == owners_before
     assert kernel.fs.read_file("/usr/bin/demo", root, "/", "/") == "demo"
+# -- pkg install <name> из репозиториев -------------------------------------
+
+
+def test_install_by_name_resolves_from_local_repo(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["install", "hello"], "")
+
+    assert "installed 'hello'" in result
+    manifest = _manifest(kernel, root, "hello")
+    assert manifest is not None
+    assert manifest["version"] == "1.0"
+    assert kernel.fs.read_file("/usr/bin/hello", root, "/", "/") == "hello"
+    assert kernel.fs.read_file(
+        _package_cache("local", "hello", "1.0"), root, "/", "/")
+
+
+def test_install_by_name_prefers_higher_priority_repo(kernel, root):
+    ctx = _ctx(kernel, root)
+    core = _make_repo(kernel, root, name="core", priority=10, packages=[
+        {"name": "hello", "version": "2.0"},
+    ])
+    local = _make_repo(kernel, root, name="local", priority=100, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [core, local])
+
+    cmd_pkg(ctx, ["install", "hello"], "")
+
+    assert _manifest(kernel, root, "hello")["version"] == "1.0"
+    assert kernel.fs.read_file(
+        _package_cache("local", "hello", "1.0"), root, "/", "/")
+
+
+def test_install_by_name_ambiguity_same_priority_errors(kernel, root):
+    ctx = _ctx(kernel, root)
+    core = _make_repo(kernel, root, name="core", priority=50, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    extra = _make_repo(kernel, root, name="extra", priority=50, packages=[
+        {"name": "hello", "version": "2.0"},
+    ])
+    _use_repos(kernel, root, [core, extra])
+
+    with pytest.raises(InvalidArgument, match="ambiguous") as exc:
+        cmd_pkg(ctx, ["install", "hello"], "")
+
+    message = str(exc.value)
+    assert "core" in message
+    assert "extra" in message
+    assert _manifest(kernel, root, "hello") is None
+
+
+def test_install_by_name_at_repo_selects_repo(kernel, root):
+    ctx = _ctx(kernel, root)
+    core = _make_repo(kernel, root, name="core", priority=10, packages=[
+        {"name": "hello", "version": "2.0"},
+    ])
+    local = _make_repo(kernel, root, name="local", priority=100, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [core, local])
+
+    cmd_pkg(ctx, ["install", "hello@core"], "")
+
+    assert _manifest(kernel, root, "hello")["version"] == "2.0"
+    assert kernel.fs.read_file(
+        _package_cache("core", "hello", "2.0"), root, "/", "/")
+
+
+def test_install_by_name_version_spec_eq(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+        {"name": "hello", "version": "2.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    cmd_pkg(ctx, ["install", "hello=1.0"], "")
+
+    assert _manifest(kernel, root, "hello")["version"] == "1.0"
+
+
+def test_install_by_name_version_spec_ge(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+        {"name": "hello", "version": "1.9"},
+        {"name": "hello", "version": "1.10"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    cmd_pkg(ctx, ["install", "hello>=1.9"], "")
+
+    assert _manifest(kernel, root, "hello")["version"] == "1.10"
+
+
+def test_install_by_name_selects_max_via_pkgvercmp_not_alpha(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.9"},
+        {"name": "hello", "version": "1.10"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    cmd_pkg(ctx, ["install", "hello"], "")
+
+    assert _manifest(kernel, root, "hello")["version"] == "1.10"
+
+
+def test_install_by_name_downloads_and_verifies_sha256_ok(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    cmd_pkg(ctx, ["install", "hello"], "")
+
+    source = kernel.fs.read_file(
+        "/srv/local/packages/hello-1.0.pkg.json", root, "/", "/")
+    cached = kernel.fs.read_file(
+        _package_cache("local", "hello", "1.0"), root, "/", "/")
+    assert cached == source
+    assert (hashlib.sha256(cached.encode("utf-8")).hexdigest()
+            == hashlib.sha256(source.encode("utf-8")).hexdigest())
+
+
+def test_install_by_name_sha256_mismatch_removes_cache_and_errors(
+        kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0", "sha256": "b" * 64},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    with pytest.raises(PyOSError, match="sha256 mismatch"):
+        cmd_pkg(ctx, ["install", "hello"], "")
+
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup(
+            _package_cache("local", "hello", "1.0"), root, "/", "/")
+    assert _manifest(kernel, root, "hello") is None
+
+
+def test_install_by_name_reuses_cached_package_when_sha_matches(kernel, root):
+    ctx = _ctx(kernel, root)
+    package_data = _package_json(name="hello", version="1.0")
+    repo = _make_repo(kernel, root, packages=[{
+        "name": "hello",
+        "version": "1.0",
+        "data": package_data,
+        "skip_source": True,
+    }])
+    _use_repos(kernel, root, [repo])
+
+    _ensure(kernel, root, "/var/cache/packages/local")
+    kernel.fs.write_file(
+        _package_cache("local", "hello", "1.0"),
+        json.dumps(package_data), root, "/", "/")
+
+    cmd_pkg(ctx, ["install", "hello"], "")
+
+    assert _manifest(kernel, root, "hello")["version"] == "1.0"
+    assert kernel.fs.read_file(
+        _package_cache("local", "hello", "1.0"), root, "/", "/")
+
+
+def test_install_by_name_size_limit_exceeded_errors(kernel, root):
+    ctx = _ctx(kernel, root)
+    package_data = _package_json(name="hello", version="1.0")
+    raw = json.dumps(package_data)
+    repo = _make_repo(kernel, root, packages=[{
+        "name": "hello",
+        "version": "1.0",
+        "data": package_data,
+        "size": len(raw.encode("utf-8")) - 1,
+    }])
+    _use_repos(kernel, root, [repo])
+
+    with pytest.raises(PyOSError, match="size"):
+        cmd_pkg(ctx, ["install", "hello"], "")
+
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup(
+            _package_cache("local", "hello", "1.0"), root, "/", "/")
+    assert _manifest(kernel, root, "hello") is None
+
+
+def test_install_by_name_without_index_cache_errors_update_first(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [_repo("local", "/srv/local/")])
+
+    with pytest.raises(InvalidArgument, match="pkg repo update first"):
+        cmd_pkg(ctx, ["install", "hello"], "")
+
+
+def test_install_by_name_dry_run_does_not_write(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["install", "hello", "--dry-run"], "")
+
+    assert "would install" in result
+    assert _manifest(kernel, root, "hello") is None
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/usr/bin/hello", root, "/", "/")
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup(
+            _package_cache("local", "hello", "1.0"), root, "/", "/")
+
+
+def test_install_by_name_calls_existing_file_installer(kernel, root):
+    from pyos.commands import package_cmds
+
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    with mock.patch.object(
+            package_cmds, "_install_package_file",
+            wraps=package_cmds._install_package_file) as installer:
+        cmd_pkg(ctx, ["install", "hello"], "")
+
+    installer.assert_called_once()
+    assert kernel.fs.read_file("/usr/bin/hello", root, "/", "/") == "hello"
+    owners = json.loads(kernel.fs.read_file(
+        "/var/lib/packages/file-owners.json", root, "/", "/"))
+    assert owners["/usr/bin/hello"] == "hello"
+    assert _manifest(kernel, root, "hello")["name"] == "hello"
+
+
+def test_install_by_path_still_works(kernel, root):
+    ctx = _ctx(kernel, root)
+    kernel.fs.write_file(
+        "/root/manual.pkg.json",
+        json.dumps(_package_json(name="manual")), root, "/", "/")
+
+    result = cmd_pkg(ctx, ["install", "/root/manual.pkg.json"], "")
+
+    assert "installed 'manual'" in result
+    assert _manifest(kernel, root, "manual") is not None
+    assert kernel.fs.read_file("/usr/bin/manual", root, "/", "/") == "manual"

@@ -804,6 +804,40 @@ def _package_dependents(ctx, pkgname):
     return dependents
 
 
+def _install_named_package(ctx, target, dry_run=False):
+    """Устанавливает пакет по имени из репозитория или из кэша makepkg."""
+    from ..repo import install_package_by_name, read_repos
+
+    config = read_repos(ctx.fs, ctx.user)
+    if config["repos"]:
+        return install_package_by_name(
+            ctx, target, dry_run=dry_run,
+            installer=_install_package_file)
+
+    # Обратная совместимость: без repos.json — старый путь из кэша makepkg.
+    pkgname = target
+    try:
+        cache_node = ctx.fs.lookup(f"{CACHE_ROOT}", ctx.user, "/", "/")
+    except NoSuchFileOrDirectory:
+        raise InvalidArgument("pkg: no packages in cache (run makepkg first)")
+
+    candidates = []
+    if cache_node.is_dir():
+        for name in cache_node.children:
+            if name == pkgname or name.startswith(pkgname + "-"):
+                candidates.append(name)
+
+    if not candidates:
+        raise InvalidArgument(
+            f"pkg: package '{pkgname}' not found in cache")
+
+    chosen, ver = _choose_cached_package(pkgname, candidates)
+    if not chosen.startswith(pkgname + "-"):
+        pkgname = chosen
+
+    return _install_from_cache(ctx, pkgname, ver, dry_run=dry_run)
+
+
 def _install_package_file(ctx, path, dry_run=False):
     """Устанавливает локальный .pkg.json из виртуальной ФС."""
     try:
@@ -1043,7 +1077,8 @@ def _format_pkg_info(data, installed=False):
 
 
 @register("pkg",
-          usage=("pkg install <name|file.pkg.json> [--dry-run] | "
+          usage=("pkg install <name|name@repo|name[op]version|file.pkg.json> "
+                 "[--dry-run] | "
                  "pkg remove <name> [--force] [--dry-run] | "
                  "pkg list | pkg info <name> | "
                  "pkg repo add|remove|list|update ..."),
@@ -1054,7 +1089,9 @@ def cmd_pkg(ctx, args, stdin):
 
     Подкоманды:
       pkg install <path>      — установить локальный .pkg.json из виртуальной ФС
-      pkg install <pkgname>   — установить пакет из кэша makepkg
+      pkg install <name>      — установить из репозитория (или кэша makepkg)
+      pkg install <name>@<repo> — только из указанного репозитория
+      pkg install <name>=<version> / >= / <= / > / < — version-spec
       pkg remove <pkgname>    — удалить пакет
       pkg list                — показать установленные пакеты
       pkg info <pkgname>      — информация о пакете
@@ -1095,31 +1132,7 @@ def cmd_pkg(ctx, args, stdin):
         if "/" in target or target.endswith(".json"):
             return _install_package_file(ctx, target, dry_run=dry_run)
 
-        pkgname = target
-
-        # Ищем в кэше: точное совпадение <name>-<ver> или последнюю версию
-        try:
-            cache_node = ctx.fs.lookup(f"{CACHE_ROOT}", ctx.user, "/", "/")
-        except NoSuchFileOrDirectory:
-            raise InvalidArgument(f"pkg: no packages in cache (run makepkg first)")
-
-        candidates = []
-        if cache_node.is_dir():
-            for name in cache_node.children:
-                if name == pkgname or name.startswith(pkgname + "-"):
-                    candidates.append(name)
-
-        if not candidates:
-            raise InvalidArgument(
-                f"pkg: package '{pkgname}' not found in cache"
-            )
-
-        chosen, ver = _choose_cached_package(pkgname, candidates)
-        if not chosen.startswith(pkgname + "-"):
-            # Каталог без версии: сохраняем прежнюю трактовку имени.
-            pkgname = chosen
-
-        return _install_from_cache(ctx, pkgname, ver, dry_run=dry_run)
+        return _install_named_package(ctx, target, dry_run=dry_run)
 
     elif subcmd == "remove":
         allowed = {"--force", "--dry-run"}

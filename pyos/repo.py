@@ -14,12 +14,18 @@ from .errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
 
 REPOS_CONFIG = "/etc/pyos/repos.json"
 REPO_CACHE_ROOT = "/var/cache/repos"
+PACKAGE_CACHE_ROOT = "/var/cache/packages"
 # Максимальный размер index.json (4 MiB). Больше — не парсим.
 REPO_INDEX_MAX_BYTES = 4 * 1024 * 1024
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _DEP_RE = re.compile(r"^([A-Za-z0-9@._+-]+)\s*(?:([<>=]+)\s*(\S+))?$")
+_INSTALL_SPEC_RE = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9+._-]*)"
+    r"(?:@(?P<repo>[a-z0-9]+(?:-[a-z0-9]+)*))?"
+    r"(?:(?P<op>>=|<=|=|>|<)(?P<version>.+))?$"
+)
 
 
 # -- утилиты ----------------------------------------------------------------
@@ -510,6 +516,272 @@ def update_repos(ctx, names=None):
                 f"'{repo['name']}'")
 
     return "\n".join(lines)
+
+
+# -- установка по имени -----------------------------------------------------
+
+
+def _parse_install_spec(target):
+    """Разбирает ``name[@repo][op version]``."""
+    match = _INSTALL_SPEC_RE.match(target)
+    if not match:
+        if "~=" in target:
+            raise InvalidArgument(
+                f"pkg: '~=' version spec is not supported: '{target}'")
+        raise InvalidArgument(f"pkg: invalid package spec '{target}'")
+    return {
+        "name": match.group("name"),
+        "repo": match.group("repo"),
+        "op": match.group("op"),
+        "version": match.group("version"),
+    }
+
+
+def _package_full_version(package):
+    """Возвращает ``version-release`` для pkgvercmp."""
+    return f"{package['version']}-{package['release']}"
+
+
+def _version_matches(package, op, version, pkgvercmp):
+    """Проверяет version-spec через pkgvercmp.
+
+    Сравниваются и ``version``, и ``version-release``, чтобы работали
+    и ``name=1.0``, и ``name=1.0-2``.
+    """
+    if op is None:
+        return True
+
+    actuals = [package["version"]]
+    full = _package_full_version(package)
+    if full != package["version"]:
+        actuals.append(full)
+
+    for actual in actuals:
+        result = pkgvercmp(actual, version)
+        if op == "=" and result == 0:
+            return True
+        if op == ">=" and result >= 0:
+            return True
+        if op == "<=" and result <= 0:
+            return True
+        if op == ">" and result > 0:
+            return True
+        if op == "<" and result < 0:
+            return True
+    return False
+
+
+def _max_package(packages, pkgvercmp):
+    """Выбирает максимальную версию через pkgvercmp."""
+    chosen = packages[0]
+    for candidate in packages[1:]:
+        if pkgvercmp(_package_full_version(candidate),
+                     _package_full_version(chosen)) > 0:
+            chosen = candidate
+    return chosen
+
+
+def read_cached_index(fs, user, repo):
+    """Читает кэшированный индекс репозитория (без сети)."""
+    path = f"{REPO_CACHE_ROOT}/{repo['name']}/index.json"
+    try:
+        text = fs.read_file(path, user, "/", "/")
+    except NoSuchFileOrDirectory:
+        raise InvalidArgument(
+            f"repo: no cached index for '{repo['name']}', "
+            "run pkg repo update first")
+    except PyOSError as exc:
+        raise InvalidArgument(
+            f"repo: cannot read cached index '{path}': {exc}")
+    return _parse_index(text, path, repo)
+
+
+def resolve_package(ctx, target):
+    """Резолвит ``name[@repo][op version]`` по кэшам индексов.
+
+    Возвращает ``(repo, package_entry)``.
+    """
+    from .commands.package_cmds import pkgvercmp
+
+    spec = _parse_install_spec(target)
+    config = read_repos(ctx.fs, ctx.user)
+
+    if spec["repo"] is not None:
+        explicit = [repo for repo in config["repos"]
+                    if repo["name"] == spec["repo"]]
+        if not explicit:
+            raise InvalidArgument(
+                f"pkg: repository '{spec['repo']}' not found")
+        if not explicit[0]["enabled"]:
+            raise InvalidArgument(
+                f"pkg: repository '{spec['repo']}' is disabled")
+        repos = explicit
+    else:
+        repos = [repo for repo in config["repos"] if repo["enabled"]]
+        if not repos:
+            raise InvalidArgument("pkg: no enabled repositories")
+        repos.sort(key=lambda repo: (-repo["priority"], repo["name"]))
+
+    indexes = [(repo, read_cached_index(ctx.fs, ctx.user, repo))
+               for repo in repos]
+
+    found = []
+    for repo, index in indexes:
+        seen_keys = set()
+        candidates = []
+        for package in index["packages"]:
+            if package["name"] != spec["name"]:
+                continue
+            key = (package["name"], package["version"],
+                   package["release"], package["arch"])
+            if key in seen_keys:
+                raise InvalidArgument(
+                    f"pkg: duplicate package "
+                    f"{key[0]}-{key[1]}-{key[2]}-{key[3]} "
+                    f"in repository '{repo['name']}'")
+            seen_keys.add(key)
+            if _version_matches(package, spec["op"], spec["version"],
+                                pkgvercmp):
+                candidates.append(package)
+
+        if candidates:
+            found.append((repo, _max_package(candidates, pkgvercmp)))
+
+    if not found:
+        where = (f" in repository '{spec['repo']}'"
+                 if spec["repo"] else "")
+        raise InvalidArgument(
+            f"pkg: package '{spec['name']}' not found{where}")
+
+    if spec["repo"] is not None:
+        return found[0]
+
+    top_priority = max(repo["priority"] for repo, _ in found)
+    top = [(repo, package) for repo, package in found
+           if repo["priority"] == top_priority]
+    if len(top) > 1:
+        details = ", ".join(
+            f"{repo['name']} ({_package_full_version(package)})"
+            for repo, package in top)
+        raise InvalidArgument(
+            f"pkg: ambiguous package '{spec['name']}' at priority "
+            f"{top_priority}: {details}")
+    return top[0]
+
+
+def _safe_package_url(repo, package):
+    """Повторно проверяет url пакета и склеивает его с base репозитория."""
+    relative = package["url"]
+    name = package.get("name", "?")
+    base = repo["url"].rstrip("/") + "/"
+
+    if (not isinstance(relative, str) or not relative
+            or relative.startswith("/")
+            or _SCHEME_RE.match(relative)
+            or ".." in relative.split("/")):
+        raise InvalidArgument(
+            f"pkg: unsafe package url '{relative}' for '{name}'")
+
+    resolved = base + relative
+    if not resolved.startswith(base):
+        raise InvalidArgument(
+            f"pkg: package url escapes repository base: '{relative}'")
+    return resolved
+
+
+def _package_cache_path(repo, package):
+    """Возвращает безопасный путь кэша пакета."""
+    filename = package["filename"]
+    if (not isinstance(filename, str) or not filename
+            or "/" in filename or "\\" in filename
+            or filename in (".", "..")):
+        raise InvalidArgument(
+            f"pkg: unsafe package filename {filename!r}")
+    return f"{PACKAGE_CACHE_ROOT}/{repo['name']}/{filename}"
+
+
+def _fetch_package_text(ctx, repo, package, url):
+    """Читает пакет из path-репо или качает через общий network helper."""
+    if repo["type"] == "http":
+        try:
+            return network_cmds._http_get_text(
+                url, follow_redirects=True,
+                timeout=network_cmds.REQUEST_TIMEOUT,
+                raise_for_status=True)
+        except (PyOSError, InvalidArgument) as exc:
+            raise PyOSError(
+                f"pkg: failed to download '{package['name']}': "
+                f"{_clean_error(exc)}")
+
+    try:
+        return ctx.fs.read_file(url, ctx.user, "/", "/")
+    except NoSuchFileOrDirectory:
+        raise InvalidArgument(f"pkg: package file not found: '{url}'")
+    except PyOSError as exc:
+        raise InvalidArgument(f"pkg: cannot read package '{url}': {exc}")
+
+
+def _remove_cached_file(ctx, path):
+    try:
+        ctx.fs.unlink(path, ctx.user, "/", "/")
+    except PyOSError:
+        pass
+
+
+def install_package_by_name(ctx, target, *, dry_run=False, installer):
+    """Находит, скачивает, проверяет пакет и вызывает file-installer.
+
+    ``installer`` — существующая функция ``_install_package_file(ctx, path,
+    dry_run=...)``; установка файлов/DB не дублируется.
+    """
+    repo, package = resolve_package(ctx, target)
+    cache_path = _package_cache_path(repo, package)
+    expected_sha = str(package["sha256"]).lower()
+
+    try:
+        cached = ctx.fs.read_file(cache_path, ctx.user, "/", "/")
+    except NoSuchFileOrDirectory:
+        cached = None
+    except PyOSError as exc:
+        raise InvalidArgument(
+            f"pkg: cannot read cached package '{cache_path}': {exc}")
+
+    downloaded = False
+    if (cached is not None
+            and hashlib.sha256(cached.encode("utf-8")).hexdigest().lower()
+            == expected_sha):
+        text = cached
+    else:
+        url = _safe_package_url(repo, package)
+        text = _fetch_package_text(ctx, repo, package, url)
+
+        _ensure_dir(ctx.fs, f"{PACKAGE_CACHE_ROOT}/{repo['name']}", ctx.user)
+        ctx.fs.write_file(cache_path, text, ctx.user, "/", "/", create=True)
+        downloaded = True
+
+        actual_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if actual_sha.lower() != expected_sha:
+            _remove_cached_file(ctx, cache_path)
+            raise PyOSError(
+                f"pkg: sha256 mismatch for '{package['name']}': "
+                f"expected {expected_sha}, got {actual_sha}")
+
+        size = package.get("size")
+        actual_size = len(text.encode("utf-8"))
+        if size is not None and actual_size > size:
+            _remove_cached_file(ctx, cache_path)
+            raise PyOSError(
+                f"pkg: package '{package['name']}' exceeds declared size "
+                f"({actual_size} > {size})")
+
+    if dry_run:
+        try:
+            return installer(ctx, cache_path, dry_run=True)
+        finally:
+            if downloaded:
+                _remove_cached_file(ctx, cache_path)
+
+    return installer(ctx, cache_path, dry_run=False)
 
 
 # -- CLI pkg repo -----------------------------------------------------------
