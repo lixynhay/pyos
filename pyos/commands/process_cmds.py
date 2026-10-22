@@ -3,13 +3,36 @@
 from ..errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
 from ..process import ProcessState
 from ..scheduler import TICKS_PER_SECOND
-from ..signals import signal_number
+from ..signals import SIGNAL_BY_NAME, signal_name, signal_number
 from .registry import register
 
 
 # Сигналы, которые ядро pyOS не умеет обрабатывать: остановка/продолжение
 # процессов не реализованы, поэтому такие запросы отклоняются явно.
 _UNSUPPORTED_SIGNAL_NAMES = {"STOP", "TSTP", "CONT"}
+
+
+def _supported_signals():
+    """Пары (номер, короткое имя) для сигналов, которые kill принимает."""
+    return sorted(
+        (num, name)
+        for name, num in SIGNAL_BY_NAME.items()
+        if name not in _UNSUPPORTED_SIGNAL_NAMES
+    )
+
+
+def _format_signal_list():
+    """Список поддерживаемых сигналов в формате ``<номер> <имя> SIG<имя>``."""
+    return "\n".join(
+        f"{num:>2} {name:<5} SIG{name}" for num, name in _supported_signals()
+    )
+
+
+def _check_supported(resolved, option):
+    """Отклоняет сигналы, которые симулятор не умеет обрабатывать."""
+    if signal_name(resolved) in _UNSUPPORTED_SIGNAL_NAMES:
+        raise InvalidArgument(
+            f"kill: {option}: signal is not supported by pyos simulator")
 
 
 def _parse_kill_signal(opts):
@@ -23,12 +46,7 @@ def _parse_kill_signal(opts):
         if resolved is None:
             raise InvalidArgument(f"kill: {o}: invalid signal specification")
 
-        base = spec.upper().removeprefix("SIG")
-        if base in _UNSUPPORTED_SIGNAL_NAMES:
-            raise InvalidArgument(
-                f"kill: {o}: signal is not supported by pyos simulator"
-            )
-
+        _check_supported(resolved, o)
         signum = resolved
 
     return signum
@@ -97,10 +115,23 @@ def cmd_top(ctx, args, stdin):
     return "\n".join(frames)
 
 
-@register("kill", usage="kill [-signal] pid ...", summary="Послать сигнал процессу",
-          category="process")
+@register("kill", usage="kill [-signal] pid ... | kill -l [signal]",
+          summary="Послать сигнал процессу", category="process")
 def cmd_kill(ctx, args, stdin):
     opts, pids = _split(args)
+    if "-l" in opts:
+        if len(opts) > 1 or len(pids) > 1:
+            raise InvalidArgument("kill: -l: too many arguments")
+        if not pids:
+            return _format_signal_list()
+        spec = str(pids[0])
+        resolved = signal_number(spec)
+        if resolved is None:
+            raise InvalidArgument(
+                f"kill: -l: invalid signal specification '{spec}'")
+        _check_supported(resolved, "-l")
+        return signal_name(resolved) if spec.isdigit() else str(resolved)
+
     signum = _parse_kill_signal(opts)
     if not pids:
         raise InvalidArgument("kill: usage: kill [-signum] pid ...")

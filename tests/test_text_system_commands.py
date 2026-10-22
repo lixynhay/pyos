@@ -490,6 +490,79 @@ def test_kill_named_signal_logs_number_in_dmesg(kernel, root, capsys):
     assert f"signal 9 sent to pid {proc.pid}" in capsys.readouterr().out
 
 
+def test_kill_l_prints_supported_signals(kernel, root, capsys):
+    """kill -l перечисляет поддерживаемые сигналы."""
+    Shell(kernel, root).handle_line("kill -l")
+    tokens = capsys.readouterr().out.split()
+    for token in ("TERM", "SIGTERM", "KILL", "SIGKILL"):
+        assert token in tokens
+
+
+def test_kill_l_does_not_include_unsupported_stop_signals(kernel, root, capsys):
+    """STOP/TSTP/CONT не выдаются как поддерживаемые."""
+    Shell(kernel, root).handle_line("kill -l")
+    tokens = capsys.readouterr().out.split()
+    for token in ("STOP", "SIGSTOP", "CONT", "SIGCONT",
+                  "TSTP", "SIGTSTP"):
+        assert token not in tokens
+
+
+def test_kill_l_name_returns_number(kernel, root, capsys):
+    """kill -l <имя> печатает номер сигнала."""
+    Shell(kernel, root).handle_line("kill -l TERM")
+    assert capsys.readouterr().out.strip() == "15"
+
+
+def test_kill_l_number_returns_name(kernel, root, capsys):
+    """kill -l <номер> печатает имя сигнала."""
+    Shell(kernel, root).handle_line("kill -l 9")
+    assert capsys.readouterr().out.strip() == "KILL"
+
+
+def test_kill_l_invalid_name(kernel, root, capsys):
+    """kill -l с неизвестным сигналом — ошибка."""
+    sh = Shell(kernel, root)
+    sh.handle_line("kill -l BOGUS")
+    captured = capsys.readouterr()
+    assert "invalid signal specification" in captured.err
+    assert sh.last_code != 0
+
+
+def test_kill_l_with_pid_args(kernel, root, capsys):
+    """kill -l принимает только один сигнал, PID-подобный аргумент — ошибка."""
+    sh = Shell(kernel, root)
+    sh.handle_line("kill -l 123")
+    captured = capsys.readouterr()
+    assert "invalid signal specification" in captured.err
+    assert sh.last_code != 0
+
+    sh.handle_line("kill -l 123 456")
+    captured = capsys.readouterr()
+    assert "too many arguments" in captured.err
+    assert sh.last_code != 0
+
+
+@pytest.mark.parametrize("signal_spec", [None, "-9", "-TERM"])
+def test_kill_still_works_after_l_change(kernel, root, capsys,
+                                         signal_spec):
+    """Обычная отправка сигналов не сломалась."""
+    proc = _spawn_victim(kernel)
+    line = f"kill {signal_spec} {proc.pid}" if signal_spec else f"kill {proc.pid}"
+    Shell(kernel, root).handle_line(line)
+    assert kernel.get_process(proc.pid) is None
+
+
+def test_kill_rejects_numeric_unsupported_signal(kernel, root, capsys):
+    """Числовая форма STOP тоже отклоняется."""
+    proc = _spawn_victim(kernel)
+    sh = Shell(kernel, root)
+    sh.handle_line(f"kill -19 {proc.pid}")
+    captured = capsys.readouterr()
+    assert "not supported" in captured.err
+    assert sh.last_code != 0
+    assert kernel.get_process(proc.pid) is proc
+
+
 # -- uptime -----------------------------------------------------------------
 
 
