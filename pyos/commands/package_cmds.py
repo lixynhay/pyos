@@ -804,6 +804,29 @@ def _package_dependents(ctx, pkgname):
     return dependents
 
 
+def _installed_satisfies(ctx, pkgname, op, version):
+    """Проверяет installed DB через pkgvercmp.
+
+    Без version-spec достаточно факта установки. Иначе сравниваются
+    ``version`` и ``version-release`` установленного пакета.
+    """
+    manifest = _read_manifest(ctx.fs, ctx.user, pkgname)
+    if manifest is None:
+        return False
+    if op is None:
+        return True
+
+    from ..repo import _version_matches
+
+    installed = {
+        "version": str(manifest.get("version") or manifest.get("pkgver") or ""),
+        "release": manifest.get("release", manifest.get("pkgrel", 1)),
+    }
+    if not installed["version"]:
+        return False
+    return _version_matches(installed, op, version, pkgvercmp)
+
+
 def _install_named_package(ctx, target, dry_run=False):
     """Устанавливает пакет по имени из репозитория или из кэша makepkg."""
     from ..repo import install_package_by_name, read_repos
@@ -812,7 +835,9 @@ def _install_named_package(ctx, target, dry_run=False):
     if config["repos"]:
         return install_package_by_name(
             ctx, target, dry_run=dry_run,
-            installer=_install_package_file)
+            installer=_install_package_file,
+            is_installed=lambda name, op, version: _installed_satisfies(
+                ctx, name, op, version))
 
     # Обратная совместимость: без repos.json — старый путь из кэша makepkg.
     pkgname = target

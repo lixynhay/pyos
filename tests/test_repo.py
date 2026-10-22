@@ -9,7 +9,12 @@ import pytest
 from pyos.commands.package_cmds import cmd_pkg
 from pyos.context import Context
 from pyos.errors import InvalidArgument, NoSuchFileOrDirectory, PermissionDenied, PyOSError
-from pyos.repo import REPOS_CONFIG, REPO_INDEX_MAX_BYTES, read_index
+from pyos.repo import (
+    REPOS_CONFIG,
+    REPO_INDEX_MAX_BYTES,
+    parse_dependency,
+    read_index,
+)
 from pyos.shell import Shell
 
 
@@ -114,7 +119,10 @@ def _make_repo(kernel, root, name="local", packages=None, priority=100,
         release = spec.get("release", 1)
         filename = spec.get("filename", f"{pkgname}-{version}.pkg.json")
         data = spec.get("data") or _package_json(
-            name=pkgname, version=version, release=release)
+            name=pkgname, version=version, release=release,
+            depends=spec.get("depends", []),
+            provides=spec.get("provides", []),
+            conflicts=spec.get("conflicts", []))
         raw = json.dumps(data)
         if not spec.get("skip_source"):
             _ensure(kernel, root, url.rstrip("/") + "/packages")
@@ -126,7 +134,11 @@ def _make_repo(kernel, root, name="local", packages=None, priority=100,
         entries.append(_entry(
             name=pkgname, version=version, release=release,
             filename=filename, url="packages/" + filename,
-            sha256=sha256, size=size))
+            sha256=sha256, size=size,
+            depends=spec.get("depends", []),
+            provides=spec.get("provides", []),
+            conflicts=spec.get(
+                "index_conflicts", spec.get("conflicts", []))))
 
     _cache_index(kernel, root, name, _index(entries, repo=name))
     return {"name": name, "url": url, "priority": priority}
@@ -800,6 +812,219 @@ def test_install_by_name_calls_existing_file_installer(kernel, root):
         "/var/lib/packages/file-owners.json", root, "/", "/"))
     assert owners["/usr/bin/hello"] == "hello"
     assert _manifest(kernel, root, "hello")["name"] == "hello"
+
+
+def _install_and_record(ctx, target):
+    """Устанавливает target и возвращает порядок вызовов file-installer."""
+    from pyos.commands import package_cmds
+
+    calls = []
+    original = package_cmds._install_package_file
+
+    def spy(install_ctx, path, dry_run=False):
+        data = json.loads(
+            install_ctx.fs.read_file(path, install_ctx.user, "/", "/"))
+        calls.append(data["name"])
+        return original(install_ctx, path, dry_run=dry_run)
+
+    with mock.patch.object(
+            package_cmds, "_install_package_file", side_effect=spy):
+        cmd_pkg(ctx, ["install", target], "")
+    return calls
+
+
+def test_resolve_chain_a_depends_b_depends_c_installs_in_post_order(
+        kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "c", "version": "1.0"},
+        {"name": "b", "version": "1.0", "depends": ["c"]},
+        {"name": "a", "version": "1.0", "depends": ["b"]},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    calls = _install_and_record(ctx, "a")
+
+    assert calls == ["c", "b", "a"]
+    for name in ("a", "b", "c"):
+        assert _manifest(kernel, root, name) is not None
+        assert kernel.fs.read_file(
+            f"/usr/bin/{name}", root, "/", "/") == name
+
+
+def test_resolve_cycle_errors_with_chain(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "a", "version": "1.0", "depends": ["b"]},
+        {"name": "b", "version": "1.0", "depends": ["a"]},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    with pytest.raises(InvalidArgument, match="dependency cycle") as exc:
+        cmd_pkg(ctx, ["install", "a"], "")
+
+    assert "a -> b -> a" in str(exc.value)
+    assert _manifest(kernel, root, "a") is None
+    assert _manifest(kernel, root, "b") is None
+
+
+def test_resolve_unsatisfied_dependency_errors_with_required_by(
+        kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "app", "version": "1.0", "depends": ["ghost>=1.0"]},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    with pytest.raises(InvalidArgument, match="unsatisfied dependency") as exc:
+        cmd_pkg(ctx, ["install", "app"], "")
+
+    message = str(exc.value)
+    assert "ghost>=1.0" in message
+    assert "required by 'app'" in message
+    assert _manifest(kernel, root, "app") is None
+
+
+def test_resolve_dependency_version_spec_ge(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "lib", "version": "1.9"},
+        {"name": "lib", "version": "1.10"},
+        {"name": "app", "version": "1.0", "depends": ["lib>=1.9"]},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    cmd_pkg(ctx, ["install", "app"], "")
+
+    assert _manifest(kernel, root, "lib")["version"] == "1.10"
+    assert _manifest(kernel, root, "app") is not None
+
+
+def test_resolve_dependency_version_spec_eq(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "lib", "version": "1.0"},
+        {"name": "lib", "version": "2.0"},
+        {"name": "app", "version": "1.0", "depends": ["lib=1.0"]},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    cmd_pkg(ctx, ["install", "app"], "")
+
+    assert _manifest(kernel, root, "lib")["version"] == "1.0"
+
+
+def test_resolve_skips_already_installed_satisfying_dep(kernel, root):
+    ctx = _ctx(kernel, root)
+    kernel.fs.write_file(
+        "/root/lib.pkg.json",
+        json.dumps(_package_json(name="lib", version="1.0")),
+        root, "/", "/")
+    cmd_pkg(ctx, ["install", "/root/lib.pkg.json"], "")
+
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "lib", "version": "2.0"},
+        {"name": "app", "version": "1.0", "depends": ["lib>=1.0"]},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    calls = _install_and_record(ctx, "app")
+
+    assert calls == ["app"]
+    assert _manifest(kernel, root, "lib")["version"] == "1.0"
+    assert _manifest(kernel, root, "app") is not None
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup(
+            _package_cache("local", "lib", "2.0"), root, "/", "/")
+
+
+def test_resolve_at_repo_only_applies_to_root_not_deps(kernel, root):
+    ctx = _ctx(kernel, root)
+    core = _make_repo(kernel, root, name="core", priority=100, packages=[
+        {"name": "app", "version": "1.0", "depends": ["lib"]},
+    ])
+    extra = _make_repo(kernel, root, name="extra", priority=10, packages=[
+        {"name": "lib", "version": "2.0"},
+    ])
+    _use_repos(kernel, root, [core, extra])
+
+    cmd_pkg(ctx, ["install", "app@core"], "")
+
+    assert _manifest(kernel, root, "app") is not None
+    assert _manifest(kernel, root, "lib")["version"] == "2.0"
+    assert kernel.fs.read_file(
+        _package_cache("extra", "lib", "2.0"), root, "/", "/")
+
+
+def test_resolve_dry_run_prints_full_plan_in_order(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "c", "version": "1.0"},
+        {"name": "b", "version": "1.0", "depends": ["c"]},
+        {"name": "a", "version": "1.0", "depends": ["b"]},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["install", "a", "--dry-run"], "")
+
+    lines = [line.strip() for line in result.splitlines()
+             if line.startswith("  ")]
+    assert [line.split()[0] for line in lines] == ["c", "b", "a"]
+    assert _manifest(kernel, root, "a") is None
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup(
+            _package_cache("local", "c", "1.0"), root, "/", "/")
+
+
+def test_resolve_dep_string_parsing_all_operators():
+    assert parse_dependency("foo") == {
+        "name": "foo", "op": None, "version": None}
+    assert parse_dependency("foo>=1.0") == {
+        "name": "foo", "op": ">=", "version": "1.0"}
+    assert parse_dependency("foo=1.0") == {
+        "name": "foo", "op": "=", "version": "1.0"}
+    assert parse_dependency("foo<=2.0") == {
+        "name": "foo", "op": "<=", "version": "2.0"}
+    assert parse_dependency("foo>0.9") == {
+        "name": "foo", "op": ">", "version": "0.9"}
+    assert parse_dependency("foo<3.0") == {
+        "name": "foo", "op": "<", "version": "3.0"}
+    assert parse_dependency("foo >= 1.2") == {
+        "name": "foo", "op": ">=", "version": "1.2"}
+
+    with pytest.raises(InvalidArgument, match="invalid dependency"):
+        parse_dependency("foo~=1.0")
+
+
+def test_provides_parsed_but_not_resolved(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "provider", "version": "1.0", "provides": ["virtual"]},
+        {"name": "app", "version": "1.0", "depends": ["virtual"]},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    with pytest.raises(InvalidArgument, match="unsatisfied dependency") as exc:
+        cmd_pkg(ctx, ["install", "app"], "")
+
+    assert "virtual" in str(exc.value)
+    assert _manifest(kernel, root, "provider") is None
+    assert _manifest(kernel, root, "app") is None
+
+
+def test_conflicts_parsed_but_not_enforced(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "a", "version": "1.0", "index_conflicts": ["b"]},
+        {"name": "b", "version": "1.0", "index_conflicts": ["a"]},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    cmd_pkg(ctx, ["install", "a"], "")
+    cmd_pkg(ctx, ["install", "b"], "")
+
+    assert _manifest(kernel, root, "a") is not None
+    assert _manifest(kernel, root, "b") is not None
 
 
 def test_install_by_path_still_works(kernel, root):

@@ -26,6 +26,10 @@ _INSTALL_SPEC_RE = re.compile(
     r"(?:@(?P<repo>[a-z0-9]+(?:-[a-z0-9]+)*))?"
     r"(?:(?P<op>>=|<=|=|>|<)(?P<version>.+))?$"
 )
+_DEP_SPEC_RE = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9+._-]*)"
+    r"(?:\s*(?P<op>>=|<=|=|>|<)\s*(?P<version>[^\s]+))?$"
+)
 
 
 # -- утилиты ----------------------------------------------------------------
@@ -537,6 +541,23 @@ def _parse_install_spec(target):
     }
 
 
+def parse_dependency(spec):
+    """Разбирает строку зависимости вида ``name``/``name>=1.2``.
+
+    Поддержаны операторы ``=``, ``>=``, ``<=``, ``>``, ``<``.
+    """
+    if not isinstance(spec, str) or not spec:
+        raise InvalidArgument(f"pkg: invalid dependency {spec!r}")
+    match = _DEP_SPEC_RE.match(spec.strip())
+    if not match:
+        raise InvalidArgument(f"pkg: invalid dependency '{spec}'")
+    return {
+        "name": match.group("name"),
+        "op": match.group("op"),
+        "version": match.group("version"),
+    }
+
+
 def _package_full_version(package):
     """Возвращает ``version-release`` для pkgvercmp."""
     return f"{package['version']}-{package['release']}"
@@ -596,41 +617,36 @@ def read_cached_index(fs, user, repo):
     return _parse_index(text, path, repo)
 
 
-def resolve_package(ctx, target):
-    """Резолвит ``name[@repo][op version]`` по кэшам индексов.
+def _enabled_repos(config):
+    """Возвращает включённые репозитории в порядке priority desc, name asc."""
+    repos = [repo for repo in config["repos"] if repo["enabled"]]
+    if not repos:
+        raise InvalidArgument("pkg: no enabled repositories")
+    repos.sort(key=lambda repo: (-repo["priority"], repo["name"]))
+    return repos
 
-    Возвращает ``(repo, package_entry)``.
-    """
-    from .commands.package_cmds import pkgvercmp
 
-    spec = _parse_install_spec(target)
-    config = read_repos(ctx.fs, ctx.user)
+def _explicit_repo(config, name):
+    """Проверяет и возвращает репозиторий, указанный через ``@repo``."""
+    explicit = [repo for repo in config["repos"] if repo["name"] == name]
+    if not explicit:
+        raise InvalidArgument(f"pkg: repository '{name}' not found")
+    if not explicit[0]["enabled"]:
+        raise InvalidArgument(f"pkg: repository '{name}' is disabled")
+    return explicit[0]
 
-    if spec["repo"] is not None:
-        explicit = [repo for repo in config["repos"]
-                    if repo["name"] == spec["repo"]]
-        if not explicit:
-            raise InvalidArgument(
-                f"pkg: repository '{spec['repo']}' not found")
-        if not explicit[0]["enabled"]:
-            raise InvalidArgument(
-                f"pkg: repository '{spec['repo']}' is disabled")
-        repos = explicit
-    else:
-        repos = [repo for repo in config["repos"] if repo["enabled"]]
-        if not repos:
-            raise InvalidArgument("pkg: no enabled repositories")
-        repos.sort(key=lambda repo: (-repo["priority"], repo["name"]))
 
-    indexes = [(repo, read_cached_index(ctx.fs, ctx.user, repo))
-               for repo in repos]
-
+def _select_package(indexes, name, op, version, repo_filter, required_by,
+                    pkgvercmp):
+    """Выбирает лучший пакет по имени/version-spec среди индексов."""
     found = []
     for repo, index in indexes:
+        if repo_filter is not None and repo["name"] != repo_filter:
+            continue
         seen_keys = set()
         candidates = []
         for package in index["packages"]:
-            if package["name"] != spec["name"]:
+            if package["name"] != name:
                 continue
             key = (package["name"], package["version"],
                    package["release"], package["arch"])
@@ -640,20 +656,22 @@ def resolve_package(ctx, target):
                     f"{key[0]}-{key[1]}-{key[2]}-{key[3]} "
                     f"in repository '{repo['name']}'")
             seen_keys.add(key)
-            if _version_matches(package, spec["op"], spec["version"],
-                                pkgvercmp):
+            if _version_matches(package, op, version, pkgvercmp):
                 candidates.append(package)
 
         if candidates:
             found.append((repo, _max_package(candidates, pkgvercmp)))
 
     if not found:
-        where = (f" in repository '{spec['repo']}'"
-                 if spec["repo"] else "")
-        raise InvalidArgument(
-            f"pkg: package '{spec['name']}' not found{where}")
+        if required_by is not None:
+            spec_text = f"{name}{op or ''}{version or ''}"
+            raise InvalidArgument(
+                f"pkg: unsatisfied dependency '{spec_text}' "
+                f"required by '{required_by}'")
+        where = f" in repository '{repo_filter}'" if repo_filter else ""
+        raise InvalidArgument(f"pkg: package '{name}' not found{where}")
 
-    if spec["repo"] is not None:
+    if repo_filter is not None:
         return found[0]
 
     top_priority = max(repo["priority"] for repo, _ in found)
@@ -664,9 +682,110 @@ def resolve_package(ctx, target):
             f"{repo['name']} ({_package_full_version(package)})"
             for repo, package in top)
         raise InvalidArgument(
-            f"pkg: ambiguous package '{spec['name']}' at priority "
+            f"pkg: ambiguous package '{name}' at priority "
             f"{top_priority}: {details}")
     return top[0]
+
+
+class _DependencyResolver:
+    """Жадный DFS-резолвер с post-order планом установки."""
+
+    def __init__(self, indexes, pkgvercmp, dependency_indexes=None):
+        self.indexes = indexes
+        self.dependency_indexes = dependency_indexes
+        self.pkgvercmp = pkgvercmp
+        self.resolved = set()
+        self.stack = []
+        self.plan = []
+
+    def _indexes_for(self, required_by):
+        if required_by is None or self.dependency_indexes is None:
+            return self.indexes
+        if callable(self.dependency_indexes):
+            self.dependency_indexes = self.dependency_indexes()
+        return self.dependency_indexes
+
+    def resolve(self, name, op, version, repo_filter, required_by):
+        if name in self.stack:
+            start = self.stack.index(name)
+            chain = self.stack[start:] + [name]
+            raise InvalidArgument(
+                f"pkg: dependency cycle: {' -> '.join(chain)}")
+        if name in self.resolved:
+            return
+
+        repo, package = _select_package(
+            self._indexes_for(required_by), name, op, version, repo_filter,
+            required_by, self.pkgvercmp)
+
+        self.stack.append(name)
+        try:
+            for raw in package.get("depends", []) or []:
+                dependency = parse_dependency(raw)
+                self.resolve(
+                    dependency["name"], dependency["op"],
+                    dependency["version"], None, name)
+        finally:
+            self.stack.pop()
+
+        self.resolved.add(name)
+        self.plan.append((repo, package, op, version, required_by))
+
+
+def resolve_package(ctx, target):
+    """Резолвит один пакет ``name[@repo][op version]`` по кэшам индексов.
+
+    Возвращает ``(repo, package_entry)``. Зависимости не обходит;
+    для них используйте :func:`resolve_package_plan`.
+    """
+    from .commands.package_cmds import pkgvercmp
+
+    spec = _parse_install_spec(target)
+    config = read_repos(ctx.fs, ctx.user)
+
+    if spec["repo"] is not None:
+        repos = [_explicit_repo(config, spec["repo"])]
+    else:
+        repos = _enabled_repos(config)
+
+    indexes = [(repo, read_cached_index(ctx.fs, ctx.user, repo))
+               for repo in repos]
+    return _select_package(
+        indexes, spec["name"], spec["op"], spec["version"], spec["repo"],
+        None, pkgvercmp)
+
+
+def resolve_package_plan(ctx, target):
+    """Строит post-order план установки пакета и его зависимостей.
+
+    ``@repo`` ограничивает только корневой пакет; зависимости ищутся
+    по всем включённым репозиториям.
+    """
+    from .commands.package_cmds import pkgvercmp
+
+    spec = _parse_install_spec(target)
+    config = read_repos(ctx.fs, ctx.user)
+
+    if spec["repo"] is not None:
+        explicit = _explicit_repo(config, spec["repo"])
+        root_indexes = [(explicit, read_cached_index(
+            ctx.fs, ctx.user, explicit))]
+
+        def load_dependency_indexes():
+            return [(repo, read_cached_index(ctx.fs, ctx.user, repo))
+                    for repo in _enabled_repos(config)]
+
+        resolver = _DependencyResolver(
+            root_indexes, pkgvercmp, load_dependency_indexes)
+    else:
+        repos = _enabled_repos(config)
+        indexes = [(repo, read_cached_index(ctx.fs, ctx.user, repo))
+                   for repo in repos]
+        resolver = _DependencyResolver(indexes, pkgvercmp)
+
+    resolver.resolve(
+        spec["name"], spec["op"], spec["version"], spec["repo"], None)
+    return resolver.plan
 
 
 def _safe_package_url(repo, package):
@@ -728,13 +847,8 @@ def _remove_cached_file(ctx, path):
         pass
 
 
-def install_package_by_name(ctx, target, *, dry_run=False, installer):
-    """Находит, скачивает, проверяет пакет и вызывает file-installer.
-
-    ``installer`` — существующая функция ``_install_package_file(ctx, path,
-    dry_run=...)``; установка файлов/DB не дублируется.
-    """
-    repo, package = resolve_package(ctx, target)
+def _cache_package(ctx, repo, package):
+    """Скачивает/переиспользует пакет в кэше и проверяет sha256/size."""
     cache_path = _package_cache_path(repo, package)
     expected_sha = str(package["sha256"]).lower()
 
@@ -746,42 +860,70 @@ def install_package_by_name(ctx, target, *, dry_run=False, installer):
         raise InvalidArgument(
             f"pkg: cannot read cached package '{cache_path}': {exc}")
 
-    downloaded = False
     if (cached is not None
             and hashlib.sha256(cached.encode("utf-8")).hexdigest().lower()
             == expected_sha):
-        text = cached
-    else:
-        url = _safe_package_url(repo, package)
-        text = _fetch_package_text(ctx, repo, package, url)
+        return cache_path
 
-        _ensure_dir(ctx.fs, f"{PACKAGE_CACHE_ROOT}/{repo['name']}", ctx.user)
-        ctx.fs.write_file(cache_path, text, ctx.user, "/", "/", create=True)
-        downloaded = True
+    url = _safe_package_url(repo, package)
+    text = _fetch_package_text(ctx, repo, package, url)
 
-        actual_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        if actual_sha.lower() != expected_sha:
-            _remove_cached_file(ctx, cache_path)
-            raise PyOSError(
-                f"pkg: sha256 mismatch for '{package['name']}': "
-                f"expected {expected_sha}, got {actual_sha}")
+    _ensure_dir(ctx.fs, f"{PACKAGE_CACHE_ROOT}/{repo['name']}", ctx.user)
+    ctx.fs.write_file(cache_path, text, ctx.user, "/", "/", create=True)
 
-        size = package.get("size")
-        actual_size = len(text.encode("utf-8"))
-        if size is not None and actual_size > size:
-            _remove_cached_file(ctx, cache_path)
-            raise PyOSError(
-                f"pkg: package '{package['name']}' exceeds declared size "
-                f"({actual_size} > {size})")
+    actual_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if actual_sha.lower() != expected_sha:
+        _remove_cached_file(ctx, cache_path)
+        raise PyOSError(
+            f"pkg: sha256 mismatch for '{package['name']}': "
+            f"expected {expected_sha}, got {actual_sha}")
+
+    size = package.get("size")
+    actual_size = len(text.encode("utf-8"))
+    if size is not None and actual_size > size:
+        _remove_cached_file(ctx, cache_path)
+        raise PyOSError(
+            f"pkg: package '{package['name']}' exceeds declared size "
+            f"({actual_size} > {size})")
+
+    return cache_path
+
+
+def install_package_by_name(ctx, target, *, dry_run=False, installer,
+                            is_installed=None):
+    """Резолвит пакет с зависимостями и устанавливает их в post-order.
+
+    ``installer`` — существующая функция ``_install_package_file(ctx, path,
+    dry_run=...)``; установка файлов/DB не дублируется.
+
+    ``is_installed(name, op, version)`` проверяет installed DB. Если пакет
+    уже установлен с удовлетворяющей версией, он не скачивается и не
+    переустанавливается.
+    """
+    plan = resolve_package_plan(ctx, target)
+    if is_installed is None:
+        def is_installed(name, op, version):
+            return False
 
     if dry_run:
-        try:
-            return installer(ctx, cache_path, dry_run=True)
-        finally:
-            if downloaded:
-                _remove_cached_file(ctx, cache_path)
+        lines = ["pkg: would install:"]
+        for repo, package, op, version, _required_by in plan:
+            marker = ""
+            if is_installed(package["name"], op, version):
+                marker = " (already installed)"
+            lines.append(
+                f"  {package['name']} {_package_full_version(package)} "
+                f"[{repo['name']}]{marker}")
+        return "\n".join(lines)
 
-    return installer(ctx, cache_path, dry_run=False)
+    results = []
+    for repo, package, op, version, _required_by in plan:
+        if is_installed(package["name"], op, version):
+            results.append(f"pkg: '{package['name']}' already installed")
+            continue
+        cache_path = _cache_package(ctx, repo, package)
+        results.append(installer(ctx, cache_path, dry_run=False))
+    return "\n".join(results)
 
 
 # -- CLI pkg repo -----------------------------------------------------------
