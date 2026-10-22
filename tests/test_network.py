@@ -243,3 +243,54 @@ def test_wget_registered():
     """wget зарегистрирована в реестре."""
     from pyos.commands import get
     assert get("wget") is not None
+
+
+# -- общий helper _http_get_text --------------------------------------------
+
+def test_http_get_text_follows_redirects_when_asked():
+    """Helper принимает follow_redirects/timeout и возвращает текст."""
+    from pyos.commands import network_cmds
+
+    with mock.patch.object(network_cmds, "_do_request") as mock_do:
+        mock_do.return_value = (
+            200, {"Content-Type": "text/plain"}, b"body")
+        text = network_cmds._http_get_text(
+            "https://example.com/x", follow_redirects=True, timeout=5)
+
+    assert text == "body"
+    assert text.status == 200
+    assert text.raw_size == 4
+    mock_do.assert_called_once_with(
+        "https://example.com/x", follow_redirects=True, timeout=5)
+
+
+def test_http_get_text_does_not_follow_by_default_for_curl_path():
+    """Без явного флага helper не следует редиректам (как curl)."""
+    from pyos.commands import network_cmds
+
+    with mock.patch.object(network_cmds, "_do_request") as mock_do:
+        mock_do.return_value = (200, {}, b"body")
+        text = network_cmds._http_get_text("https://example.com/x")
+
+    assert text == "body"
+    mock_do.assert_called_once_with(
+        "https://example.com/x", follow_redirects=False,
+        timeout=network_cmds.REQUEST_TIMEOUT)
+
+
+def test_curl_wget_behavior_unchanged(kernel, root):
+    """curl не следует редиректам по умолчанию, wget следует."""
+    from pyos.commands.network_cmds import cmd_curl, cmd_wget
+
+    shell = Shell(kernel, root)
+    ctx = Context(kernel, root, "/root", shell=shell)
+
+    with mock.patch("pyos.commands.network_cmds._do_request") as mock_do:
+        mock_do.return_value = (200, {}, b"ok")
+        cmd_curl(ctx, ["https://example.com/x"], "")
+        assert mock_do.call_args.kwargs["follow_redirects"] is False
+
+        mock_do.reset_mock()
+        mock_do.return_value = (200, {}, b"ok")
+        cmd_wget(ctx, ["-q", "https://example.com/x.txt"], "")
+        assert mock_do.call_args.kwargs["follow_redirects"] is True

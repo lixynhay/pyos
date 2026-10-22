@@ -65,6 +65,33 @@ def _do_request(url, follow_redirects=False, timeout=REQUEST_TIMEOUT):
         raise PyOSError(f"curl: request failed: {exc}")
 
 
+class HttpText(str):
+    """Текст тела ответа с метаданными, нужными ``curl -v``."""
+
+    def __new__(cls, text, status, headers, raw_size):
+        obj = super().__new__(cls, text)
+        obj.status = status
+        obj.headers = headers
+        obj.raw_size = raw_size
+        return obj
+
+
+def _http_get_text(url, *, follow_redirects=False, timeout=REQUEST_TIMEOUT,
+                   raise_for_status=False):
+    """Выполняет HTTP GET и возвращает тело как текст.
+
+    Кодировка определяется так же, как в curl/wget. ``raise_for_status``
+    включает ошибку для не-2xx ответов (используется пакетным менеджером).
+    """
+    status, headers, body = _do_request(
+        url, follow_redirects=follow_redirects, timeout=timeout)
+
+    if raise_for_status and not 200 <= status < 300:
+        raise PyOSError(f"HTTP {status}")
+
+    return HttpText(_decode_body(body, headers), status, headers, len(body))
+
+
 def _format_size(n: int) -> str:
     """Форматирует размер в байтах."""
     if n < 1024:
@@ -127,10 +154,11 @@ def cmd_curl(ctx, args, stdin):
     if url is None:
         raise InvalidArgument("curl: missing URL")
 
-    status, headers, body = _do_request(url, follow_redirects=follow)
-
-    # Обработка тела как текста
-    body_text = _decode_body(body, headers)
+    # Обработка тела как текста (helper общий с pkg repo update)
+    body_text = _http_get_text(
+        url, follow_redirects=follow, timeout=REQUEST_TIMEOUT)
+    status = body_text.status
+    headers = body_text.headers
 
     if verbose:
         proto = "HTTP/1.1"
@@ -153,7 +181,7 @@ def cmd_curl(ctx, args, stdin):
             _ensure_dir_simple(ctx.fs, parent, ctx.user)
         ctx.fs.write_file(path, body_text, ctx.user, ctx.cwd, ctx.home,
                           create=True)
-        sz = _format_size(len(body))
+        sz = _format_size(body_text.raw_size)
         return f"curl: saved to '{output_file}' ({sz})"
 
     return output
@@ -199,8 +227,8 @@ def cmd_wget(ctx, args, stdin):
     if url is None:
         raise InvalidArgument("wget: missing URL")
 
-    status, headers, body = _do_request(url, follow_redirects=True)
-    body_text = _decode_body(body, headers)
+    body_text = _http_get_text(
+        url, follow_redirects=True, timeout=REQUEST_TIMEOUT)
 
     # Определяем имя файла
     if output_file is None:
@@ -218,7 +246,7 @@ def cmd_wget(ctx, args, stdin):
     ctx.fs.write_file(path, body_text, ctx.user, ctx.cwd, ctx.home,
                       create=True)
 
-    sz = _format_size(len(body))
+    sz = _format_size(body_text.raw_size)
     if quiet:
         return None
     return f"wget: saved to '{output_file}' ({sz})"

@@ -16,7 +16,6 @@ from ..errors import (
     PermissionDenied,
     PyOSError,
 )
-from ..repo import handle_repo_command
 from .registry import register
 
 # -- пути в виртуальной ФС -------------------------------------------------
@@ -1073,6 +1072,10 @@ def cmd_pkg(ctx, args, stdin):
         raise PermissionDenied(message="pkg: only root can manage packages")
 
     if subcmd == "repo":
+        # Ленивый импорт: разрывает цикл repo -> commands.network_cmds ->
+        # commands.__init__ -> package_cmds -> repo.
+        from ..repo import handle_repo_command
+
         return handle_repo_command(ctx, cmd_args)
 
     if subcmd == "install":

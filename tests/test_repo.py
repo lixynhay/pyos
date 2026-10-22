@@ -1,14 +1,15 @@
-"""Тесты конфигурации репозиториев и чтения index.json (без сети)."""
+"""Тесты конфигурации репозиториев и чтения index.json."""
 
 import hashlib
 import json
+from unittest import mock
 
 import pytest
 
 from pyos.commands.package_cmds import cmd_pkg
 from pyos.context import Context
 from pyos.errors import InvalidArgument, NoSuchFileOrDirectory, PermissionDenied, PyOSError
-from pyos.repo import REPOS_CONFIG, read_index
+from pyos.repo import REPOS_CONFIG, REPO_INDEX_MAX_BYTES, read_index
 from pyos.shell import Shell
 
 
@@ -282,17 +283,161 @@ def test_repo_update_path_records_repo_mismatch(kernel, root):
     assert meta["repo_matches"] is False
 
 
-def test_repo_update_http_is_stub_error_not_crash(kernel, root):
+def test_repo_update_http_populates_cache_and_meta(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [
+        _repo("core", "https://example.com/p/", "http"),
+    ])
+    index_data = _index([_entry()], repo="core")
+    raw = json.dumps(index_data)
+
+    with mock.patch(
+            "pyos.commands.network_cmds._http_get_text",
+            return_value=raw) as mock_get:
+        result = cmd_pkg(ctx, ["repo", "update", "core"], "")
+
+    assert "updated 'core'" in result
+    assert "1 packages" in result
+
+    cached = kernel.fs.read_file(
+        "/var/cache/repos/core/index.json", root, "/", "/")
+    assert json.loads(cached) == index_data
+
+    meta = json.loads(kernel.fs.read_file(
+        "/var/cache/repos/core/index.meta.json", root, "/", "/"))
+    assert meta["source_url"] == "https://example.com/p/index.json"
+    assert meta["type"] == "http"
+    assert meta["package_count"] == 1
+    assert meta["index_sha256"] == hashlib.sha256(
+        raw.encode("utf-8")).hexdigest()
+    assert meta["fetched_at"]
+    assert meta["repo_matches"] is True
+
+    kwargs = mock_get.call_args.kwargs
+    assert kwargs["follow_redirects"] is True
+    assert kwargs["timeout"] == 10
+    assert kwargs["raise_for_status"] is True
+
+
+def test_repo_update_http_validates_index(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [
+        _repo("core", "https://example.com/p/", "http"),
+    ])
+    broken = json.dumps(_index([_entry()], repo="core", fmt=2))
+
+    with mock.patch(
+            "pyos.commands.network_cmds._http_get_text",
+            return_value=broken):
+        result = cmd_pkg(ctx, ["repo", "update", "core"], "")
+
+    assert "warning" in result
+    assert "format" in result
+
+    # Битый индекс не кэшируется.
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/var/cache/repos/core", root, "/", "/")
+
+
+def test_repo_update_http_rejects_http_scheme(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [
+        _repo("core", "http://example.com/p/", "http"),
+    ])
+
+    with mock.patch("pyos.commands.network_cmds._http_get_text") as mock_get:
+        with pytest.raises(InvalidArgument, match="https"):
+            cmd_pkg(ctx, ["repo", "update"], "")
+
+    mock_get.assert_not_called()
+
+
+def test_repo_update_http_one_repo_fails_others_continue(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [
+        _repo("core", "https://core.example/", "http"),
+        _repo("broken", "https://broken.example/", "http"),
+    ])
+    good_raw = json.dumps(_index([_entry()], repo="core"))
+
+    def fake_get(url, **kwargs):
+        if url.startswith("https://broken.example/"):
+            raise PyOSError("HTTP 500")
+        return good_raw
+
+    with mock.patch(
+            "pyos.commands.network_cmds._http_get_text",
+            side_effect=fake_get):
+        result = cmd_pkg(ctx, ["repo", "update"], "")
+
+    assert "updated 'core'" in result
+    assert "warning: 'broken'" in result
+    assert "500" in result
+
+    cached = kernel.fs.read_file(
+        "/var/cache/repos/core/index.json", root, "/", "/")
+    assert json.loads(cached) == _index([_entry()], repo="core")
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/var/cache/repos/broken", root, "/", "/")
+
+
+def test_repo_update_http_429_single_attempt_no_retry(kernel, root):
     ctx = _ctx(kernel, root)
     _write_config(kernel, root, [
         _repo("core", "https://example.com/p/", "http"),
     ])
 
-    result = cmd_pkg(ctx, ["repo", "update"], "")
-    assert "network repos not enabled yet" in result
+    with mock.patch(
+            "pyos.commands.network_cmds._do_request",
+            return_value=(429, {}, b"rate limited")) as mock_do:
+        result = cmd_pkg(ctx, ["repo", "update", "core"], "")
+
+    assert "warning: 'core'" in result
+    assert "429" in result
+    assert mock_do.call_count == 1
+
+    mock_do.assert_called_once()
+    kwargs = mock_do.call_args.kwargs
+    assert kwargs["follow_redirects"] is True
+    assert kwargs["timeout"] == 10
 
     with pytest.raises(NoSuchFileOrDirectory):
         kernel.fs.lookup("/var/cache/repos/core", root, "/", "/")
+
+
+def test_repo_update_http_index_too_large(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [
+        _repo("core", "https://example.com/p/", "http"),
+    ])
+    huge = "x" * (REPO_INDEX_MAX_BYTES + 1)
+
+    with mock.patch(
+            "pyos.commands.network_cmds._http_get_text",
+            return_value=huge):
+        result = cmd_pkg(ctx, ["repo", "update", "core"], "")
+
+    assert "index too large" in result
+    assert "warning: 'core'" in result
+
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/var/cache/repos/core", root, "/", "/")
+
+
+def test_repo_update_live_skip_when_offline(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [
+        _repo("live", "https://example.com/", "http"),
+    ])
+
+    result = cmd_pkg(ctx, ["repo", "update", "live"], "")
+
+    if "cannot fetch" in result:
+        pytest.skip("network unavailable")
+
+    # example.com отдаёт HTML, а не index.json: сетевая попытка реально была.
+    assert "warning: 'live'" in result
+    assert "invalid index" in result
 
 
 # -- repo-команды не трогают installed/owners DB ----------------------------

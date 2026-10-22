@@ -210,11 +210,21 @@ python -m pyos
 - `pkg repo list` — показать репозитории (доступно всем);
 - `pkg repo update [<name>...]` — обновить кэш индексов (только root).
 
-`pkg repo update` для `type: "path"` читает и валидирует индекс, сохраняет
-копию в `/var/cache/repos/<name>/index.json` и метаданные в
-`index.meta.json` (`fetched_at`, `source_url`, `type`, `index_sha256`,
-`package_count`). Для `type: "http"` команда пока печатает
-`network repos not enabled yet` и ничего не скачивает.
+`pkg repo update` для `type: "path"` читает и валидирует индекс, для
+`type: "http"` скачивает `<url>index.json` через общий сетевой helper
+(тот же, что используют `curl`/`wget`). Для http:
+
+- редиректы включены (`follow_redirects=True`), как у `wget`;
+- таймаут — `REQUEST_TIMEOUT` (10 секунд);
+- 429/5xx и сетевые ошибки дают warning по репозиторию, без retry; остальные
+  репозитории продолжают обновляться;
+- индекс больше 4 MiB (`REPO_INDEX_MAX_BYTES`) не парсится — ошибка
+  `index too large`;
+- ETag/Last-Modified/TTL не используются: индекс скачивается целиком при
+  каждом явном `pkg repo update`;
+- кэш (`/var/cache/repos/<name>/index.json` и `index.meta.json` с `fetched_at`,
+  `source_url`, `type`, `index_sha256`, `package_count`) обновляется только
+  после успешной валидации; при ошибке старый кэш не трогается.
 
 Ограничения: при чтении индекса проверяются `format`, обязательные поля,
 `sha256`, дубли `(name, version, release, arch)` и отсутствие `..`/абсолютных
@@ -353,8 +363,9 @@ pyos/
   файлы не реализованы. Зависимости проверяются по имени пакета, без
   ограничений версий и без учёта `provides`; `pkg remove --force` может
   оставить сломанные зависимости.
-- `pkg repo update` для `type: "http"` — заглушка: сеть в пакетном менеджере
-  ещё не включена, `http://` запрещён, допускается только `https://`.
+- `pkg repo update` для `type: "http"` использует реальную сеть хоста:
+  `http://` запрещён, допускается только `https://`; редиректы и таймаут
+  10 секунд, без retry и TTL, индекс ограничен 4 MiB.
 - `clear` очищает реальный терминал хоста, а не виртуальный экран.
 - Пароли хранятся как SHA-256 без «соли»; это учебный код, не для продакшена.
 - `df`/`free` показывают условные значения.

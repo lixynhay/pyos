@@ -1,7 +1,7 @@
 """Конфигурация репозиториев пакетов и чтение index.json.
 
-Фаза 1: локальные репозитории (``type="path"``) читаются из виртуальной ФС.
-Сеть не используется: ``type="http"`` пока является заглушкой.
+``type="path"`` читается из виртуальной ФС, ``type="http"`` — через общий
+сетевой helper из ``commands.network_cmds``.
 """
 
 import hashlib
@@ -9,10 +9,13 @@ import json
 import re
 from datetime import datetime, timezone
 
+from .commands import network_cmds
 from .errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
 
 REPOS_CONFIG = "/etc/pyos/repos.json"
 REPO_CACHE_ROOT = "/var/cache/repos"
+# Максимальный размер index.json (4 MiB). Больше — не парсим.
+REPO_INDEX_MAX_BYTES = 4 * 1024 * 1024
 
 _NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
@@ -341,19 +344,8 @@ def _validate_index_package(entry, repo):
     }
 
 
-def read_index(fs, user, repo):
-    """Читает и валидирует ``<url>index.json``.
-
-    Возвращает ``(index, raw_text)``; raw_text нужен для sha256 в meta.
-    """
-    source = repo["url"] + "index.json"
-    try:
-        text = fs.read_file(source, user, "/", "/")
-    except NoSuchFileOrDirectory:
-        raise InvalidArgument(f"repo: index not found: '{source}'")
-    except PyOSError as exc:
-        raise InvalidArgument(f"repo: cannot read index '{source}': {exc}")
-
+def _parse_index(text, source, repo):
+    """Валидирует текст index.json и возвращает нормализованный индекс."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -392,17 +384,68 @@ def read_index(fs, user, repo):
         seen.add(key)
         packages.append(package)
 
-    index = {
+    return {
         "format": 1,
         "repo": repo_field if repo_field is not None else repo["name"],
         "generated": data.get("generated"),
         "packages": packages,
     }
-    return index, text
+
+
+def read_index(fs, user, repo):
+    """Читает и валидирует ``<url>index.json`` из виртуальной ФС.
+
+    Возвращает ``(index, raw_text)``; raw_text нужен для sha256 в meta.
+    """
+    source = repo["url"] + "index.json"
+    try:
+        text = fs.read_file(source, user, "/", "/")
+    except NoSuchFileOrDirectory:
+        raise InvalidArgument(f"repo: index not found: '{source}'")
+    except PyOSError as exc:
+        raise InvalidArgument(f"repo: cannot read index '{source}': {exc}")
+
+    return _parse_index(text, source, repo), text
+
+
+def _clean_error(exc):
+    """Убирает служебный префикс из сообщения для warning-строки."""
+    text = str(exc)
+    for prefix in ("curl: ", "repo: "):
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
+
+def _write_cache(ctx, repo, index, raw, source):
+    cache_dir = f"{REPO_CACHE_ROOT}/{repo['name']}"
+    _ensure_dir(ctx.fs, cache_dir, ctx.user)
+
+    ctx.fs.write_file(cache_dir + "/index.json", raw,
+                      ctx.user, "/", "/", create=True)
+
+    meta = {
+        "fetched_at": _utc_now(),
+        "source_url": source,
+        "type": repo["type"],
+        "index_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "package_count": len(index["packages"]),
+        "repo": index["repo"],
+        "repo_matches": index["repo"] == repo["name"],
+    }
+    ctx.fs.write_file(cache_dir + "/index.meta.json",
+                      json.dumps(meta, indent=2, ensure_ascii=False),
+                      ctx.user, "/", "/", create=True)
+    return meta
 
 
 def update_repos(ctx, names=None):
-    """Обновляет кэш индексов. Для http — заглушка без сети."""
+    """Обновляет кэш индексов.
+
+    ``type="path"`` читается из виртуальной ФС, ``type="http"`` качается
+    через общий network helper. Ошибка одного репозитория не мешает
+    обновлению остальных.
+    """
     config = read_repos(ctx.fs, ctx.user)
     if names:
         known = {repo["name"]: repo for repo in config["repos"]}
@@ -418,32 +461,46 @@ def update_repos(ctx, names=None):
 
     lines = []
     for repo in targets:
+        source = repo["url"] + "index.json"
+
         if repo["type"] == "http":
-            lines.append(
-                f"repo: {repo['name']}: network repos not enabled yet")
-            continue
+            try:
+                raw = network_cmds._http_get_text(
+                    source,
+                    follow_redirects=True,
+                    timeout=network_cmds.REQUEST_TIMEOUT,
+                    raise_for_status=True,
+                )
+            except (PyOSError, InvalidArgument) as exc:
+                lines.append(
+                    f"repo: warning: '{repo['name']}': cannot fetch "
+                    f"'{source}': {_clean_error(exc)}")
+                continue
 
-        index, raw = read_index(ctx.fs, ctx.user, repo)
-        cache_dir = f"{REPO_CACHE_ROOT}/{repo['name']}"
-        _ensure_dir(ctx.fs, cache_dir, ctx.user)
+            size = getattr(raw, "raw_size", None)
+            if size is None:
+                size = len(raw.encode("utf-8"))
+            if size > REPO_INDEX_MAX_BYTES:
+                lines.append(
+                    f"repo: warning: '{repo['name']}': index too large "
+                    f"({size} bytes > {REPO_INDEX_MAX_BYTES})")
+                continue
 
-        ctx.fs.write_file(cache_dir + "/index.json", raw,
-                          ctx.user, "/", "/", create=True)
+            try:
+                index = _parse_index(raw, source, repo)
+            except InvalidArgument as exc:
+                lines.append(
+                    f"repo: warning: '{repo['name']}': {_clean_error(exc)}")
+                continue
+        else:
+            try:
+                index, raw = read_index(ctx.fs, ctx.user, repo)
+            except InvalidArgument as exc:
+                lines.append(
+                    f"repo: warning: '{repo['name']}': {_clean_error(exc)}")
+                continue
 
-        meta = {
-            "fetched_at": _utc_now(),
-            "source_url": repo["url"] + "index.json",
-            "type": repo["type"],
-            "index_sha256": hashlib.sha256(
-                raw.encode("utf-8")).hexdigest(),
-            "package_count": len(index["packages"]),
-            "repo": index["repo"],
-            "repo_matches": index["repo"] == repo["name"],
-        }
-        ctx.fs.write_file(cache_dir + "/index.meta.json",
-                          json.dumps(meta, indent=2, ensure_ascii=False),
-                          ctx.user, "/", "/", create=True)
-
+        meta = _write_cache(ctx, repo, index, raw, source)
         lines.append(
             f"repo: updated '{repo['name']}' "
             f"({meta['package_count']} packages)")
