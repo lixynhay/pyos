@@ -379,127 +379,178 @@ def test_save_load_hardlinks_remain_independent_but_keep_metadata(
 
 
 
-def test_cp_drops_mode_bits_currently(kernel, root, capsys):
-    # CHARACTERIZE: cp/cp -r не сохраняют права источника (create_file/mkdir
-    # берут дефолт 0644/0755); fixed in stage 3a (В8).
+def test_cp_preserves_file_mode(kernel, root, capsys):
+    # В8: cp сохраняет mode источника (umask в pyos нет).
     fs = kernel.fs
     fs.create_file("/tmp/exec", root, data="x", mode=0o755)
     fs.copy_tree("/tmp/exec", "/tmp/exec_cp", root, "/", "/")
-    assert fs.lookup("/tmp/exec_cp", root, "/", "/").mode == 0o644
+    assert fs.lookup("/tmp/exec_cp").mode == 0o755
 
-    fs.mkdir("/tmp/sdir", root, mode=0o700)
-    fs.create_file("/tmp/sdir/secret", root, data="s", mode=0o600)
-    fs.copy_tree("/tmp/sdir", "/tmp/sdir_cp", root, "/", "/")
-    assert fs.lookup("/tmp/sdir_cp", root, "/", "/").mode == 0o755
-    assert fs.lookup("/tmp/sdir_cp/secret", root, "/", "/").mode == 0o644
+    fs.create_file("/tmp/private", root, data="p", mode=0o600)
+    fs.copy_tree("/tmp/private", "/tmp/private_cp", root, "/", "/")
+    assert fs.lookup("/tmp/private_cp").mode == 0o600
 
-    # то же через пользовательскую команду cp
     sh = Shell(kernel, root)
     _run(sh, capsys, "cp /tmp/exec /tmp/exec_cp2")
-    assert fs.lookup("/tmp/exec_cp2", root, "/", "/").mode == 0o644
+    assert fs.lookup("/tmp/exec_cp2").mode == 0o755
+
+
+def test_cp_r_preserves_directory_and_file_modes(kernel, root, capsys):
+    # В8: cp -r сохраняет mode каталогов и файлов.
+    fs = kernel.fs
+    fs.mkdir("/tmp/sdir", root, mode=0o700)
+    fs.create_file("/tmp/sdir/secret", root, data="s", mode=0o600)
+
+    fs.copy_tree("/tmp/sdir", "/tmp/sdir_cp", root, "/", "/")
+    assert fs.lookup("/tmp/sdir_cp").mode == 0o700
+    assert fs.lookup("/tmp/sdir_cp/secret").mode == 0o600
+
+    sh = Shell(kernel, root)
+    _run(sh, capsys, "cp -r /tmp/sdir /tmp/sdir_cp2")
+    assert fs.lookup("/tmp/sdir_cp2").mode == 0o700
+    assert fs.lookup("/tmp/sdir_cp2/secret").mode == 0o600
 
 
 # ============================================================================
-# CHARACTERIZE — symlink и краевые случаи (инверсия на этапе 3b)
+# symlink и краевые случаи (этап 3b: CHARACTERIZE инвертированы)
 # ============================================================================
 
 
-def test_ls_l_explicit_symlink_follows_currently(kernel, root, capsys):
-    # CHARACTERIZE: ls -l/stat по явному symlink пути дереференсят цель вместо
-    # lstat; fixed in stage 3b (В9).
+def test_ls_l_explicit_symlink_shows_link(kernel, root, capsys):
+    # В9: явный symlink в ls -l показывается как ссылка (lstat).
     fs = kernel.fs
     fs.create_file("/tmp/t", root, data="TT", mode=0o644)
     fs.symlink("/tmp/t", "/tmp/lnk", root, "/", "/")
 
     sh = Shell(kernel, root)
     out = _run(sh, capsys, "ls -l /tmp/lnk")
-    assert "lnk" not in out
-    assert "->" not in out
+    assert "lnk -> /tmp/t" in out
+    assert out.strip().startswith("lrwxrwxrwx")
+    assert fs.read_file("/tmp/lnk", root) == "TT"
 
+
+def test_stat_explicit_symlink_shows_link(kernel, root, capsys):
+    # В9: stat показывает сам symlink, а не цель.
+    fs = kernel.fs
+    fs.create_file("/tmp/t", root, data="TT", mode=0o644)
+    fs.symlink("/tmp/t", "/tmp/lnk", root, "/", "/")
+
+    sh = Shell(kernel, root)
     out = _run(sh, capsys, "stat /tmp/lnk")
-    assert "File: /tmp/t" in out
-    assert "File: /tmp/lnk" not in out
+    assert "File: /tmp/lnk" in out
+    assert "File: /tmp/t" not in out
+    assert "Type: link" in out
+    assert "Access: (0777/lrwxrwxrwx)" in out
 
 
-def test_ls_l_dangling_symlink_errors_currently(kernel, root, capsys):
-    # CHARACTERIZE: ls -l по явному висячему symlink падает вместо показа
-    # ссылки; при этом листинг каталога показывает её корректно; fixed in
-    # stage 3b (В10a).
+def test_ls_l_dangling_symlink_shows_link(kernel, root, capsys):
+    # В9: висячий symlink отображается как ссылка, без No such file.
     fs = kernel.fs
     fs.symlink("/tmp/nope", "/tmp/dang", root, "/", "/")
 
     sh = Shell(kernel, root)
     out = _run(sh, capsys, "ls -l /tmp/dang")
-    assert "cannot access" in out
-    assert "No such file or directory" in out
+    assert "cannot access" not in out
+    assert "dang -> /tmp/nope" in out
+    assert out.strip().startswith("lrwxrwxrwx")
+
+    out = _run(sh, capsys, "stat /tmp/dang")
+    assert "File: /tmp/dang" in out
+    assert "Type: link" in out
 
     out = _run(sh, capsys, "ls -l /tmp")
-    assert "dang" in out
-    assert "-> /tmp/nope" in out
+    assert "dang -> /tmp/nope" in out
 
 
-def test_redirect_to_dangling_symlink_fails_currently(kernel, root, capsys):
-    # CHARACTERIZE: запись через висячий symlink падает с FileExists вместо
-    # создания цели; touch ведёт себя так же; fixed in stage 3b (В10b).
+def test_redirect_to_dangling_symlink_creates_target_or_clear_error(
+        kernel, root, capsys):
+    # В10: запись через висячий symlink создаёт цель, не FileExists.
     fs = kernel.fs
     fs.symlink("/tmp/nope", "/tmp/dang", root, "/", "/")
 
     sh = Shell(kernel, root)
     out = _run(sh, capsys, "echo X > /tmp/dang")
-    assert "File exists" in out
-    with pytest.raises(NoSuchFileOrDirectory):
-        fs.lookup("/tmp/nope", root, "/", "/")
+    assert "File exists" not in out
+    assert fs.read_file("/tmp/nope", root).strip() == "X"
     assert fs.lookup("/tmp/dang", "/", "/", follow=False,
                      user=root).is_link()
 
-    out = _run(sh, capsys, "touch /tmp/dang")
-    assert "File exists" in out
+
+def test_touch_dangling_symlink_creates_target_or_clear_error(
+        kernel, root, capsys):
+    # В10: touch через висячий symlink создаёт цель, не FileExists.
+    fs = kernel.fs
+    fs.symlink("/tmp/nope2", "/tmp/dang2", root, "/", "/")
+
+    sh = Shell(kernel, root)
+    out = _run(sh, capsys, "touch /tmp/dang2")
+    assert "File exists" not in out
+    assert fs.lookup("/tmp/nope2", root).is_file()
+    assert fs.lookup("/tmp/dang2", "/", "/", follow=False,
+                     user=root).is_link()
 
 
-def test_chmod_invalid_numeric_internal_error_currently(kernel, root, capsys):
-    # CHARACTERIZE: числовой chmod с невалидной восьмеричной строкой роняет
-    # ValueError наружу как internal error; fixed in stage 3b (В11).
+def test_chmod_invalid_numeric_returns_user_error(kernel, root, capsys):
+    # В11: невалидная восьмеричная запись — InvalidArgument, не internal error.
     fs = kernel.fs
     fs.create_file("/tmp/f", root, data="x", mode=0o644)
 
     sh = Shell(kernel, root)
     out = _run(sh, capsys, "chmod 999 /tmp/f")
-    assert "internal error" in out
-    assert "invalid literal for int() with base 8: '999'" in out
+    assert "invalid mode '999'" in out
+    assert "internal error" not in out
+    assert "invalid literal for int()" not in out
+    assert fs.lookup("/tmp/f").mode == 0o644
+
+    out = _run(sh, capsys, "chmod 77777 /tmp/f")
+    assert "invalid mode '77777'" in out
+    assert fs.lookup("/tmp/f").mode == 0o644
+
+    _run(sh, capsys, "chmod 600 /tmp/f")
+    assert fs.lookup("/tmp/f").mode == 0o600
 
 
-def test_tilde_user_wrong_path_currently(kernel, root, user, capsys):
-    # CHARACTERIZE: ~user нормализуется как home + "user"; fixed in stage 3b
-    # (В12).
+def test_tilde_user_rejected(kernel, root, user, capsys):
+    # В12: ~user не поддерживается и отклоняется явно.
     fs = kernel.fs
-    assert fs.normalize("~bob", "/", user.home) == "/home/userbob"
+    assert fs.normalize("~", "/", user.home) == user.home
+    assert fs.normalize("~/sub", "/", user.home) == user.home + "/sub"
+
+    with pytest.raises(InvalidArgument,
+                       match="unsupported home user expansion: ~bob"):
+        fs.normalize("~bob", "/", user.home)
 
     sh = Shell(kernel, user)
     out = _run(sh, capsys, "cd ~bob")
-    assert "/home/userbob" in out
+    assert "unsupported home user expansion" in out
+    assert "/home/userbob" not in out
 
 
-def test_trailing_slash_file_accepted_currently(kernel, root, capsys):
-    # CHARACTERIZE: завершающий слэш на обычном файле принимается (normalize
-    # убирает пустые компоненты); fixed in stage 3b (В13).
+def test_trailing_slash_on_file_returns_not_a_directory(kernel, root, capsys):
+    # В13: завершающий слэш требует, чтобы конечный узел был каталогом.
     fs = kernel.fs
     fs.create_file("/tmp/f", root, data="payload", mode=0o644)
 
     sh = Shell(kernel, root)
     out = _run(sh, capsys, "cat /tmp/f/")
-    assert "payload" in out
+    assert "Not a directory" in out
+    assert "payload" not in out
 
     out = _run(sh, capsys, "stat /tmp/f/")
-    assert "/tmp/f" in out
+    assert "Not a directory" in out
 
-    _run(sh, capsys, "rm /tmp/f/")
-    with pytest.raises(NoSuchFileOrDirectory):
-        fs.lookup("/tmp/f", root, "/", "/")
+    out = _run(sh, capsys, "rm /tmp/f/")
+    assert "Not a directory" in out
+    assert fs.lookup("/tmp/f", root).is_file()
+
+    out = _run(sh, capsys, "cd /tmp/f/")
+    assert "Not a directory" in out
 
 
-def test_glob_returns_absolute_paths_currently(kernel, root, user, capsys):
-    # CHARACTERIZE: glob возвращает абсолютные пути и `*/` матчит файлы;
-    # fixed in stage 3b (В14).
+def test_glob_absolute_output_remains_documented_limit(kernel, root, user,
+                                                       capsys):
+    # DOCUMENTED LIMIT / FEATURE GAP (В14): glob возвращает абсолютные пути и
+    # `*/` матчит файлы; фикс требует shell.py или смены API glob.
     fs = kernel.fs
     fs.mkdir("/tmp/g", root, mode=0o755)
     fs.create_file("/tmp/g/a", root, data="1", mode=0o644)

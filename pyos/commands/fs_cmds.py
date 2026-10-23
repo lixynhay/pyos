@@ -46,7 +46,9 @@ def cmd_ls(ctx, args, stdin):
     multi = len(paths) > 1
     for idx, path in enumerate(paths):
         try:
-            node = ctx.fs.lookup(path, ctx.cwd, ctx.home, user=ctx.user)
+            # ls -l показывает сам symlink (lstat), не разыменовывая его
+            node = ctx.fs.lookup(path, ctx.cwd, ctx.home,
+                                 follow=not long_fmt, user=ctx.user)
         except PyOSError as exc:
             out_lines.append(f"ls: cannot access '{path}': {exc.message}")
             continue
@@ -152,10 +154,7 @@ def cmd_touch(ctx, args, stdin):
     if not paths:
         raise InvalidArgument("touch: missing file operand")
     for path in paths:
-        try:
-            ctx.fs.touch(path, ctx.user, ctx.cwd, ctx.home)
-        except NoSuchFileOrDirectory:
-            ctx.fs.create_file(path, ctx.user, ctx.cwd, ctx.home)
+        ctx.fs.touch(path, ctx.user, ctx.cwd, ctx.home)
     return None
 
 
@@ -235,7 +234,8 @@ def cmd_cp(ctx, args, stdin):
 
     data = ctx.fs.read_file(src, ctx.user, ctx.cwd, ctx.home)
     try:
-        ctx.fs.write_file(dst, data, ctx.user, ctx.cwd, ctx.home)
+        ctx.fs.write_file(dst, data, ctx.user, ctx.cwd, ctx.home,
+                          mode=snode.mode)
     except IsADirectory:
         raise InvalidArgument(f"cp: '{dst}' is a directory")
     return None
@@ -282,7 +282,12 @@ def cmd_chmod(ctx, args, stdin):
     spec, paths = args[0], args[1:]
     for path in paths:
         if spec.isdigit():
-            new_mode = int(spec, 8) & 0o7777
+            try:
+                new_mode = int(spec, 8)
+            except ValueError:
+                raise InvalidArgument(f"chmod: invalid mode '{spec}'")
+            if not 0 <= new_mode <= 0o7777:
+                raise InvalidArgument(f"chmod: invalid mode '{spec}'")
         else:
             node = ctx.fs.lookup(path, ctx.cwd, ctx.home, user=ctx.user)
             import re
@@ -343,7 +348,8 @@ def cmd_stat(ctx, args, stdin):
         raise InvalidArgument("stat: missing operand")
     lines = []
     for path in paths:
-        node = ctx.fs.lookup(path, ctx.cwd, ctx.home, user=ctx.user)
+        node = ctx.fs.lookup(path, ctx.cwd, ctx.home, follow=False,
+                             user=ctx.user)
         owner = ctx.users.get_by_uid(node.uid)
         lines.append(f"  File: {ctx.fs.path_of(node)}")
         lines.append(f"  Size: {getattr(node, 'size', 0)}")

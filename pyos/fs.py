@@ -322,8 +322,9 @@ class FileSystem:
         if path == "~" or path.startswith("~/"):
             path = home + path[1:]
         elif path.startswith("~"):
-            # ~user — не поддерживаем точно, считаем домашним текущего
-            path = home + path[1:]
+            # ~user требует users.py; на этом этапе не поддерживаем
+            raise InvalidArgument(
+                f"unsupported home user expansion: {path.split('/')[0]}")
 
         if not path.startswith("/"):
             base = cwd if cwd.endswith("/") else cwd + "/"
@@ -355,6 +356,8 @@ class FileSystem:
         return self._walk(path, cwd, home, follow, 0, user)
 
     def _walk(self, path, cwd, home, follow, depth, user=None) -> Node:
+        raw = "" if path is None else str(path)
+        trailing_slash = raw.endswith("/") and raw != "/"
         norm = self.normalize(path, cwd, home)
         if norm == "/":
             return self.root
@@ -374,6 +377,9 @@ class FileSystem:
             node = child
         if follow:
             node = self._deref(node, depth, user)
+        # завершающий слэш требует, чтобы конечный узел был каталогом
+        if trailing_slash and not node.is_dir():
+            raise NotADirectory(norm)
         return node
 
     def _deref(self, node: Node, depth: int, user=None) -> Node:
@@ -444,8 +450,28 @@ class FileSystem:
         node.atime = time.time()
         return node.data
 
+    def _creation_target(self, path, cwd, home, user) -> str:
+        """Путь создания при записи: висячий symlink ведёт к своей цели.
+
+        Как POSIX open(O_CREAT): если последний компонент — symlink, создаётся
+        его цель (включая цепочку ссылок), а не новый файл поверх ссылки.
+        """
+        cur = self.normalize(path, cwd, home)
+        for _ in range(MAX_SYMLINK_DEPTH + 1):
+            try:
+                node = self._walk(cur, "/", "/", False, 0, user)
+            except NoSuchFileOrDirectory:
+                return cur
+            if not node.is_link():
+                return cur
+            target = node.target
+            if not target.startswith("/"):
+                target = self.path_of(node.parent).rstrip("/") + "/" + target
+            cur = self.normalize(target, "/", "/")
+        raise InvalidArgument("too many levels of symbolic links")
+
     def write_file(self, path, data, user=None, cwd="/", home="/",
-                   append=False, create=True) -> Node:
+                   append=False, create=True, mode=None) -> Node:
         try:
             node = self._walk(path, cwd, home, True, 0, user)
         except NoSuchFileOrDirectory:
@@ -462,11 +488,17 @@ class FileSystem:
             return node
         if not create:
             raise NoSuchFileOrDirectory(path)
-        return self.create_file(path, user, cwd, home, data=data)
+        target = self._creation_target(path, cwd, home, user)
+        extra = {} if mode is None else {"mode": mode}
+        return self.create_file(target, user, cwd, home, data=data, **extra)
 
     def touch(self, path, user=None, cwd="/", home="/") -> Node:
         """Обновляет mtime узла; чужой файл требует root, владельца или W."""
-        node = self._walk(path, cwd, home, True, 0, user)
+        try:
+            node = self._walk(path, cwd, home, True, 0, user)
+        except NoSuchFileOrDirectory:
+            target = self._creation_target(path, cwd, home, user)
+            return self.create_file(target, user, cwd, home)
         if user is not None and not getattr(user, "is_root", False):
             if node.uid != user.uid and not self.has_perm(node, user, W_BIT):
                 raise PermissionDenied(path)
@@ -564,6 +596,8 @@ class FileSystem:
         node = parent.children.get(name)
         if node is None:
             raise NoSuchFileOrDirectory(norm)
+        if str(path).endswith("/") and not node.is_dir():
+            raise NotADirectory(norm)
         self._require_parent(parent, user, W_BIT | X_BIT, norm)
         if node.is_dir():
             if not recursive:
@@ -733,7 +767,7 @@ class FileSystem:
         dnorm = self.normalize(dst, cwd, home)
         if snode.is_file():
             data = self.read_file(src, user, cwd, home)
-            self.write_file(dnorm, data, user, cwd, home)
+            self.write_file(dnorm, data, user, cwd, home, mode=snode.mode)
             return self._walk(dnorm, "/", "/", True, 0, user)
         if not snode.is_dir():
             raise InvalidArgument(f"{src}: unsupported file type")
@@ -748,7 +782,8 @@ class FileSystem:
         try:
             dnode = self._walk(dnorm, "/", "/", True, 0, user)
         except NoSuchFileOrDirectory:
-            dnode = self.mkdir(dnorm, user, "/", "/", parents=True)
+            dnode = self.mkdir(dnorm, user, "/", "/", parents=True,
+                               mode=snode.mode)
         if not dnode.is_dir():
             raise NotADirectory(dnorm)
         for child in snode.children.values():
@@ -757,7 +792,8 @@ class FileSystem:
                 self.copy_tree(self.path_of(child), target, user)
             elif child.is_file():
                 data = self.read_file(self.path_of(child), user, "/", "/")
-                self.write_file(target, data, user, "/", "/")
+                self.write_file(target, data, user, "/", "/",
+                                mode=child.mode)
             else:  # символическая ссылка
                 self.symlink(child.target, target, user, "/", "/")
         return dnode
