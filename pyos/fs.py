@@ -37,6 +37,21 @@ S_IFLNK = 0o120000
 MAX_SYMLINK_DEPTH = 40
 
 
+def _to_bytes(data) -> bytes:
+    """Нормализует содержимое файла к bytes.
+
+    ``str`` кодируется строго в UTF-8, ``bytes`` сохраняются как есть.
+    """
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, bytearray):
+        return bytes(data)
+    if isinstance(data, str):
+        return data.encode("utf-8")
+    raise InvalidArgument(
+        f"file data must be str or bytes, got {type(data).__name__}")
+
+
 # ---------------------------------------------------------------------------
 # Узлы файловой системы
 # ---------------------------------------------------------------------------
@@ -105,14 +120,22 @@ class FileLink:
     остальные.
     """
 
-    __slots__ = ("data", "nlink", "uid", "gid", "mode")
+    __slots__ = ("_data", "nlink", "uid", "gid", "mode")
 
-    def __init__(self, data="", uid=0, gid=0, mode=0o644):
+    def __init__(self, data=b"", uid=0, gid=0, mode=0o644):
         self.data = data
         self.nlink = 1
         self.uid = uid
         self.gid = gid
         self.mode = mode & 0o7777
+
+    @property
+    def data(self) -> bytes:
+        return self._data
+
+    @data.setter
+    def data(self, value):
+        self._data = _to_bytes(value)
 
 
 class File(Node):
@@ -154,11 +177,11 @@ class File(Node):
         return True
 
     @property
-    def data(self) -> str:
+    def data(self) -> bytes:
         return self._link.data
 
     @data.setter
-    def data(self, value: str):
+    def data(self, value):
         self._link.data = value
 
     @property
@@ -171,7 +194,7 @@ class File(Node):
 
     @property
     def size(self) -> int:
-        return len(self.data.encode("utf-8"))
+        return len(self.data)
 
 
 class VirtualFile(File):
@@ -188,15 +211,15 @@ class VirtualFile(File):
         self._write_sink = write_sink
 
     @property
-    def data(self) -> str:
+    def data(self) -> bytes:
         if self._read_provider is not None:
-            return self._read_provider()
+            return _to_bytes(self._read_provider())
         return self._link.data
 
     @data.setter
-    def data(self, value: str):
+    def data(self, value):
         if self._write_sink is not None:
-            self._write_sink(value)
+            self._write_sink(_to_bytes(value))
 
     @property
     def size(self) -> int:
@@ -443,6 +466,13 @@ class FileSystem:
         return sorted(node.children.values(), key=lambda n: n.name)
 
     def read_file(self, path, user=None, cwd="/", home="/") -> str:
+        data = self.read_bytes(path, user, cwd, home)
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise InvalidArgument(f"{path}: not valid UTF-8 text")
+
+    def read_bytes(self, path, user=None, cwd="/", home="/") -> bytes:
         node = self._walk(path, cwd, home, True, 0, user)
         if node.is_dir():
             raise IsADirectory(path)
@@ -472,6 +502,7 @@ class FileSystem:
 
     def write_file(self, path, data, user=None, cwd="/", home="/",
                    append=False, create=True, mode=None) -> Node:
+        data = _to_bytes(data)
         try:
             node = self._walk(path, cwd, home, True, 0, user)
         except NoSuchFileOrDirectory:
@@ -766,7 +797,7 @@ class FileSystem:
         snode = self._walk(src, cwd, home, True, 0, user)
         dnorm = self.normalize(dst, cwd, home)
         if snode.is_file():
-            data = self.read_file(src, user, cwd, home)
+            data = self.read_bytes(src, user, cwd, home)
             self.write_file(dnorm, data, user, cwd, home, mode=snode.mode)
             return self._walk(dnorm, "/", "/", True, 0, user)
         if not snode.is_dir():
@@ -791,7 +822,7 @@ class FileSystem:
             if child.is_dir():
                 self.copy_tree(self.path_of(child), target, user)
             elif child.is_file():
-                data = self.read_file(self.path_of(child), user, "/", "/")
+                data = self.read_bytes(self.path_of(child), user, "/", "/")
                 self.write_file(target, data, user, "/", "/",
                                 mode=child.mode)
             else:  # символическая ссылка

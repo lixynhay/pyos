@@ -126,7 +126,7 @@ def test_makepkg_builds_package(kernel, root):
         "/var/cache/packages/hello-1.0.0/pkg/usr/share/hello.txt", root, "/", "/"
     )
     assert node.is_file()
-    assert node.data.strip() == "Hello World"
+    assert node.data.strip() == b"Hello World"
 
 
 def test_makepkg_without_pkgbuild(kernel, root):

@@ -112,7 +112,7 @@ def test_touch_creates_file(kernel, root, capsys):
     Shell(kernel, root).handle_line("touch /tmp/newfile.txt")
     node = kernel.fs.lookup("/tmp/newfile.txt", root)
     assert node.is_file()
-    assert node.data == ""
+    assert node.data == b""
 
 
 def test_touch_existing(kernel, root):
@@ -120,7 +120,7 @@ def test_touch_existing(kernel, root):
     fs.create_file("/tmp/existing.txt", root, data="content")
     Shell(kernel, root).handle_line("touch /tmp/existing.txt")
     node = kernel.fs.lookup("/tmp/existing.txt", root)
-    assert node.data == "content"  # content preserved, mtime updated
+    assert node.data == b"content"  # content preserved, mtime updated
 
 
 def test_touch_multiple(kernel, root):

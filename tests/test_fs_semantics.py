@@ -207,7 +207,7 @@ def test_cp_r_rejects_copy_into_self(kernel, root):
             fs.copy_tree("/tmp/self", "/tmp/self/sub", root, "/", "/")
     finally:
         sys.setrecursionlimit(old_limit)
-    assert fs.lookup("/tmp/self/a", root, "/", "/").data == "a"
+    assert fs.lookup("/tmp/self/a", root, "/", "/").data == b"a"
 
 
 def test_cp_r_rejects_overlapping_recursive_copy(kernel, root, capsys):
@@ -239,7 +239,7 @@ def test_mv_dir_over_file_returns_not_a_directory(kernel, root, capsys):
     assert "Not a directory" in out
     node = fs.lookup("/tmp/dstfile", root, "/", "/")
     assert node.is_file()
-    assert node.data == "keep"
+    assert node.data == b"keep"
     assert fs.lookup("/tmp/srcdir", root, "/", "/").is_dir()
 
 
@@ -628,15 +628,15 @@ def test_save_load_times_lost_currently(kernel, root):
         os.unlink(tmpname)
 
 
-def test_fs_text_only_currently(kernel, root):
-    # DOCUMENTED LIMIT: ФС текстовая (binary-safe — ось расширения, не баг).
-    # Фиксируем только то, что data хранится как str, а size считается по
-    # UTF-8; потерю бинарных данных НЕ ассертим.
+def test_fs_stores_file_data_as_bytes(kernel, root):
+    # BS-2: каноническое хранение — bytes; текст является UTF-8
+    # представлением этих bytes, size всегда в байтах.
     fs = kernel.fs
     payload = "h\u00e9llo"
     fs.create_file("/tmp/txt", root, "/", "/", data=payload, mode=0o644)
     node = fs.lookup("/tmp/txt", root, "/", "/")
-    assert isinstance(node.data, str)
+    assert isinstance(node.data, bytes)
+    assert node.data == payload.encode("utf-8")
     assert node.size == len(payload.encode("utf-8"))
 
 

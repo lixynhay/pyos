@@ -429,11 +429,13 @@ class Shell:
         return self.kernel.fs.read_file(target, user, self.cwd, self.user.home)
 
     def _write_redirect(self, target, data, append, user):
-        # Проверка ulimit -f (максимальный размер файла)
+        # Проверка ulimit -f (максимальный размер файла) — всегда в байтах
+        size = len(data) if isinstance(data, bytes) else len(
+            data.encode("utf-8"))
         limit = self.ulimit.get("file_size", -1)
-        if limit >= 0 and len(data.encode("utf-8")) > limit:
+        if limit >= 0 and size > limit:
             raise PyOSError(
-                f"File size exceeds ulimit ({len(data)} > {limit} bytes)")
+                f"File size exceeds ulimit ({size} > {limit} bytes)")
         self.kernel.fs.write_file(target, data, user, self.cwd, self.user.home,
                                   append=append)
 

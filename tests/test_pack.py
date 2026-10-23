@@ -96,7 +96,7 @@ def test_pack_rejects_symlink(kernel, root):
 
 def test_pack_rejects_non_utf8_content(kernel, root):
     ctx = _ctx(kernel, root)
-    _write(kernel, root, "/tmp/bad-root/bad.txt", "\udcff")
+    _write(kernel, root, "/tmp/bad-root/bad.txt", b"\xff")
 
     with pytest.raises(InvalidArgument, match="utf-8"):
         _pack(ctx, "/tmp/bad-root", "/tmp/bad.pkg.json")
@@ -179,7 +179,7 @@ def test_pack_then_install_roundtrip(kernel, root, user):
     for source, (mode, content, uid, gid) in files.items():
         target = source[len("/tmp/round-root"):]
         node = kernel.fs.lookup(target, root, "/", "/")
-        assert node.data == content
+        assert node.data == content.encode("utf-8")
         assert node.mode == mode
         assert node.uid == uid
         assert node.gid == gid

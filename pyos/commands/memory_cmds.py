@@ -5,6 +5,7 @@ load — загружает состояние из JSON-файла.
 ulimit — управляет ограничениями ресурсов (ulimit -f).
 """
 
+import base64
 import json
 import os
 
@@ -36,7 +37,12 @@ def _serialize_node(path, node):
         "mode": node.mode,
     }
     if node.is_file():
-        entry["data"] = node.data
+        data = node.data
+        try:
+            entry["data"] = data.decode("utf-8")
+        except UnicodeDecodeError:
+            entry["encoding"] = "base64"
+            entry["data"] = base64.b64encode(data).decode("ascii")
     elif node.is_link():
         entry["target"] = node.target
     return entry
@@ -101,7 +107,7 @@ def cmd_save(ctx, args, stdin):
 
     filename = args[0]
     state = {
-        "version": 2,
+        "version": 3,
         "hostname": ctx.kernel.hostname,
         "users": _serialize_users(ctx.users),
         "filesystem": _walk_and_serialize(ctx.fs),
@@ -215,6 +221,25 @@ def _restore_fs(fs, entries):
 
             elif node_type == "file":
                 data = entry.get("data", "")
+                encoding = entry.get("encoding", "utf-8")
+                if encoding in ("utf-8", "utf8", None):
+                    if not isinstance(data, str):
+                        raise InvalidArgument(
+                            f"load: text data must be a string for '{path}'")
+                    raw = data.encode("utf-8")
+                elif encoding == "base64":
+                    if not isinstance(data, str):
+                        raise InvalidArgument(
+                            f"load: base64 data must be a string for '{path}'")
+                    try:
+                        raw = base64.b64decode(data, validate=True)
+                    except ValueError:
+                        raise InvalidArgument(
+                            f"load: invalid base64 data for '{path}'")
+                else:
+                    raise InvalidArgument(
+                        f"load: unsupported file encoding {encoding!r} "
+                        f"for '{path}'")
                 # Создаём родительские каталоги если нужно
                 parent = "/".join(path.rstrip("/").split("/")[:-1])
                 if parent:
@@ -222,7 +247,7 @@ def _restore_fs(fs, entries):
                         fs.lookup(parent, None, "/", "/")
                     except NoSuchFileOrDirectory:
                         fs.mkdir(parent, None, "/", "/", parents=True)
-                fs.write_file(path, data, None, "/", "/", create=True)
+                fs.write_file(path, raw, None, "/", "/", create=True)
                 node = fs.lookup(path, None, "/", "/")
                 node.uid = uid
                 node.gid = gid
@@ -279,7 +304,7 @@ def cmd_load(ctx, args, stdin):
         raise PyOSError(f"load: cannot read '{filename}': {exc}")
 
     version = state.get("version", 1)
-    if version not in (1, 2):
+    if version not in (1, 2, 3):
         raise InvalidArgument(f"load: unsupported snapshot version {version}")
 
     # Восстанавливаем hostname
