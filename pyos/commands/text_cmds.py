@@ -4,16 +4,56 @@ from ..errors import InvalidArgument, PyOSError
 from .registry import register
 
 
-def _read_input(ctx, paths, stdin):
-    """Возвращает текст: из файлов или из stdin, если файлов нет."""
+def _stdin_text(command, stdin):
+    """Возвращает stdin как текст; binary stdin даёт понятную ошибку."""
+    if stdin is None:
+        return ""
+    if isinstance(stdin, bytes):
+        try:
+            return stdin.decode("utf-8")
+        except UnicodeDecodeError:
+            raise InvalidArgument(
+                f"{command}: not valid UTF-8 text: <stdin>")
+    return stdin
+
+
+def _decode_text(command, label, raw):
+    """Декодирует bytes в текст или сообщает, что файл binary."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise InvalidArgument(f"{command}: not valid UTF-8 text: {label}")
+
+
+def _read_raw_input(ctx, paths, stdin, command):
+    """Возвращает bytes: из файлов или из stdin, если файлов нет."""
     if not paths or paths == ["-"]:
-        return stdin
+        text = _stdin_text(command, stdin)
+        return text.encode("utf-8")
     chunks = []
     for p in paths:
         if p == "-":
-            chunks.append(stdin)
+            chunks.append(_stdin_text(command, stdin).encode("utf-8"))
         else:
-            chunks.append(ctx.fs.read_file(p, ctx.user, ctx.cwd, ctx.home))
+            chunks.append(ctx.fs.read_bytes(p, ctx.user, ctx.cwd, ctx.home))
+    return b"".join(chunks)
+
+
+def _read_input(ctx, paths, stdin, command):
+    """Возвращает текст: из файлов или из stdin, если файлов нет.
+
+    Binary-файлы не декодируются частично: команда получает явную ошибку
+    ``<command>: not valid UTF-8 text: <path>``.
+    """
+    if not paths or paths == ["-"]:
+        return _stdin_text(command, stdin)
+    chunks = []
+    for p in paths:
+        if p == "-":
+            chunks.append(_stdin_text(command, stdin))
+        else:
+            raw = ctx.fs.read_bytes(p, ctx.user, ctx.cwd, ctx.home)
+            chunks.append(_decode_text(command, p, raw))
     return "".join(chunks)
 
 
@@ -22,7 +62,7 @@ def _split_opts(args):
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("-n", "-c") and i + 1 < len(args):
+        if a == "-n" and i + 1 < len(args):
             opts.append(a)
             opts.append(args[i + 1])
             i += 2
@@ -46,6 +86,29 @@ def cmd_echo(ctx, args, stdin):
     return text + ("\n" if newline else "")
 
 
+def _grep_text(rx, text, invert, numbered, first_line):
+    """Возвращает (строки вывода, было ли совпадение)."""
+    out = []
+    matched = False
+    for i, line in enumerate(text.splitlines(), first_line):
+        hit = bool(rx.search(line))
+        if hit != invert:
+            matched = True
+            prefix = f"{i}:" if numbered else ""
+            out.append(prefix + line)
+    return out, matched
+
+
+def _grep_binary_match(raw, pattern, flags, invert):
+    """Проверяет совпадение в binary-файле по точным bytes."""
+    import re
+    try:
+        hit = re.search(pattern.encode("utf-8"), raw, flags) is not None
+    except (re.error, UnicodeEncodeError):
+        return False
+    return hit != invert
+
+
 @register("grep", usage="grep [-i] [-v] [-n] pattern [file ...]",
           summary="Поиск строк по шаблону", category="text")
 def cmd_grep(ctx, args, stdin):
@@ -57,7 +120,6 @@ def cmd_grep(ctx, args, stdin):
         raise InvalidArgument("grep: missing pattern")
     pattern = pos[0]
     files = pos[1:]
-    text = _read_input(ctx, files, stdin)
 
     import re
     flags = re.IGNORECASE if icase else 0
@@ -66,16 +128,47 @@ def cmd_grep(ctx, args, stdin):
     except re.error as exc:
         raise InvalidArgument(f"grep: invalid pattern: {exc}")
 
+    if not files or files == ["-"]:
+        text = _stdin_text("grep", stdin)
+        out, matched = _grep_text(rx, text, invert, numbered, 1)
+        return ("\n".join(out), 0 if matched else 1)
+
+    raws = []
+    for path in files:
+        if path == "-":
+            raws.append((path, _stdin_text("grep", stdin).encode("utf-8")))
+        else:
+            raws.append(
+                (path, ctx.fs.read_bytes(path, ctx.user, ctx.cwd, ctx.home)))
+
+    texts = []
+    has_binary = False
+    for path, raw in raws:
+        try:
+            texts.append(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            texts.append(None)
+            has_binary = True
+
+    if not has_binary:
+        out, matched = _grep_text(
+            rx, "".join(texts), invert, numbered, 1)
+        return ("\n".join(out), 0 if matched else 1)
+
     out = []
     matched = False
-    for i, line in enumerate(text.splitlines(), 1):
-        hit = bool(rx.search(line))
-        if hit != invert:
-            matched = True
-            prefix = f"{i}:" if numbered else ""
-            out.append(prefix + line)
-    code = 0 if matched else 1
-    return ("\n".join(out), code)
+    line_no = 1
+    for (path, raw), text in zip(raws, texts):
+        if text is None:
+            if _grep_binary_match(raw, pattern, flags, invert):
+                matched = True
+                out.append(f"Binary file {path} matches")
+            continue
+        lines, hit = _grep_text(rx, text, invert, numbered, line_no)
+        out.extend(lines)
+        matched = matched or hit
+        line_no += len(text.splitlines())
+    return ("\n".join(out), 0 if matched else 1)
 
 
 @register("wc", usage="wc [-l] [-w] [-c] [file ...]",
@@ -87,7 +180,10 @@ def cmd_wc(ctx, args, stdin):
     do_c = any("c" in o for o in opts if o.startswith("-"))
     if not (do_l or do_w or do_c):
         do_l = do_w = do_c = True
-    text = _read_input(ctx, pos, stdin)
+    if do_c and not do_l and not do_w:
+        # -c не требует декодирования: считаем точные bytes.
+        return str(len(_read_raw_input(ctx, pos, stdin, "wc")))
+    text = _read_input(ctx, pos, stdin, "wc")
     counts = {
         "l": len(text.splitlines()),
         "w": len(text.split()),
@@ -110,7 +206,7 @@ def cmd_head(ctx, args, stdin):
     for o in opts:
         if o.startswith("-") and o[1:].isdigit():
             n = int(o[1:])
-    text = _read_input(ctx, pos, stdin)
+    text = _read_input(ctx, pos, stdin, "head")
     return "\n".join(text.splitlines()[:n])
 
 
@@ -127,7 +223,7 @@ def cmd_tail(ctx, args, stdin):
     for o in opts:
         if o.startswith("-") and o[1:].isdigit():
             n = int(o[1:])
-    text = _read_input(ctx, pos, stdin)
+    text = _read_input(ctx, pos, stdin, "tail")
     return "\n".join(text.splitlines()[-n:])
 
 
@@ -137,7 +233,7 @@ def cmd_sort(ctx, args, stdin):
     opts, pos = _split_opts(args)
     reverse = any("r" in o for o in opts if o.startswith("-"))
     unique = any("u" in o for o in opts if o.startswith("-"))
-    text = _read_input(ctx, pos, stdin)
+    text = _read_input(ctx, pos, stdin, "sort")
     lines = text.splitlines()
     lines.sort(reverse=reverse)
     if unique:
@@ -153,7 +249,7 @@ def cmd_sort(ctx, args, stdin):
           category="text")
 def cmd_uniq(ctx, args, stdin):
     opts, pos = _split_opts(args)
-    text = _read_input(ctx, pos, stdin)
+    text = _read_input(ctx, pos, stdin, "uniq")
     out = []
     for line in text.splitlines():
         if not out or out[-1] != line:
@@ -165,7 +261,7 @@ def cmd_uniq(ctx, args, stdin):
           category="text")
 def cmd_rev(ctx, args, stdin):
     opts, pos = _split_opts(args)
-    text = _read_input(ctx, pos, stdin)
+    text = _read_input(ctx, pos, stdin, "rev")
     return "\n".join(line[::-1] for line in text.splitlines())
 
 
@@ -215,7 +311,7 @@ def cmd_tr(ctx, args, stdin):
     elif len(set2) > len(set1):
         set2 = set2[:len(set1)]
     table = str.maketrans(set1, set2)
-    return stdin.translate(table)
+    return _stdin_text("tr", stdin).translate(table)
 
 
 @register("cut", usage="cut -d DELIM -f N [file ...]",
@@ -245,7 +341,7 @@ def cmd_cut(ctx, args, stdin):
     if field is None:
         raise InvalidArgument("cut: you must specify a field list")
     indices = [int(x) - 1 for x in field.split(",") if x.strip().isdigit()]
-    text = _read_input(ctx, pos, stdin)
+    text = _read_input(ctx, pos, stdin, "cut")
     out = []
     for line in text.splitlines():
         parts = line.split(delim)

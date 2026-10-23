@@ -139,8 +139,12 @@ def cmd_cat(ctx, args, stdin):
         if path == "-":
             parts.append(stdin)
             continue
-        data = ctx.fs.read_file(path, ctx.user, ctx.cwd, ctx.home)
-        parts.append(data)
+        raw = ctx.fs.read_bytes(path, ctx.user, ctx.cwd, ctx.home)
+        try:
+            parts.append(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            raise InvalidArgument(
+                f"cat: binary file: {path} (not valid UTF-8)")
     text = "".join(parts)
     if text and not text.endswith("\n"):
         text += "\n"
