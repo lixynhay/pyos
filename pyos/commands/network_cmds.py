@@ -76,6 +76,15 @@ class HttpText(str):
         return obj
 
 
+def _http_get_bytes(url, *, follow_redirects=False, timeout=REQUEST_TIMEOUT):
+    """Выполняет HTTP GET и возвращает ``(status, headers, body_bytes)``.
+
+    Нижний слой общий с :func:`_http_get_text`; тело не декодируется.
+    """
+    return _do_request(
+        url, follow_redirects=follow_redirects, timeout=timeout)
+
+
 def _http_get_text(url, *, follow_redirects=False, timeout=REQUEST_TIMEOUT,
                    raise_for_status=False):
     """Выполняет HTTP GET и возвращает тело как текст.
@@ -83,7 +92,7 @@ def _http_get_text(url, *, follow_redirects=False, timeout=REQUEST_TIMEOUT,
     Кодировка определяется так же, как в curl/wget. ``raise_for_status``
     включает ошибку для не-2xx ответов (используется пакетным менеджером).
     """
-    status, headers, body = _do_request(
+    status, headers, body = _http_get_bytes(
         url, follow_redirects=follow_redirects, timeout=timeout)
 
     if raise_for_status and not 200 <= status < 300:
@@ -108,6 +117,30 @@ def _filename_from_url(url: str) -> str:
     if path and "/" in path:
         return path.rsplit("/", 1)[-1]
     return "index.html"
+
+
+def _format_headers(status, headers) -> str:
+    """Формирует verbose-блок заголовков для ``curl -v``."""
+    lines = [f"HTTP/1.1 {status}"]
+    for key in headers:
+        lines.append(f"{key}: {headers[key]}")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _stdout_body(body, headers, command, flag) -> str:
+    """Текст для stdout; binary в терминал не выводится.
+
+    Явная политика MVP: raw bytes не пишутся в ``sys.stdout``. Если тело
+    не является валидным UTF-8, команда возвращает ошибку с подсказкой
+    сохранить ответ в файл.
+    """
+    try:
+        body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise PyOSError(
+            f"{command}: binary output suppressed; use {flag} FILE")
+    return _decode_body(body, headers)
 
 
 # -- curl ------------------------------------------------------------------
@@ -154,24 +187,12 @@ def cmd_curl(ctx, args, stdin):
     if url is None:
         raise InvalidArgument("curl: missing URL")
 
-    # Обработка тела как текста (helper общий с pkg repo update)
-    body_text = _http_get_text(
+    status, headers, body = _http_get_bytes(
         url, follow_redirects=follow, timeout=REQUEST_TIMEOUT)
-    status = body_text.status
-    headers = body_text.headers
-
-    if verbose:
-        proto = "HTTP/1.1"
-        lines = [f"{proto} {status}"]
-        for key in headers:
-            lines.append(f"{key}: {headers[key]}")
-        lines.append("")
-        output = "\n".join(lines) + "\n" + body_text
-    else:
-        output = body_text
+    header_block = _format_headers(status, headers) if verbose else ""
 
     if output_file:
-        # Сохраняем в файл в виртуальной ФС
+        # Сохраняем точные bytes в виртуальную ФС
         path = output_file
         if not path.startswith("/"):
             path = ctx.cwd.rstrip("/") + "/" + path
@@ -179,12 +200,14 @@ def cmd_curl(ctx, args, stdin):
         parent = "/".join(path.rstrip("/").split("/")[:-1])
         if parent:
             _ensure_dir_simple(ctx.fs, parent, ctx.user)
-        ctx.fs.write_file(path, body_text, ctx.user, ctx.cwd, ctx.home,
+        ctx.fs.write_file(path, body, ctx.user, ctx.cwd, ctx.home,
                           create=True)
-        sz = _format_size(body_text.raw_size)
-        return f"curl: saved to '{output_file}' ({sz})"
+        message = (f"curl: saved to '{output_file}' "
+                   f"({_format_size(len(body))})")
+        # -v: заголовки видны в stdout, но в файл попадает только тело
+        return header_block + message
 
-    return output
+    return header_block + _stdout_body(body, headers, "curl", "-o")
 
 
 # -- wget ------------------------------------------------------------------
@@ -227,7 +250,7 @@ def cmd_wget(ctx, args, stdin):
     if url is None:
         raise InvalidArgument("wget: missing URL")
 
-    body_text = _http_get_text(
+    _, _, body = _http_get_bytes(
         url, follow_redirects=True, timeout=REQUEST_TIMEOUT)
 
     # Определяем имя файла
@@ -243,10 +266,11 @@ def cmd_wget(ctx, args, stdin):
     if parent:
         _ensure_dir_simple(ctx.fs, parent, ctx.user)
 
-    ctx.fs.write_file(path, body_text, ctx.user, ctx.cwd, ctx.home,
+    # Сохраняем точные bytes: декодирование не применяется.
+    ctx.fs.write_file(path, body, ctx.user, ctx.cwd, ctx.home,
                       create=True)
 
-    sz = _format_size(body_text.raw_size)
+    sz = _format_size(len(body))
     if quiet:
         return None
     return f"wget: saved to '{output_file}' ({sz})"

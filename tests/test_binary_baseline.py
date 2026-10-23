@@ -1,9 +1,8 @@
-"""CHARACTERIZATION baseline for network body decoding (BS-1).
+"""BS-3: binary-safe downloads and explicit binary-stdout policy.
 
-These tests pin the CURRENT text-only behavior of curl/wget on binary or
-non-UTF-8 bodies. They are not a spec of desired behavior.
-
-# BASELINE: current network decode behavior; changed in BS-3
+The old BS-1 baseline (decoded text saved to files, silent latin-1 fallback)
+is inverted here: `-o`/`-O` now preserve exact bytes, and binary stdout is
+rejected instead of being silently reinterpreted.
 """
 
 from unittest import mock
@@ -11,15 +10,11 @@ from unittest import mock
 import pytest
 
 from pyos.context import Context
+from pyos.errors import PyOSError
 from pyos.shell import Shell
 
 
-BINARY_BODIES = [
-    (b"\xff\xfe", "\u00ff\u00fe"),
-    (b"\x00\xff\x10", "\x00\u00ff\x10"),
-    (b"\xc3\x28", "\u00c3("),
-    (b"hello\x00world", "hello\x00world"),
-]
+BINARY_BODIES = [b"\xff\xfe", b"\x00\xff\x10", b"\xc3\x28", b"hello\x00world"]
 
 
 def _ctx(kernel, root):
@@ -33,119 +28,162 @@ def _mock_request(body, headers=None, status=200):
     )
 
 
-# -- curl -------------------------------------------------------------------
+# -- saving to files --------------------------------------------------------
 
-def test_baseline_curl_o_saves_decoded_text_not_raw_bytes(kernel, root):
-    # BASELINE: current network decode behavior; changed in BS-3
+def test_curl_o_saves_exact_binary_bytes(kernel, root):
     from pyos.commands.network_cmds import cmd_curl
 
     body = b"\xff\xfe"
     ctx = _ctx(kernel, root)
-
     with _mock_request(body):
         result = cmd_curl(ctx, ["-o", "/tmp/out.bin", "http://example.com"], "")
 
-    saved = kernel.fs.read_file("/tmp/out.bin", root, "/", "/")
-    # latin-1 fallback, not the original bytes
-    assert saved == "\u00ff\u00fe"
-    assert isinstance(saved, str)
-    assert saved.encode("utf-8") != body
+    assert kernel.fs.read_bytes("/tmp/out.bin", root, "/", "/") == body
+    with pytest.raises(PyOSError, match="not valid UTF-8"):
+        kernel.fs.read_file("/tmp/out.bin", root, "/", "/")
+    assert "2 B" in result
+
+
+def test_wget_O_saves_exact_binary_bytes(kernel, root):
+    from pyos.commands.network_cmds import cmd_wget
+
+    body = b"\x00\xff\x10"
+    ctx = _ctx(kernel, root)
+    with _mock_request(body):
+        result = cmd_wget(
+            ctx, ["-O", "/tmp/out.bin", "http://example.com/data.bin"], "")
+
+    assert kernel.fs.read_bytes("/tmp/out.bin", root, "/", "/") == body
+    assert "3 B" in result
+
+
+def test_wget_without_O_saves_exact_binary_bytes(kernel, root):
+    # wget всегда пишет файл: без -O имя берётся из URL (не stdout).
+    from pyos.commands.network_cmds import cmd_wget
+
+    body = b"\xff\xfe"
+    ctx = _ctx(kernel, root)
+    with _mock_request(body):
+        result = cmd_wget(ctx, ["http://example.com/downloads/raw.bin"], "")
+
+    assert kernel.fs.read_bytes("/root/raw.bin", root, "/", "/") == body
     assert "saved" in result
+    assert "raw.bin" in result
 
 
-def test_baseline_curl_stdout_decodes_binary_body(kernel, root):
-    # BASELINE: current network decode behavior; changed in BS-3
+def test_wget_quiet_saves_binary_without_stdout(kernel, root):
+    from pyos.commands.network_cmds import cmd_wget
+
+    body = b"\x00\xff"
+    ctx = _ctx(kernel, root)
+    with _mock_request(body):
+        result = cmd_wget(
+            ctx, ["-q", "-O", "/tmp/q.bin", "http://example.com"], "")
+
+    assert result is None
+    assert kernel.fs.read_bytes("/tmp/q.bin", root, "/", "/") == body
+
+
+@pytest.mark.parametrize("body", BINARY_BODIES)
+def test_invalid_utf8_does_not_error_when_saving_to_file(kernel, root, body):
     from pyos.commands.network_cmds import cmd_curl
 
-    body = b"\xc3\x28"
     ctx = _ctx(kernel, root)
-
     with _mock_request(body):
-        result = cmd_curl(ctx, ["http://example.com"], "")
+        cmd_curl(ctx, ["-o", "/tmp/all.bin", "http://example.com"], "")
 
-    assert isinstance(result, str)
-    assert result == "\u00c3("
-    assert result.encode("utf-8") != body
+    assert kernel.fs.read_bytes("/tmp/all.bin", root, "/", "/") == body
 
 
-def test_baseline_curl_v_o_drops_headers_instead_of_saving_them(kernel, root):
-    # BASELINE: current network decode behavior; changed in BS-3.
-    # With -o the verbose header block is built but discarded: only the
-    # decoded body is written to the file.
+# -- binary stdout ----------------------------------------------------------
+
+def test_curl_stdout_rejects_invalid_utf8(kernel, root):
+    from pyos.commands.network_cmds import cmd_curl
+
+    ctx = _ctx(kernel, root)
+    with _mock_request(b"\xff\xfe"):
+        with pytest.raises(PyOSError,
+                           match="curl: binary output suppressed; use -o FILE"):
+            cmd_curl(ctx, ["http://example.com"], "")
+
+
+def test_curl_binary_stdout_error_reaches_stderr(kernel, root, capsys):
+    shell = Shell(kernel, root)
+    with _mock_request(b"\xff\xfe"):
+        shell.handle_line("curl http://example.com")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "curl: binary output suppressed; use -o FILE" in captured.err
+    assert "Traceback" not in captured.err
+    assert shell.exit_code == 1
+
+
+# -- verbose ----------------------------------------------------------------
+
+def test_curl_v_o_headers_not_in_file(kernel, root):
     from pyos.commands.network_cmds import cmd_curl
 
     body = b"payload"
     headers = {"Content-Type": "text/plain", "X-Test": "1"}
     ctx = _ctx(kernel, root)
-
     with _mock_request(body, headers=headers):
         result = cmd_curl(
             ctx, ["-v", "-o", "/tmp/verbose.bin", "http://example.com"], "")
 
-    saved = kernel.fs.read_file("/tmp/verbose.bin", root, "/", "/")
-    assert saved == "payload"
-    assert "HTTP/1.1" not in saved
-    assert "Content-Type" not in saved
-    assert "X-Test" not in saved
-    # The header block is not returned either; only the save message is.
+    assert kernel.fs.read_bytes("/tmp/verbose.bin", root, "/", "/") == body
+    # Заголовки уходят в stdout, а не в файл.
+    assert "HTTP/1.1 200" in result
+    assert "X-Test: 1" in result
     assert "saved" in result
 
 
-# -- wget -------------------------------------------------------------------
+def test_curl_v_stdout_headers_still_work(kernel, root):
+    from pyos.commands.network_cmds import cmd_curl
 
-def test_baseline_wget_O_saves_decoded_text_not_raw_bytes(kernel, root):
-    # BASELINE: current network decode behavior; changed in BS-3
-    from pyos.commands.network_cmds import cmd_wget
+    headers = {"X-Test": "1"}
+    ctx = _ctx(kernel, root)
+    with _mock_request(b"ok", headers=headers):
+        result = cmd_curl(ctx, ["-v", "http://example.com"], "")
 
-    body = b"\x00\xff\x10"
+    assert result == "HTTP/1.1 200\nX-Test: 1\n\nok"
+
+
+# -- text compatibility -----------------------------------------------------
+
+def test_text_responses_still_decode_as_before(kernel, root):
+    from pyos.commands.network_cmds import cmd_curl, cmd_wget
+
+    body = "h\u00e9llo".encode("utf-8")
+    headers = {"Content-Type": "text/plain; charset=utf-8"}
     ctx = _ctx(kernel, root)
 
-    with _mock_request(body):
-        result = cmd_wget(
-            ctx, ["-O", "/tmp/out.bin", "http://example.com/data.bin"], "")
-
-    saved = kernel.fs.read_file("/tmp/out.bin", root, "/", "/")
-    assert saved == "\x00\u00ff\x10"
-    assert isinstance(saved, str)
-    assert saved.encode("utf-8") != body
-    assert "saved" in result
+    with _mock_request(body, headers=headers):
+        assert cmd_curl(ctx, ["http://example.com"], "") == "h\u00e9llo"
+    with _mock_request(body, headers=headers):
+        cmd_wget(ctx, ["-O", "/tmp/text.txt", "http://example.com"], "")
+    assert kernel.fs.read_file("/tmp/text.txt", root, "/", "/") == "h\u00e9llo"
 
 
-def test_baseline_wget_without_O_decodes_to_file_not_stdout(kernel, root):
-    # BASELINE: current network decode behavior; changed in BS-3.
-    # wget never prints the body: without -O it writes the decoded text to
-    # a file named from the URL and returns only a status line.
-    from pyos.commands.network_cmds import cmd_wget
+# -- redirects --------------------------------------------------------------
 
-    body = b"hello\x00world"
-    ctx = _ctx(kernel, root)
-
-    with _mock_request(body):
-        result = cmd_wget(ctx, ["http://example.com/downloads/raw.bin"], "")
-
-    saved = kernel.fs.read_file("/root/raw.bin", root, "/", "/")
-    assert saved == "hello\x00world"
-    assert isinstance(saved, str)
-    assert saved.encode("utf-8") == body  # NUL survives because it is valid UTF-8
-    assert "hello" not in result
-    assert "saved" in result
-    assert "raw.bin" in result
-
-
-# -- invalid UTF-8 ----------------------------------------------------------
-
-@pytest.mark.parametrize("body,expected", BINARY_BODIES)
-def test_baseline_invalid_utf8_does_not_error_currently(
-        kernel, root, body, expected):
-    # BASELINE: current network decode behavior; changed in BS-3.
-    # _decode_body falls back to latin-1 for invalid UTF-8: no exception,
-    # no explicit error, data is silently reinterpreted.
+def test_curl_L_still_follows_redirects(kernel, root):
     from pyos.commands.network_cmds import cmd_curl
 
     ctx = _ctx(kernel, root)
+    with _mock_request(b"ok") as mock_do:
+        cmd_curl(ctx, ["http://example.com"], "")
+    assert mock_do.call_args.kwargs["follow_redirects"] is False
 
-    with _mock_request(body):
-        result = cmd_curl(ctx, ["http://example.com"], "")
+    with _mock_request(b"ok") as mock_do:
+        cmd_curl(ctx, ["-L", "http://example.com"], "")
+    assert mock_do.call_args.kwargs["follow_redirects"] is True
 
-    assert isinstance(result, str)
-    assert result == expected
+
+def test_wget_default_follows_redirects(kernel, root):
+    from pyos.commands.network_cmds import cmd_wget
+
+    ctx = _ctx(kernel, root)
+    with _mock_request(b"ok") as mock_do:
+        cmd_wget(ctx, ["-O", "/tmp/x", "http://example.com"], "")
+    assert mock_do.call_args.kwargs["follow_redirects"] is True
