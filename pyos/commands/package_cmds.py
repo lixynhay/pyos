@@ -6,6 +6,7 @@ PKGBUILD-подход (как в Arch Linux):
   - pkg устанавливает/удаляет/просматривает пакеты
 """
 
+import base64
 import json
 import re
 
@@ -670,7 +671,8 @@ def _copy_pkg_files(ctx, node, base_path, rel_prefix, installed_files):
     if node.is_file():
         # Вычисляем целевой путь: rel_prefix — это путь без base_path
         target = "/" + rel_prefix
-        data = ctx.fs.read_file(base_path + "/" + rel_prefix, ctx.user, "/", "/")
+        data = ctx.fs.read_bytes(
+            base_path + "/" + rel_prefix, ctx.user, "/", "/")
         try:
             # Попытка создать/перезаписать файл
             ctx.fs.write_file(target, data, ctx.user, "/", "/", create=True)
@@ -785,16 +787,28 @@ def _validate_pkg(ctx, data, source):
         seen.add(path)
 
         encoding = entry.get("encoding", "utf-8")
-        if not isinstance(encoding, str) or encoding.lower() not in (
-                "utf-8", "utf8"):
+        if not isinstance(encoding, str):
             raise InvalidArgument(
-                f"pkg: '{source}': unsupported encoding {encoding!r} "
-                "(only utf-8 is supported)")
+                f"pkg: '{source}': encoding must be a string")
+        encoding = encoding.lower()
 
         content = entry.get("content", "")
         if not isinstance(content, str):
             raise InvalidArgument(
                 f"pkg: '{source}': content must be a string")
+
+        if encoding in ("utf-8", "utf8"):
+            content = content.encode("utf-8")
+        elif encoding == "base64":
+            try:
+                content = base64.b64decode(content, validate=True)
+            except ValueError:
+                raise InvalidArgument(
+                    f"pkg: '{source}': invalid base64 content for '{path}'")
+        else:
+            raise InvalidArgument(
+                f"pkg: '{source}': unsupported encoding {encoding!r} "
+                "(expected utf-8 or base64)")
 
         mode = _parse_pkg_mode(entry.get("mode", "0644"), path)
         owner = entry.get("owner", "root")
@@ -934,22 +948,25 @@ def _pack_validate_component(name, parts):
             f"{name!r} at '{_pack_path_label(parts)}'")
 
 
-def _pack_read_text(path, content):
-    if isinstance(content, bytes):
+def _pack_read_content(path, content):
+    """Возвращает ``(encoding, json_content)`` для файла пакета.
+
+    UTF-8-совместимые данные остаются читаемым текстом, остальные
+    кодируются в base64.
+    """
+    if isinstance(content, str):
         try:
-            return content.decode("utf-8")
-        except UnicodeDecodeError:
+            content = content.encode("utf-8")
+        except UnicodeEncodeError:
             raise InvalidArgument(
                 f"pkg pack: file is not valid utf-8 text: '{path}'")
-    if not isinstance(content, str):
+    if not isinstance(content, bytes):
         raise InvalidArgument(
-            f"pkg pack: file content is not text: '{path}'")
+            f"pkg pack: file content is neither text nor bytes: '{path}'")
     try:
-        content.encode("utf-8")
-    except UnicodeEncodeError:
-        raise InvalidArgument(
-            f"pkg pack: file is not valid utf-8 text: '{path}'")
-    return content
+        return "utf-8", content.decode("utf-8")
+    except UnicodeDecodeError:
+        return "base64", base64.b64encode(content).decode("ascii")
 
 
 def _pack_collect(ctx, node, parts, root_path, output_path, files):
@@ -982,7 +999,7 @@ def _pack_collect(ctx, node, parts, root_path, output_path, files):
         raise InvalidArgument(
             f"pkg pack: hardlink is not supported: '{path}'")
 
-    content = _pack_read_text(path, node.data)
+    content_encoding, content = _pack_read_content(path, node.data)
     owner = ctx.users.get_by_uid(node.uid)
     if owner is None:
         raise InvalidArgument(
@@ -997,7 +1014,7 @@ def _pack_collect(ctx, node, parts, root_path, output_path, files):
         "mode": f"{node.mode & 0o7777:04o}",
         "owner": owner.name,
         "group": group.name,
-        "encoding": "utf-8",
+        "encoding": content_encoding,
         "content": content,
     })
 

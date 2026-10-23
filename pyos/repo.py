@@ -968,14 +968,16 @@ def _package_cache_path(repo, package):
     return f"{PACKAGE_CACHE_ROOT}/{repo['name']}/{filename}"
 
 
-def _fetch_package_text(ctx, repo, package, url):
+def _fetch_package_bytes(ctx, repo, package, url):
     """Читает пакет из path-репо или качает через общий network helper."""
     if repo["type"] == "http":
         try:
-            return network_cmds._http_get_text(
+            status, _, body = network_cmds._http_get_bytes(
                 url, follow_redirects=True,
-                timeout=network_cmds.REQUEST_TIMEOUT,
-                raise_for_status=True)
+                timeout=network_cmds.REQUEST_TIMEOUT)
+            if not 200 <= status < 300:
+                raise PyOSError(f"HTTP {status}")
+            return body
         except (PyOSError, InvalidArgument) as exc:
             raise PyOSError(
                 f"pkg: failed to download '{package['name']}' from "
@@ -983,7 +985,7 @@ def _fetch_package_text(ctx, repo, package, url):
                 f"{_clean_error(exc)}")
 
     try:
-        return ctx.fs.read_file(url, ctx.user, "/", "/")
+        return ctx.fs.read_bytes(url, ctx.user, "/", "/")
     except NoSuchFileOrDirectory:
         raise InvalidArgument(
             f"pkg: package file not found for '{package['name']}' in "
@@ -1014,7 +1016,7 @@ def _cache_package(ctx, repo, package, with_status=False):
     url = _safe_package_url(repo, package)
 
     try:
-        cached = ctx.fs.read_file(cache_path, ctx.user, "/", "/")
+        cached = ctx.fs.read_bytes(cache_path, ctx.user, "/", "/")
     except NoSuchFileOrDirectory:
         cached = None
     except PyOSError as exc:
@@ -1022,10 +1024,10 @@ def _cache_package(ctx, repo, package, with_status=False):
             f"pkg: cannot read cached package '{cache_path}': {exc}")
 
     if (cached is not None
-            and hashlib.sha256(cached.encode("utf-8")).hexdigest().lower()
+            and hashlib.sha256(cached).hexdigest().lower()
             == expected_sha):
         size = package.get("size")
-        cached_size = len(cached.encode("utf-8"))
+        cached_size = len(cached)
         if size is not None and cached_size > size:
             _remove_cached_file(ctx, cache_path)
             raise PyOSError(
@@ -1035,12 +1037,12 @@ def _cache_package(ctx, repo, package, with_status=False):
                 f"bytes; cache '{cache_path}')")
         return (cache_path, True) if with_status else cache_path
 
-    text = _fetch_package_text(ctx, repo, package, url)
+    raw = _fetch_package_bytes(ctx, repo, package, url)
 
     _ensure_dir(ctx.fs, f"{PACKAGE_CACHE_ROOT}/{repo['name']}", ctx.user)
-    ctx.fs.write_file(cache_path, text, ctx.user, "/", "/", create=True)
+    ctx.fs.write_file(cache_path, raw, ctx.user, "/", "/", create=True)
 
-    actual_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    actual_sha = hashlib.sha256(raw).hexdigest()
     if actual_sha.lower() != expected_sha:
         _remove_cached_file(ctx, cache_path)
         raise PyOSError(
@@ -1049,7 +1051,7 @@ def _cache_package(ctx, repo, package, with_status=False):
             f"{expected_sha}, got {actual_sha}")
 
     size = package.get("size")
-    actual_size = len(text.encode("utf-8"))
+    actual_size = len(raw)
     if size is not None and actual_size > size:
         _remove_cached_file(ctx, cache_path)
         raise PyOSError(

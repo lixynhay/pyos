@@ -94,12 +94,19 @@ def test_pack_rejects_symlink(kernel, root):
         _pack(ctx, "/tmp/link-root", "/tmp/link.pkg.json")
 
 
-def test_pack_rejects_non_utf8_content(kernel, root):
+def test_pack_encodes_non_utf8_content_as_base64(kernel, root):
+    import base64
+
     ctx = _ctx(kernel, root)
     _write(kernel, root, "/tmp/bad-root/bad.txt", b"\xff")
 
-    with pytest.raises(InvalidArgument, match="utf-8"):
-        _pack(ctx, "/tmp/bad-root", "/tmp/bad.pkg.json")
+    result = _pack(ctx, "/tmp/bad-root", "/tmp/bad.pkg.json")
+    assert "created" in result
+
+    data = _read_package(kernel, root, "/tmp/bad.pkg.json")
+    entry = data["files"][0]
+    assert entry["encoding"] == "base64"
+    assert base64.b64decode(entry["content"]) == b"\xff"
 
 
 def test_pack_rejects_missing_root_dir(kernel, root):
