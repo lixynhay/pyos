@@ -236,7 +236,7 @@ def cmd_cp(ctx, args, stdin):
         ctx.fs.copy_tree(src, dst, ctx.user, ctx.cwd, ctx.home)
         return None
 
-    data = ctx.fs.read_file(src, ctx.user, ctx.cwd, ctx.home)
+    data = ctx.fs.read_bytes(src, ctx.user, ctx.cwd, ctx.home)
     try:
         ctx.fs.write_file(dst, data, ctx.user, ctx.cwd, ctx.home,
                           mode=snode.mode)

@@ -6,7 +6,7 @@ import pytest
 
 from pyos.commands.memory_cmds import cmd_load, cmd_save
 from pyos.context import Context
-from pyos.errors import InvalidArgument, PyOSError
+from pyos.errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
 from pyos.fs import VirtualFile
 from pyos.shell import Shell
 
@@ -90,6 +90,98 @@ def test_cp_r_preserves_binary_bytes(kernel, root):
     assert fs.read_bytes("/tmp/ddir/bin", root, "/", "/") == BINARY
     assert fs.lookup("/tmp/ddir", root, "/", "/").mode == 0o750
     assert fs.lookup("/tmp/ddir/bin", root, "/", "/").mode == 0o600
+
+
+# -- plain cp command with binary sources ------------------------------------
+
+def test_cp_binary_file_preserves_exact_bytes(kernel, root):
+    fs = kernel.fs
+    payloads = (b"\x00\xff\x10", b"\xff\xfe", b"hello\x00world")
+    for index, payload in enumerate(payloads):
+        src = f"/tmp/cp-bin-{index}"
+        dst = f"/tmp/cp-bin-out-{index}"
+        fs.create_file(src, root, "/", "/", data=payload)
+        Shell(kernel, root).handle_line(f"cp {src} {dst}")
+        assert fs.read_bytes(dst, root, "/", "/") == payload
+
+
+def test_cp_invalid_utf8_file_preserves_exact_bytes(kernel, root):
+    fs = kernel.fs
+    payload = b"\xc3\x28\xff\xfe"
+    fs.create_file("/tmp/cp-invalid", root, "/", "/", data=payload)
+    Shell(kernel, root).handle_line("cp /tmp/cp-invalid /tmp/cp-invalid-copy")
+    assert fs.read_bytes("/tmp/cp-invalid-copy", root, "/", "/") == payload
+
+
+def test_cp_text_file_still_works(kernel, root):
+    fs = kernel.fs
+    fs.create_file("/tmp/cp-text", root, "/", "/", data="h\u00e9llo\n")
+    Shell(kernel, root).handle_line("cp /tmp/cp-text /tmp/cp-text-copy")
+    assert fs.read_file("/tmp/cp-text-copy", root, "/", "/") == "h\u00e9llo\n"
+
+
+def test_cp_binary_preserves_mode(kernel, root):
+    fs = kernel.fs
+    fs.create_file("/tmp/cp-mode-src", root, "/", "/",
+                   data=BINARY, mode=0o640)
+    Shell(kernel, root).handle_line("cp /tmp/cp-mode-src /tmp/cp-mode-dst")
+    assert fs.lookup("/tmp/cp-mode-dst", root, "/", "/").mode == 0o640
+
+
+def test_cp_binary_denies_unreadable_source(kernel, root, user, capsys):
+    fs = kernel.fs
+    fs.create_file("/tmp/cp-secret", root, "/", "/",
+                   data=BINARY, mode=0o000)
+    sh = Shell(kernel, user)
+    sh.handle_line("cp /tmp/cp-secret /tmp/cp-secret-leak")
+
+    assert "Permission denied" in capsys.readouterr().err
+    with pytest.raises(NoSuchFileOrDirectory):
+        fs.lookup("/tmp/cp-secret-leak", root, "/", "/")
+
+
+def test_cp_binary_denies_unsearchable_parent(kernel, root, user, capsys):
+    fs = kernel.fs
+    fs.mkdir("/tmp/cp-locked", root, "/", "/", mode=0o600)
+    fs.create_file("/tmp/cp-locked/bin", root, "/", "/",
+                   data=BINARY, mode=0o644)
+    sh = Shell(kernel, user)
+    sh.handle_line("cp /tmp/cp-locked/bin /tmp/cp-locked-leak")
+
+    assert "Permission denied" in capsys.readouterr().err
+    with pytest.raises(NoSuchFileOrDirectory):
+        fs.lookup("/tmp/cp-locked-leak", root, "/", "/")
+
+
+def test_cp_existing_destination_behavior_unchanged(kernel, root):
+    fs = kernel.fs
+    fs.create_file("/tmp/cp-old-src", root, "/", "/", data=b"new")
+    fs.create_file("/tmp/cp-old-dst", root, "/", "/", data=b"old")
+    Shell(kernel, root).handle_line("cp /tmp/cp-old-src /tmp/cp-old-dst")
+
+    assert fs.read_bytes("/tmp/cp-old-dst", root, "/", "/") == b"new"
+    assert fs.read_bytes("/tmp/cp-old-src", root, "/", "/") == b"new"
+
+
+def test_cp_r_binary_roundtrip_still_works(kernel, root):
+    fs = kernel.fs
+    fs.mkdir("/tmp/cp-rdir", root, "/", "/")
+    fs.create_file("/tmp/cp-rdir/bin", root, "/", "/",
+                   data=BINARY, mode=0o600)
+    Shell(kernel, root).handle_line("cp -r /tmp/cp-rdir /tmp/cp-rdir-copy")
+
+    assert fs.read_bytes(
+        "/tmp/cp-rdir-copy/bin", root, "/", "/") == BINARY
+    assert fs.lookup(
+        "/tmp/cp-rdir-copy/bin", root, "/", "/").mode == 0o600
+
+
+def test_cp_proc_text_file_still_works(kernel, root):
+    fs = kernel.fs
+    expected = fs.read_file("/proc/version", root, "/", "/")
+    Shell(kernel, root).handle_line("cp /proc/version /tmp/proc-version-copy")
+    assert fs.read_file(
+        "/tmp/proc-version-copy", root, "/", "/") == expected
 
 
 def test_mv_preserves_binary_bytes(kernel, root, capsys):
