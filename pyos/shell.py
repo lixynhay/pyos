@@ -27,6 +27,16 @@ BUILTIN_NAMES = {
     "su", "sudo", "source", "set", "nice",
 }
 
+# Короткий usage для help/man. Полноценных man-страниц у builtins нет.
+BUILTIN_USAGE = {
+    "wait": "wait [pid|%job]",
+    "waitpid": "waitpid pid",
+    "jobs": "jobs",
+    "fg": "fg [%job|pid]",
+    "bg": "bg [%job|pid]",
+    "nice": "nice [-n N] command [args...]\n    nice N command [args...]",
+}
+
 
 # ---------------------------------------------------------------------------
 # Разбор командной строки
@@ -329,6 +339,10 @@ class Shell:
     @property
     def builtins(self):
         return BUILTIN_NAMES
+
+    def builtin_usage(self, name):
+        """Короткий SYNOPSIS для встроенной команды или ``None``."""
+        return BUILTIN_USAGE.get(name)
 
     # -- утилиты -------------------------------------------------------------
     def write_stdout(self, text):

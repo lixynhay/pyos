@@ -171,6 +171,10 @@ def _man(ctx, name):
     if cmd is not None:
         return f"NAME\n    {cmd.name} - {cmd.summary}\n\nSYNOPSIS\n    {cmd.usage}"
     if ctx.shell is not None and name in ctx.shell.builtins:
+        usage = ctx.shell.builtin_usage(name)
+        if usage:
+            return (f"NAME\n    {name} - встроенная команда шелла"
+                    f"\n\nSYNOPSIS\n    {usage}")
         return f"NAME\n    {name} - встроенная команда шелла"
     raise InvalidArgument(f"man: no manual entry for {name}")
 
