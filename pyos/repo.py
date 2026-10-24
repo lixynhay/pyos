@@ -7,6 +7,7 @@
 import hashlib
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from functools import cmp_to_key
 
@@ -663,6 +664,15 @@ def read_cached_index(fs, user, repo):
     return _parse_index(text, path, repo)
 
 
+def _write_warning(ctx, message):
+    """Пишет warning в stderr, не смешивая его с результатами."""
+    shell = getattr(ctx, "shell", None)
+    if shell is not None:
+        shell.write_stderr(message)
+    else:
+        print(message, file=sys.stderr)
+
+
 def search_packages(ctx, query):
     """Ищет подстроку в name/description кэшированных индексов.
 
@@ -678,7 +688,6 @@ def search_packages(ctx, query):
 
     needle = query.casefold()
     hits = []
-    warnings = []
 
     for repo in sorted(repos, key=lambda item: item["name"]):
         try:
@@ -687,7 +696,8 @@ def search_packages(ctx, query):
             message = _clean_error(exc)
             if "run pkg repo update" not in message:
                 message += " (run pkg repo update)"
-            warnings.append(
+            _write_warning(
+                ctx,
                 f"pkg: warning: skipping repo '{repo['name']}': {message}")
             continue
 
@@ -710,7 +720,8 @@ def search_packages(ctx, query):
 
     hits.sort(key=cmp_to_key(compare))
 
-    lines = list(warnings)
+    lines = ["  ".join([
+        "REPO", "NAME", "VERSION-RELEASE", "ARCH", "DESCRIPTION"])]
     for repo_name, package in hits:
         description = package["description"].replace("\n", " ")
         lines.append("  ".join([
@@ -721,8 +732,6 @@ def search_packages(ctx, query):
             description,
         ]))
 
-    if not lines:
-        return f"pkg: no matches for '{query}'"
     return "\n".join(lines)
 
 

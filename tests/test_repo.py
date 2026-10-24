@@ -796,7 +796,7 @@ def test_search_matches_description_substring_case_insensitive(kernel, root):
     assert "other" not in result
 
 
-def test_search_skips_repo_without_cache_with_warning(kernel, root):
+def test_search_skips_repo_without_cache_with_warning(kernel, root, capsys):
     ctx = _ctx(kernel, root)
     cached = _make_repo(kernel, root, name="cached", packages=[
         {"name": "hello", "version": "1.0"},
@@ -805,11 +805,13 @@ def test_search_skips_repo_without_cache_with_warning(kernel, root):
     _use_repos(kernel, root, [cached, missing])
 
     result = cmd_pkg(ctx, ["search", "hello"], "")
+    err = capsys.readouterr().err
 
     assert "hello" in result
-    assert "warning" in result
-    assert "missing" in result
-    assert "run pkg repo update" in result
+    assert "warning" not in result
+    assert "warning" in err
+    assert "missing" in err
+    assert "run pkg repo update" in err
 
 
 def test_search_empty_query_usage_error(kernel, root):
@@ -836,7 +838,9 @@ def test_search_output_sorted_by_repo_name_version(kernel, root):
     result = cmd_pkg(ctx, ["search", "tool"], "")
 
     lines = [line for line in result.splitlines() if line.strip()]
-    assert [line.split("  ")[:3] for line in lines] == [
+    assert lines[0].split() == [
+        "REPO", "NAME", "VERSION-RELEASE", "ARCH", "DESCRIPTION"]
+    assert [line.split("  ")[:3] for line in lines[1:]] == [
         ["arepo", "tool", "2.0-1"],
         ["arepo", "tool-box", "9.0-1"],
         ["zrepo", "tool", "1.10-1"],
@@ -882,6 +886,67 @@ def test_search_available_to_non_root(kernel, root, user):
     result = cmd_pkg(_ctx(kernel, user), ["search", "hello"], "")
 
     assert "hello" in result
+
+
+def test_pkg_search_header_in_stdout(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["search", "hello"], "")
+
+    header = result.splitlines()[0]
+    for column in ("REPO", "NAME", "VERSION-RELEASE", "ARCH",
+                   "DESCRIPTION"):
+        assert column in header
+
+
+def test_pkg_search_warnings_in_stderr(kernel, root, capsys):
+    ctx = _ctx(kernel, root)
+    cached = _make_repo(kernel, root, name="cached", packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    missing = _repo("missing", "/srv/missing/", priority=10)
+    _use_repos(kernel, root, [cached, missing])
+
+    result = cmd_pkg(ctx, ["search", "hello"], "")
+    err = capsys.readouterr().err
+
+    assert "hello" in result
+    assert "warning" in err
+    assert "missing" in err
+    assert "warning" not in result
+
+
+def test_pkg_search_no_cache_warning_not_in_stdout(kernel, root, capsys):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [_repo("cold", "/srv/cold/")])
+
+    result = cmd_pkg(ctx, ["search", "anything"], "")
+    err = capsys.readouterr().err
+
+    assert "warning" in err
+    assert "run pkg repo update" in err
+    assert "warning" not in result
+    assert "REPO" in result
+
+
+def test_pkg_search_result_format_unchanged_except_header(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, name="local", packages=[
+        {"name": "hello", "version": "1.5", "release": 2,
+         "description": "hello package"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["search", "hello"], "")
+    lines = result.splitlines()
+
+    assert lines[0].startswith("REPO  NAME  VERSION-RELEASE")
+    assert lines[1].split("  ") == [
+        "local", "hello", "1.5-2", "any", "hello package"]
 
 
 # -- pkg install <name> из репозиториев -------------------------------------
