@@ -134,6 +134,20 @@ def _create_snapshot(kernel, root, extra_fs=None):
     return tmpname
 
 
+def _add_virtual_entries(tmpname):
+    """Добавляет в снапшот статические /dev и /proc как в старых версиях."""
+    with open(tmpname, "r", encoding="utf-8") as f:
+        state = json.load(f)
+    state["filesystem"]["/dev/null"] = {
+        "type": "file", "uid": 0, "gid": 0, "mode": 0o666, "data": "stale",
+    }
+    state["filesystem"]["/proc/uptime"] = {
+        "type": "file", "uid": 0, "gid": 0, "mode": 0o444, "data": "stale",
+    }
+    with open(tmpname, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+
 def test_load_restores_files(kernel, root):
     """load восстанавливает файлы ФС."""
     from pyos.commands.memory_cmds import cmd_load, cmd_save
@@ -320,11 +334,68 @@ def test_load_ignores_static_proc_dev_from_old_snapshot(kernel, root):
         os.unlink(tmpname)
 
 
+def test_load_message_counts_only_restored_nodes(kernel, root):
+    """load считает только реально восстановленные не-volatile узлы."""
+    from pyos.commands.memory_cmds import cmd_load
+
+    ctx = Context(kernel, root, "/root")
+    tmpname = _create_snapshot(kernel, root)
+    try:
+        with open(tmpname, "r", encoding="utf-8") as f:
+            expected = len(json.load(f)["filesystem"])
+        _add_virtual_entries(tmpname)
+
+        result = cmd_load(ctx, [tmpname], "")
+
+        assert f"({expected} nodes," in result
+        assert f"{expected + 2} nodes" not in result
+        assert "loaded" in result
+    finally:
+        os.unlink(tmpname)
+
+
+def test_load_message_mentions_ignored_virtual_entries(kernel, root):
+    """load сообщает, сколько виртуальных записей проигнорировано."""
+    from pyos.commands.memory_cmds import cmd_load
+
+    ctx = Context(kernel, root, "/root")
+    tmpname = _create_snapshot(kernel, root)
+    try:
+        _add_virtual_entries(tmpname)
+
+        result = cmd_load(ctx, [tmpname], "")
+
+        assert "2 virtual entries ignored" in result
+    finally:
+        os.unlink(tmpname)
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_load_snapshot_versions_still_work(kernel, root, version):
+    """load принимает снапшоты версий 1, 2 и 3."""
+    from pyos.commands.memory_cmds import cmd_load
+
+    ctx = Context(kernel, root, "/root")
+    tmpname = _create_snapshot(kernel, root)
+    try:
+        with open(tmpname, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        state["version"] = version
+        with open(tmpname, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+        result = cmd_load(ctx, [tmpname], "")
+
+        assert "loaded" in result
+        assert kernel.fs.read_file("/root/test.txt", root, "/", "/") == \
+            "hello world"
+    finally:
+        os.unlink(tmpname)
+
+
 # ============================================================================
 # ulimit -f
 # ============================================================================
-
-
 def test_ulimit_show_default(kernel, root, capsys):
     """ulimit без опций показывает 'unlimited'."""
     from pyos.commands.memory_cmds import cmd_ulimit

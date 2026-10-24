@@ -320,12 +320,21 @@ def cmd_load(ctx, args, stdin):
             ctx.user = restored
 
     # Файловая система
+    filesystem = state.get("filesystem", {})
     if "filesystem" in state:
-        _restore_fs(ctx.fs, state["filesystem"])
+        _restore_fs(ctx.fs, filesystem)
         ctx.kernel.reset_virtual_fs()
 
-    node_count = len(state.get("filesystem", {}))
-    return f"load: loaded ({node_count} nodes) from '{filename}'"
+    restored_nodes = sum(
+        1 for path in filesystem if not _is_virtual_path(path))
+    ignored = len(filesystem) - restored_nodes
+    if ignored:
+        ignored_text = (f"{ignored} virtual "
+                        f"entr{'y' if ignored == 1 else 'ies'} ignored")
+        detail = f"{restored_nodes} nodes, {ignored_text}"
+    else:
+        detail = f"{restored_nodes} nodes"
+    return f"load: loaded ({detail}) from '{filename}'"
 
 
 # ============================================================================
