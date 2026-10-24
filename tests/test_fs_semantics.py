@@ -751,4 +751,4 @@ def test_chmod_symbolic_invalid_mode_validated_guard(kernel, root, capsys):
     fs.create_file("/tmp/f", root, data="x", mode=0o644)
     sh = Shell(kernel, root)
     out = _run(sh, capsys, "chmod z+x /tmp/f")
-    assert "invalid mode: 'z+x'" in out
+    assert "chmod: invalid mode 'z+x'" in out

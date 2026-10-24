@@ -321,6 +321,28 @@ def test_chmod_non_existent(kernel, root, capsys):
     assert capsys.readouterr().err.strip()
 
 
+def test_chmod_invalid_numeric_message_format(kernel, root, capsys):
+    kernel.fs.create_file("/tmp/mode.txt", root, data="x", mode=0o644)
+    sh = Shell(kernel, root)
+
+    sh.handle_line("chmod 9999 /tmp/mode.txt")
+    err = capsys.readouterr().err
+
+    assert "chmod: invalid mode '9999'" in err
+    assert "invalid mode:" not in err
+
+
+def test_chmod_invalid_symbolic_message_format(kernel, root, capsys):
+    kernel.fs.create_file("/tmp/mode.txt", root, data="x", mode=0o644)
+    sh = Shell(kernel, root)
+
+    sh.handle_line("chmod +q /tmp/mode.txt")
+    err = capsys.readouterr().err
+
+    assert "chmod: invalid mode '+q'" in err
+    assert "invalid mode:" not in err
+
+
 # ============================================================================
 # chown
 # ============================================================================

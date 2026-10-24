@@ -327,7 +327,7 @@ def cmd_chmod(ctx, args, stdin):
             for clause in spec.split(","):
                 m = re.fullmatch(r"([ugoa]*)([+-=])([rwx]+)", clause)
                 if not m:
-                    raise InvalidArgument(f"invalid mode: '{spec}'")
+                    raise InvalidArgument(f"chmod: invalid mode '{spec}'")
                 who, op, perms = m.groups()
                 who = who or "a"
                 bits = (4 if "r" in perms else 0) | (2 if "w" in perms else 0) \
