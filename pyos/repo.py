@@ -1117,11 +1117,11 @@ def _parse_options(args, allowed):
             else:
                 if i + 1 >= len(args):
                     raise InvalidArgument(
-                        f"pkg repo: option '--{key}' requires an argument")
+                        f"repo: option '--{key}' requires an argument")
                 value = args[i + 1]
                 i += 1
             if key not in allowed:
-                raise InvalidArgument(f"pkg repo: unknown option '--{key}'")
+                raise InvalidArgument(f"repo: unknown option '--{key}'")
             options[key] = value
         else:
             positional.append(arg)
@@ -1154,7 +1154,7 @@ def handle_repo_command(ctx, args):
         positional, options = _parse_options(rest, {"type", "priority"})
         if len(positional) != 2:
             raise InvalidArgument(
-                "pkg repo add: expected <name> <url> "
+                "repo add: expected <name> <url> "
                 "(usage: pkg repo add <name> <url> [--type http|path] "
                 "[--priority N])")
         repo_type = options.get("type", "http")
@@ -1165,36 +1165,36 @@ def handle_repo_command(ctx, args):
     if action == "remove":
         positional, options = _parse_options(rest, set())
         if options:
-            raise InvalidArgument("pkg repo remove: unexpected option")
+            raise InvalidArgument("repo remove: unexpected option")
         if len(positional) != 1:
             raise InvalidArgument(
-                "pkg repo remove: expected <name> "
+                "repo remove: expected <name> "
                 "(usage: pkg repo remove <name>)")
         return remove_repo(ctx, positional[0])
 
     if action == "list":
         if rest:
             raise InvalidArgument(
-                "pkg repo list: unexpected arguments "
+                "repo list: unexpected arguments "
                 "(usage: pkg repo list)")
         return list_repos(ctx)
 
     if action == "update":
         positional, options = _parse_options(rest, set())
         if options:
-            raise InvalidArgument("pkg repo update: unexpected option")
+            raise InvalidArgument("repo update: unexpected option")
         return update_repos(ctx, positional or None)
 
     if action in ("enable", "disable"):
         positional, options = _parse_options(rest, set())
         if options:
             raise InvalidArgument(
-                f"pkg repo {action}: unexpected option")
+                f"repo {action}: unexpected option")
         if len(positional) != 1:
             raise InvalidArgument(
-                f"pkg repo {action}: expected <name> "
+                f"repo {action}: expected <name> "
                 f"(usage: pkg repo {action} <name>)")
         return set_repo_enabled(ctx, positional[0], action == "enable")
 
     raise InvalidArgument(
-        f"pkg repo: unknown action '{action}' (usage: {usage})")
+        f"repo: unknown action '{action}' (usage: {usage})")

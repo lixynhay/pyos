@@ -2050,3 +2050,37 @@ def test_invalid_repo_subcommand_gives_usage_error_not_traceback(
     assert "usage" in message
     assert "enable" in message
     assert "disable" in message
+
+# -- ошибки pkg: без дубля "pkg: pkg" ----------------------------------------
+
+
+def test_pkg_search_missing_query_message_no_double_prefix(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("pkg search")
+    err = capsys.readouterr().err
+
+    assert "pkg: search: missing query" in err
+    assert "pkg: pkg" not in err
+
+
+def test_pkg_install_too_many_arguments_message_no_double_prefix(
+        kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("pkg install alpha beta")
+    err = capsys.readouterr().err
+
+    assert "pkg: install: too many arguments" in err
+    assert "pkg: pkg" not in err
+
+
+def test_pkg_repo_unknown_action_message_no_double_prefix(
+        kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("pkg repo frobnicate")
+    err = capsys.readouterr().err
+
+    assert "pkg: repo: unknown action 'frobnicate'" in err
+    assert "pkg: pkg" not in err

@@ -861,13 +861,13 @@ _PACK_USAGE = (
 
 
 def _pack_usage_error(message):
-    raise InvalidArgument(f"pkg pack: {message} ({_PACK_USAGE})")
+    raise InvalidArgument(f"pack: {message} ({_PACK_USAGE})")
 
 
 def _pack_normalize_path(raw, label):
     if not isinstance(raw, str) or not raw.startswith("/"):
         raise InvalidArgument(
-            f"pkg pack: {label} must be absolute: {raw!r}")
+            f"pack: {label} must be absolute: {raw!r}")
     if raw == "/":
         return "/"
 
@@ -877,7 +877,7 @@ def _pack_normalize_path(raw, label):
         text = str(exc)
         if text.startswith("pkg: "):
             text = text[len("pkg: "):]
-        raise InvalidArgument(f"pkg pack: {label}: {text}")
+        raise InvalidArgument(f"pack: {label}: {text}")
 
 
 def _parse_pack_args(args):
@@ -944,7 +944,7 @@ def _pack_validate_component(name, parts):
     if (not isinstance(name, str) or not name
             or name in (".", "..") or "/" in name or "\\" in name):
         raise InvalidArgument(
-            f"pkg pack: path traversal or unsafe path component "
+            f"pack: path traversal or unsafe path component "
             f"{name!r} at '{_pack_path_label(parts)}'")
 
 
@@ -959,10 +959,10 @@ def _pack_read_content(path, content):
             content = content.encode("utf-8")
         except UnicodeEncodeError:
             raise InvalidArgument(
-                f"pkg pack: file is not valid utf-8 text: '{path}'")
+                f"pack: file is not valid utf-8 text: '{path}'")
     if not isinstance(content, bytes):
         raise InvalidArgument(
-            f"pkg pack: file content is neither text nor bytes: '{path}'")
+            f"pack: file content is neither text nor bytes: '{path}'")
     try:
         return "utf-8", content.decode("utf-8")
     except UnicodeDecodeError:
@@ -977,12 +977,12 @@ def _pack_collect(ctx, node, parts, root_path, output_path, files):
 
     if node.is_link():
         raise InvalidArgument(
-            f"pkg pack: symlink is not supported: '{path}'")
+            f"pack: symlink is not supported: '{path}'")
 
     if node.is_dir():
         if getattr(node, "refresh", None) is not None:
             raise InvalidArgument(
-                f"pkg pack: special directory is not supported: '{path}'")
+                f"pack: special directory is not supported: '{path}'")
         for name in sorted(node.children):
             _pack_validate_component(name, parts)
             _pack_collect(ctx, node.children[name], parts + [name],
@@ -991,23 +991,23 @@ def _pack_collect(ctx, node, parts, root_path, output_path, files):
 
     if not node.is_file():
         raise InvalidArgument(
-            f"pkg pack: unsupported file type: '{path}'")
+            f"pack: unsupported file type: '{path}'")
     if isinstance(node, VirtualFile):
         raise InvalidArgument(
-            f"pkg pack: special file is not supported: '{path}'")
+            f"pack: special file is not supported: '{path}'")
     if node.nlink > 1:
         raise InvalidArgument(
-            f"pkg pack: hardlink is not supported: '{path}'")
+            f"pack: hardlink is not supported: '{path}'")
 
     content_encoding, content = _pack_read_content(path, node.data)
     owner = ctx.users.get_by_uid(node.uid)
     if owner is None:
         raise InvalidArgument(
-            f"pkg pack: unknown owner uid {node.uid} for '{path}'")
+            f"pack: unknown owner uid {node.uid} for '{path}'")
     group = ctx.users.groups.get(node.gid)
     if group is None:
         raise InvalidArgument(
-            f"pkg pack: unknown group gid {node.gid} for '{path}'")
+            f"pack: unknown group gid {node.gid} for '{path}'")
 
     files.append({
         "path": path,
@@ -1021,7 +1021,7 @@ def _pack_collect(ctx, node, parts, root_path, output_path, files):
 
 def _pack_package(ctx, args):
     if ctx.user is None or ctx.user.uid != 0:
-        raise PermissionDenied(message="pkg pack: only root can create packages")
+        raise PermissionDenied(message="pack: only root can create packages")
     root_raw, output_raw, options, dry_run = _parse_pack_args(args)
     if output_raw != "/" and output_raw.endswith("/"):
         _pack_usage_error("output path must name a file, not a directory")
@@ -1029,20 +1029,20 @@ def _pack_package(ctx, args):
     root_path = _pack_normalize_path(root_raw, "root directory")
     output_path = _pack_normalize_path(output_raw, "output path")
     if output_path == "/":
-        raise InvalidArgument("pkg pack: output path cannot be '/'")
+        raise InvalidArgument("pack: output path cannot be '/'")
 
     try:
         root_node = ctx.fs.lookup(
             root_path, "/", "/", follow=False, user=ctx.user)
     except NoSuchFileOrDirectory:
         raise InvalidArgument(
-            f"pkg pack: root directory not found: '{root_path}'")
+            f"pack: root directory not found: '{root_path}'")
     if root_node.is_link():
         raise InvalidArgument(
-            f"pkg pack: root directory is a symlink: '{root_path}'")
+            f"pack: root directory is a symlink: '{root_path}'")
     if not root_node.is_dir():
         raise InvalidArgument(
-            f"pkg pack: root directory is not a directory: '{root_path}'")
+            f"pack: root directory is not a directory: '{root_path}'")
 
     try:
         output_node = ctx.fs.lookup(
@@ -1052,13 +1052,13 @@ def _pack_package(ctx, args):
     if output_node is not None:
         if output_node.is_dir():
             raise InvalidArgument(
-                f"pkg pack: output path is a directory: '{output_path}'")
+                f"pack: output path is a directory: '{output_path}'")
         if output_node.is_link():
             raise InvalidArgument(
-                f"pkg pack: output path is a symlink: '{output_path}'")
+                f"pack: output path is a symlink: '{output_path}'")
         if not output_node.is_file() or isinstance(output_node, VirtualFile):
             raise InvalidArgument(
-                f"pkg pack: output path is not a regular file: "
+                f"pack: output path is not a regular file: "
                 f"'{output_path}'")
 
     parent_path = output_path.rsplit("/", 1)[0] or "/"
@@ -1069,7 +1069,7 @@ def _pack_package(ctx, args):
         parent_node = None
     if parent_node is not None and not parent_node.is_dir():
         raise InvalidArgument(
-            f"pkg pack: output parent is not a directory: '{parent_path}'")
+            f"pack: output parent is not a directory: '{parent_path}'")
 
     files = []
     _pack_collect(ctx, root_node, [], root_path, output_path, files)
@@ -1435,7 +1435,7 @@ def _plan_upgrade(ctx, names, force):
         missing = [name for name in requested if name not in states]
         if missing:
             raise InvalidArgument(
-                f"pkg upgrade: package '{missing[0]}' is not installed")
+                f"upgrade: package '{missing[0]}' is not installed")
         candidate_names = requested
     else:
         candidate_names = sorted(states)
@@ -1469,7 +1469,7 @@ def _plan_upgrade(ctx, names, force):
                                 dep["version"], pkgvercmp):
                 return dep
             raise InvalidArgument(
-                f"pkg upgrade: dependency '{raw}' required by "
+                f"upgrade: dependency '{raw}' required by "
                 f"'{required_by}' conflicts with planned '{dep_name}' "
                 f"{_package_full_version(existing['package'])}")
 
@@ -1485,14 +1485,14 @@ def _plan_upgrade(ctx, names, force):
                 _package_full_version(package), state["full"])
             if comparison < 0:
                 raise InvalidArgument(
-                    f"pkg upgrade: downgrade refused for package "
+                    f"upgrade: downgrade refused for package "
                     f"'{dep_name}': installed {state['full']}, candidate "
                     f"{_package_full_version(package)} "
                     f"(required by '{required_by}', repository "
                     f"'{repo['name']}')")
             if comparison == 0:
                 raise InvalidArgument(
-                    f"pkg upgrade: dependency '{raw}' required by "
+                    f"upgrade: dependency '{raw}' required by "
                     f"'{required_by}' is not satisfied by installed "
                     f"version {state['full']}")
 
@@ -1515,7 +1515,7 @@ def _plan_upgrade(ctx, names, force):
             start = stack.index(name)
             chain = stack[start:] + [name]
             raise InvalidArgument(
-                f"pkg upgrade: dependency cycle: {' -> '.join(chain)}")
+                f"upgrade: dependency cycle: {' -> '.join(chain)}")
 
         entry = planned[name]
         stack.append(name)
@@ -1624,7 +1624,7 @@ def _plan_upgrade(ctx, names, force):
                 if requested is not None:
                     entry = planned[name]
                     raise InvalidArgument(
-                        f"pkg upgrade: upgrade '{name}' "
+                        f"upgrade: upgrade '{name}' "
                         f"{entry['old']['full']} -> "
                         f"{_package_full_version(entry['package'])} "
                         f"refused: {reason}")
@@ -1646,11 +1646,11 @@ def _plan_upgrade(ctx, names, force):
 
             if force:
                 raise InvalidArgument(
-                    f"pkg upgrade: '{name}' {old_text} -> {new_text} "
+                    f"upgrade: '{name}' {old_text} -> {new_text} "
                     f"cannot be applied: {reason}")
             if requested is not None:
                 raise InvalidArgument(
-                    f"pkg upgrade: upgrade '{name}' {old_text} -> "
+                    f"upgrade: upgrade '{name}' {old_text} -> "
                     f"{new_text} cannot be applied: {reason}")
 
             held[name] = reason
@@ -1752,16 +1752,16 @@ def _validate_upgrade_package(entry, package):
     name = entry["package"]["name"]
     if package["name"] != name:
         raise InvalidArgument(
-            f"pkg upgrade: downloaded package name '{package['name']}' "
+            f"upgrade: downloaded package name '{package['name']}' "
             f"does not match index name '{name}'")
     if str(package["version"]) != str(index_package["version"]):
         raise InvalidArgument(
-            f"pkg upgrade: '{name}' downloaded version "
+            f"upgrade: '{name}' downloaded version "
             f"{package['version']} does not match index "
             f"{index_package['version']}")
     if str(package["release"]) != str(index_package["release"]):
         raise InvalidArgument(
-            f"pkg upgrade: '{name}' downloaded release "
+            f"upgrade: '{name}' downloaded release "
             f"{package['release']} does not match index "
             f"{index_package['release']}")
 
@@ -1776,7 +1776,7 @@ def _upgrade_precheck_files(ctx, targets, owners):
     for path, names in sorted(by_path.items()):
         if len(names) > 1:
             raise InvalidArgument(
-                f"pkg upgrade: file conflict in transaction: '{path}' "
+                f"upgrade: file conflict in transaction: '{path}' "
                 f"is provided by {', '.join(sorted(names))}")
 
     transaction = set(targets)
@@ -1785,7 +1785,7 @@ def _upgrade_precheck_files(ctx, targets, owners):
             owner = owners.get(path)
             if owner is not None and owner != name and owner not in transaction:
                 raise InvalidArgument(
-                    f"pkg upgrade: file conflict for '{name}': '{path}' "
+                    f"upgrade: file conflict for '{name}': '{path}' "
                     f"is owned by '{owner}' (requested by '{name}')")
             if owner is None:
                 try:
@@ -1794,7 +1794,7 @@ def _upgrade_precheck_files(ctx, targets, owners):
                     continue
                 if node.is_dir():
                     raise InvalidArgument(
-                        f"pkg upgrade: file conflict for '{name}': "
+                        f"upgrade: file conflict for '{name}': "
                         f"'{path}' is a directory")
 
 
@@ -1820,7 +1820,7 @@ def _apply_upgrade_package(ctx, entry, package, targets):
                          user=ctx.user, cwd="/", home="/")
         except PyOSError as exc:
             raise PyOSError(
-                f"pkg upgrade: failed to write '{target}' for '{name}': "
+                f"upgrade: failed to write '{target}' for '{name}': "
                 f"{exc}")
 
     old_manifest = old.get("manifest") or {}
@@ -1847,7 +1847,7 @@ def _apply_upgrade_package(ctx, entry, package, targets):
         _write_manifest(ctx.fs, ctx.user, name, manifest)
     except PyOSError as exc:
         raise PyOSError(
-            f"pkg upgrade: failed to update installed DB for '{name}': "
+            f"upgrade: failed to update installed DB for '{name}': "
             f"{exc}")
 
     owners = _read_owners(ctx.fs, ctx.user)
@@ -1879,7 +1879,7 @@ def _apply_upgrade_package(ctx, entry, package, targets):
             pass
         except PyOSError as exc:
             raise PyOSError(
-                f"pkg upgrade: failed to prune '{path}' for '{name}': "
+                f"upgrade: failed to prune '{path}' for '{name}': "
                 f"{exc}")
         owners.pop(path, None)
         pruned += 1
@@ -1888,7 +1888,7 @@ def _apply_upgrade_package(ctx, entry, package, targets):
         _write_owners(ctx.fs, ctx.user, owners)
     except PyOSError as exc:
         raise PyOSError(
-            f"pkg upgrade: failed to update file owners for '{name}': "
+            f"upgrade: failed to update file owners for '{name}': "
             f"{exc}")
 
     return pruned
@@ -1933,13 +1933,13 @@ def _upgrade_packages(ctx, names, dry_run=False, force=False):
             text = ctx.fs.read_file(cache_path, ctx.user, "/", "/")
         except PyOSError as exc:
             raise InvalidArgument(
-                f"pkg upgrade: cannot read cached package for "
+                f"upgrade: cannot read cached package for "
                 f"'{name}': {exc}")
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             raise InvalidArgument(
-                f"pkg upgrade: invalid package file for '{name}': "
+                f"upgrade: invalid package file for '{name}': "
                 f"{exc.msg}")
 
         validated = _validate_pkg(ctx, data, cache_path)
@@ -2169,14 +2169,14 @@ def cmd_pkg(ctx, args, stdin):
     if subcmd == "search":
         if not cmd_args:
             raise InvalidArgument(
-                "pkg search: missing query (usage: pkg search <query>)")
+                "search: missing query (usage: pkg search <query>)")
         if len(cmd_args) > 1:
             raise InvalidArgument(
-                "pkg search: too many arguments (usage: pkg search <query>)")
+                "search: too many arguments (usage: pkg search <query>)")
         query = cmd_args[0].strip()
         if not query:
             raise InvalidArgument(
-                "pkg search: empty query (usage: pkg search <query>)")
+                "search: empty query (usage: pkg search <query>)")
         from ..repo import search_packages
 
         return search_packages(ctx, query)
@@ -2186,16 +2186,16 @@ def cmd_pkg(ctx, args, stdin):
         unknown = [a for a in cmd_args
                    if a.startswith("--") and a != "--dry-run"]
         if unknown:
-            raise InvalidArgument(f"pkg install: unknown option '{unknown[0]}'")
+            raise InvalidArgument(f"install: unknown option '{unknown[0]}'")
 
         positional = [a for a in cmd_args if not a.startswith("--")]
         if not positional:
             raise InvalidArgument(
-                "pkg install: missing package name or file "
+                "install: missing package name or file "
                 "(usage: pkg install <name|file.pkg.json> [--dry-run])")
         if len(positional) > 1:
             raise InvalidArgument(
-                "pkg install: too many arguments "
+                "install: too many arguments "
                 "(usage: pkg install <name|file.pkg.json> [--dry-run])")
 
         target = positional[0]
@@ -2210,14 +2210,14 @@ def cmd_pkg(ctx, args, stdin):
                    if a.startswith("--") and a not in allowed]
         if unknown:
             raise InvalidArgument(
-                f"pkg upgrade: unknown option '{unknown[0]}' "
+                f"upgrade: unknown option '{unknown[0]}' "
                 "(usage: pkg upgrade [<name>...] [--dry-run] [--force])")
 
         positional = [a for a in cmd_args if not a.startswith("--")]
         for name in positional:
             if not _UPGRADE_NAME_RE.match(name):
                 raise InvalidArgument(
-                    f"pkg upgrade: invalid package name '{name}' "
+                    f"upgrade: invalid package name '{name}' "
                     "(version specs are not supported)")
 
         return _upgrade_packages(
@@ -2231,16 +2231,16 @@ def cmd_pkg(ctx, args, stdin):
                    if a.startswith("--") and a not in allowed]
         if unknown:
             raise InvalidArgument(
-                f"pkg remove: unknown option '{unknown[0]}' "
+                f"remove: unknown option '{unknown[0]}' "
                 "(usage: pkg remove <name> [--force] [--dry-run])")
         positional = [a for a in cmd_args if not a.startswith("--")]
         if not positional:
             raise InvalidArgument(
-                "pkg remove: missing package name "
+                "remove: missing package name "
                 "(usage: pkg remove <name> [--force] [--dry-run])")
         if len(positional) > 1:
             raise InvalidArgument(
-                "pkg remove: too many arguments "
+                "remove: too many arguments "
                 "(usage: pkg remove <name> [--force] [--dry-run])")
         return _remove_package(ctx, positional[0],
                                force="--force" in cmd_args,
@@ -2252,7 +2252,7 @@ def cmd_pkg(ctx, args, stdin):
     elif subcmd == "info":
         if not cmd_args:
             raise InvalidArgument(
-                "pkg info: missing package name (usage: pkg info <name>)")
+                "info: missing package name (usage: pkg info <name>)")
         return _show_package_info(ctx, cmd_args[0])
 
     elif subcmd == "pack":
