@@ -234,6 +234,40 @@ def test_jobs_shows_done_with_code_for_normal_background_completion(
     assert "Done(1)" in out
 
 
+def test_wait_prints_done_with_code(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("false &")
+    capsys.readouterr()
+
+    sh.handle_line("wait")
+    out = capsys.readouterr().out
+
+    assert "Done(1)" in out
+
+
+def test_jobs_and_wait_use_same_done_format(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("sleep 1 &")
+    capsys.readouterr()
+
+    sh.handle_line("wait")
+    wait_lines = [
+        line for line in capsys.readouterr().out.splitlines()
+        if "Done(" in line
+    ]
+    assert len(wait_lines) == 1
+
+    sh.handle_line("jobs")
+    jobs_lines = [
+        line for line in capsys.readouterr().out.splitlines()
+        if "Done(" in line
+    ]
+    assert len(jobs_lines) == 1
+    assert wait_lines[0] == jobs_lines[0]
+
+
 # ---------------------------------------------------------------------------
 # worker isolation / foreground exit status
 # ---------------------------------------------------------------------------

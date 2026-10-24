@@ -654,6 +654,11 @@ class Shell:
         """Задание завершено: worker успел или процесс уже мёртв (kill)."""
         return job["done"] or not job["proc"].is_alive
 
+    @staticmethod
+    def _format_job_line(job, status):
+        """Единый формат строки задания для jobs и сообщения о завершении."""
+        return f"[{job['id']}] {status:<7} {job['cmdline']}"
+
     def _wait_job(self, job):
         """Крутит тики, пока задание не завершится, и возвращает его код."""
         while not self._job_finished(job):
@@ -762,7 +767,8 @@ class Shell:
                     self.exit_code = saved_exit
                 p.exit_code = code
             job["done"] = True
-            self.write_stdout(f"[{job['id']}] Done    {cmdline}")
+            self.write_stdout(self._format_job_line(
+                job, f"Done({p.exit_code})"))
 
         if is_sleep:
             proc.remaining = 0
@@ -873,7 +879,7 @@ class Shell:
                 status = f"Done({job['proc'].exit_code})"
             else:
                 status = "Running"
-            self.write_stdout(f"[{job['id']}] {status:<7} {job['cmdline']}")
+            self.write_stdout(self._format_job_line(job, status))
         return None
 
     def _bi_wait(self, args, stdin, user):
