@@ -2181,9 +2181,10 @@ def cmd_pkg(ctx, args, stdin):
     subcmd = args[0]
     cmd_args = args[1:]
 
-    # pkg repo list и pkg search доступны всем, остальные pkg — только root.
+    # pkg repo list, pkg search, pkg list и pkg info доступны всем;
+    # изменяющие пакетные команды — только root.
     repo_list = subcmd == "repo" and cmd_args[:1] == ["list"]
-    read_only = (repo_list or subcmd == "search"
+    read_only = (repo_list or subcmd in ("search", "list", "info")
                  or subcmd in ("help", "--help", "-h"))
     if not read_only and ctx.user.uid != 0:
         raise PermissionDenied(message="pkg: only root can manage packages")

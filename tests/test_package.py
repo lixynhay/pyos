@@ -6,7 +6,12 @@ import tempfile
 
 import pytest
 
-from pyos.errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
+from pyos.errors import (
+    InvalidArgument,
+    NoSuchFileOrDirectory,
+    PermissionDenied,
+    PyOSError,
+)
 from pyos.shell import Shell
 
 
@@ -308,13 +313,46 @@ package() {
 # -- Работа от обычного пользователя ----------------------------------------
 
 def test_pkg_requires_root(kernel, user):
-    """pkg без root выдаёт ошибку."""
+    """Изменяющие pkg-команды без root выдают ошибку."""
     from pyos.commands.package_cmds import cmd_pkg
-    from pyos.context import Context
 
-    ctx = Context(kernel, user, "/home/user")
+    ctx = _ctx(kernel, user)
     with pytest.raises(PyOSError, match="only root"):
-        cmd_pkg(ctx, ["list"], "")
+        cmd_pkg(ctx, ["install", "demo"], "")
+
+
+def test_pkg_list_available_to_non_root(kernel, user):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    result = cmd_pkg(_ctx(kernel, user), ["list"], "")
+
+    assert "no packages installed" in result or "Package" in result
+
+
+def test_pkg_info_available_to_non_root(kernel, root, user):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    _write_pkg(kernel, root, _make_package(), "/root/pkg.json")
+    cmd_pkg(_ctx(kernel, root), ["install", "/root/pkg.json"], "")
+
+    result = cmd_pkg(_ctx(kernel, user), ["info", "demo"], "")
+
+    assert "Package:    demo" in result
+    assert "Status: installed" in result
+
+
+def test_pkg_install_still_root_only(kernel, user):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    with pytest.raises(PermissionDenied):
+        cmd_pkg(_ctx(kernel, user), ["install", "demo"], "")
+
+
+def test_pkg_remove_still_root_only(kernel, user):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    with pytest.raises(PermissionDenied):
+        cmd_pkg(_ctx(kernel, user), ["remove", "demo"], "")
 
 
 # -- Сравнение версий --------------------------------------------------------

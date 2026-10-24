@@ -297,15 +297,17 @@ pkg repo disable <name>
 | Команда | Кто может выполнять |
 |---|---|
 | `pkg install`, `pkg upgrade`, `pkg remove`, `pkg pack` | root |
-| `pkg list`, `pkg info` | root (текущее поведение) |
+| `pkg list`, `pkg info` | все пользователи |
 | `pkg repo add`, `remove`, `update`, `enable`, `disable` | root |
 | `pkg search` | все пользователи |
 | `pkg repo list` | все пользователи |
 | `pkg help` / `pkg` без аргументов | все пользователи |
 | `makepkg` | root |
 
-Read-only командам (`pkg search`, `pkg repo list`) сеть и installed DB не нужны:
-они читают только кэш индексов.
+Read-only команды (`pkg search`, `pkg list`, `pkg info`, `pkg repo list`)
+не требуют root. `pkg search` и `pkg repo list` читают только кэш индексов;
+`pkg list` — installed DB; `pkg info` — installed DB, legacy-кэш пакетов и
+кэши индексов репозиториев (без сети и без автообновления).
 
 #### Установка по имени и кэш
 
