@@ -652,8 +652,22 @@ def test_list_shows_installed_packages(kernel, root):
     result = cmd_pkg(ctx, ["list"], "")
     assert "alpha" in result
     assert "beta" in result
-    assert "1.0" in result
-    assert "2.5" in result
+    assert "1.0-1" in result
+    assert "2.5-1" in result
+
+
+def test_pkg_list_shows_version_release(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package(name="demo", version="2.1"),
+               "/root/demo.pkg.json")
+    cmd_pkg(ctx, ["install", "/root/demo.pkg.json"], "")
+
+    result = cmd_pkg(ctx, ["list"], "")
+
+    assert "Version-Release" in result
+    assert "2.1-1" in result
 
 
 def test_info_shows_package_metadata(kernel, root):

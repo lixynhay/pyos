@@ -2057,12 +2057,17 @@ def _list_packages(ctx):
     if not names:
         return "pkg: no packages installed"
 
-    lines = [f"{'Package':<20} Version"]
-    lines.append("-" * 40)
+    lines = [f"{'Package':<20} Version-Release"]
+    lines.append("-" * 48)
     for name in names:
         manifest = _read_manifest(ctx.fs, ctx.user, name)
-        ver = manifest.get("pkgver", "?") if manifest else "?"
-        desc = manifest.get("pkgdesc", "") if manifest else ""
+        if manifest:
+            version, release = _manifest_identity(manifest)
+            ver = f"{version}-{release}"
+            desc = manifest.get("pkgdesc", "")
+        else:
+            ver = "?"
+            desc = ""
         desc_str = f"  # {desc}" if desc else ""
         lines.append(f"{name:<20} {ver}{desc_str}")
     return "\n".join(lines)
