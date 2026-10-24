@@ -383,7 +383,10 @@ def cmd_stat(ctx, args, stdin):
         node = ctx.fs.lookup(path, ctx.cwd, ctx.home, follow=False,
                              user=ctx.user)
         owner = ctx.users.get_by_uid(node.uid)
-        lines.append(f"  File: {ctx.fs.path_of(node)}")
+        name = ctx.fs.path_of(node)
+        if node.is_link():
+            name = f"{name} -> {node.target}"
+        lines.append(f"  File: {name}")
         lines.append(f"  Size: {getattr(node, 'size', 0)}")
         lines.append(f" Inode: {node.inode}  Links: {node.nlink}  Type: {node.kind}")
         lines.append(f"Access: ({node.mode:04o}/{node.perm_string()})  "

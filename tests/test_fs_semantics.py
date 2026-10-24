@@ -437,10 +437,21 @@ def test_stat_explicit_symlink_shows_link(kernel, root, capsys):
 
     sh = Shell(kernel, root)
     out = _run(sh, capsys, "stat /tmp/lnk")
-    assert "File: /tmp/lnk" in out
-    assert "File: /tmp/t" not in out
+    assert "File: /tmp/lnk -> /tmp/t" in out
     assert "Type: link" in out
     assert "Access: (0777/lrwxrwxrwx)" in out
+
+
+def test_stat_dangling_symlink_shows_link(kernel, root, capsys):
+    # Висячий symlink: stat показывает ссылку и цель, без No such file.
+    fs = kernel.fs
+    fs.symlink("/tmp/nope", "/tmp/dang", root, "/", "/")
+
+    sh = Shell(kernel, root)
+    out = _run(sh, capsys, "stat /tmp/dang")
+    assert "File: /tmp/dang -> /tmp/nope" in out
+    assert "Type: link" in out
+    assert "No such file" not in out
 
 
 def test_ls_l_dangling_symlink_shows_link(kernel, root, capsys):
