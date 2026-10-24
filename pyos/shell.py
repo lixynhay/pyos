@@ -904,7 +904,7 @@ class Shell:
         active = [j for j in self.jobs if not j["done"]]
         if not active:
             self.write_stderr("bg: no current job")
-            return 1
+            return None, 1
         job = active[-1]
         self.write_stdout(f"[{job['id']}] {job['cmdline']} &")
         return None

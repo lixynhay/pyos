@@ -167,6 +167,29 @@ def test_fg_waits_until_done_not_blind_run_until(kernel, root, capsys):
 
 
 # ---------------------------------------------------------------------------
+# bg
+# ---------------------------------------------------------------------------
+
+def test_bg_without_jobs_writes_stderr_and_returns_one(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("bg")
+    captured = capsys.readouterr()
+
+    assert "bg: no current job" in captured.err
+    assert sh.last_code == 1
+
+
+def test_bg_without_jobs_stdout_empty(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("bg")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+
+
+# ---------------------------------------------------------------------------
 # jobs output
 # ---------------------------------------------------------------------------
 
