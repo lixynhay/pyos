@@ -789,6 +789,43 @@ def test_install_dry_run_does_not_write(kernel, root):
                          root, "/", "/")
 
 
+def test_pkg_install_local_dry_run_format(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    _write_pkg(kernel, root, _make_package(
+        name="demo", version="2.1", release=3), "/tmp/demo.pkg.json")
+
+    result = cmd_pkg(ctx, ["install", "/tmp/demo.pkg.json", "--dry-run"], "")
+
+    assert result == (
+        "pkg: would install 'demo' "
+        "(version 2.1-3, 1 file, source /tmp/demo.pkg.json)")
+
+
+def test_pkg_install_dry_run_singular_plural_files(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    two_files = [
+        {"path": "/usr/bin/demo", "mode": "0755", "owner": "root",
+         "group": "root", "encoding": "utf-8", "content": "a"},
+        {"path": "/usr/share/demo", "mode": "0644", "owner": "root",
+         "group": "root", "encoding": "utf-8", "content": "b"},
+    ]
+    _write_pkg(kernel, root, _make_package(name="one", version="1.0"),
+               "/tmp/one.pkg.json")
+    _write_pkg(kernel, root, _make_package(
+        name="two", version="1.0", files=two_files), "/tmp/two.pkg.json")
+
+    single = cmd_pkg(ctx, ["install", "/tmp/one.pkg.json", "--dry-run"], "")
+    plural = cmd_pkg(ctx, ["install", "/tmp/two.pkg.json", "--dry-run"], "")
+
+    assert "1 file" in single
+    assert "1 files" not in single
+    assert "2 files" in plural
+
+
 def test_remove_dry_run_does_not_delete(kernel, root):
     from pyos.commands.package_cmds import cmd_pkg
 

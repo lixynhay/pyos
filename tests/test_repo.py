@@ -1199,6 +1199,20 @@ def test_install_by_name_dry_run_does_not_write(kernel, root):
             _package_cache("local", "hello", "1.0"), root, "/", "/")
 
 
+def test_pkg_install_repo_dry_run_format(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.5", "release": 2},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["install", "hello", "--dry-run"], "")
+
+    assert result == (
+        "pkg: would install 'hello' "
+        "(version 1.5-2, files unknown, source local)")
+
+
 def test_install_by_name_calls_existing_file_installer(kernel, root):
     from pyos.commands import package_cmds
 
@@ -1374,9 +1388,9 @@ def test_resolve_dry_run_prints_full_plan_in_order(kernel, root):
 
     result = cmd_pkg(ctx, ["install", "a", "--dry-run"], "")
 
-    lines = [line.strip() for line in result.splitlines()
-             if line.startswith("  ")]
-    assert [line.split()[0] for line in lines] == ["c", "b", "a"]
+    lines = [line for line in result.splitlines()
+             if line.startswith("pkg: would install")]
+    assert [line.split("'")[1] for line in lines] == ["c", "b", "a"]
     assert _manifest(kernel, root, "a") is None
     with pytest.raises(NoSuchFileOrDirectory):
         kernel.fs.lookup(

@@ -1108,14 +1108,16 @@ def install_package_by_name(ctx, target, *, dry_run=False, installer,
             return False
 
     if dry_run:
-        lines = ["pkg: would install:"]
+        from .commands.package_cmds import _dry_run_message
+
+        lines = []
         for repo, package, op, version, _required_by in plan:
-            marker = ""
+            line = _dry_run_message(
+                package["name"], package["version"], package["release"],
+                repo["name"])
             if is_installed(package["name"], op, version):
-                marker = " (already installed)"
-            lines.append(
-                f"  {package['name']} {_package_full_version(package)} "
-                f"[{repo['name']}]{marker}")
+                line += " (already installed)"
+            lines.append(line)
         return "\n".join(lines)
 
     results = []

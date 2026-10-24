@@ -1165,6 +1165,18 @@ def _installed_satisfies(ctx, pkgname, op, version):
     return _version_matches(installed, op, version, pkgvercmp)
 
 
+def _files_phrase(count):
+    """Грамматика: ``1 file`` / ``N files``."""
+    return f"{count} file" if count == 1 else f"{count} files"
+
+
+def _dry_run_message(name, version, release, source, files=None):
+    """Единый шаблон сообщения dry-run для файла и репозитория."""
+    files_text = "files unknown" if files is None else _files_phrase(files)
+    return (f"pkg: would install '{name}' "
+            f"(version {version}-{release}, {files_text}, source {source})")
+
+
 def _install_named_package(ctx, target, dry_run=False):
     """Устанавливает пакет по имени из репозитория или из кэша makepkg."""
     from ..repo import install_package_by_name, read_repos
@@ -1272,8 +1284,8 @@ def _install_package_file(ctx, path, dry_run=False):
             f"pkg: file conflict in '{name}':\n" + "\n".join(file_conflicts))
 
     if dry_run:
-        return (f"pkg: would install '{name}' "
-                f"(version {version}-{release}, {len(pkg['files'])} files)")
+        return _dry_run_message(
+            name, version, release, path, len(pkg["files"]))
 
     for entry in pkg["files"]:
         target = entry["path"]
