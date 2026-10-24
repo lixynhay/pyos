@@ -160,6 +160,79 @@ def test_rm_non_existent(kernel, root, capsys):
     assert "No such file" in captured.out + captured.err
 
 
+def test_ls_missing_path_error_to_stderr_and_code_two(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("ls /nonexistent_path_xyz")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "No such file or directory" in captured.err
+    assert sh.last_code == 2
+
+
+def test_rm_missing_path_error_to_stderr_and_code_two(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("rm /tmp/nonexistent")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "No such file or directory" in captured.err
+    assert sh.last_code == 2
+
+
+def test_ls_permission_denied_error_stream_and_code(
+        kernel, root, user, capsys):
+    kernel.fs.mkdir("/tmp/closed", root)
+    kernel.fs.chmod("/tmp/closed", 0o700, root)
+    sh = Shell(kernel, user)
+
+    sh.handle_line("ls /tmp/closed")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "Permission denied" in captured.err
+    assert sh.last_code == 13
+
+
+def test_rm_permission_denied_error_stream_and_code(
+        kernel, root, user, capsys):
+    kernel.fs.create_file("/root/secret.txt", root, data="x", mode=0o600)
+    sh = Shell(kernel, user)
+
+    sh.handle_line("rm /root/secret.txt")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "Permission denied" in captured.err
+    assert sh.last_code == 13
+
+
+def test_ls_success_keeps_stdout_and_zero_code(kernel, root, capsys):
+    kernel.fs.create_file("/tmp/ok.txt", root, data="x")
+    sh = Shell(kernel, root)
+
+    sh.handle_line("ls /tmp/ok.txt")
+    captured = capsys.readouterr()
+
+    assert "ok.txt" in captured.out
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_rm_success_keeps_stdout_empty_and_zero_code(kernel, root, capsys):
+    kernel.fs.create_file("/tmp/gone.txt", root, data="x")
+    sh = Shell(kernel, root)
+
+    sh.handle_line("rm /tmp/gone.txt")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
 def test_rm_recursive(kernel, root):
     fs = kernel.fs
     fs.mkdir("/tmp/rmdir_test", root)

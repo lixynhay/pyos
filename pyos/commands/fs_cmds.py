@@ -1,5 +1,6 @@
 """Команды для работы с файловой системой."""
 
+import sys
 import time
 
 from ..errors import (
@@ -13,6 +14,20 @@ from ..errors import (
     PyOSError,
 )
 from .registry import register
+
+
+def _emit_error(ctx, message):
+    """Пишет сообщение об ошибке в stderr (или в stderr процесса)."""
+    if ctx.shell is not None:
+        ctx.shell.write_stderr(message)
+    else:
+        print(message, file=sys.stderr)
+
+
+def _report_errors(ctx, errors):
+    """Отправляет накопленные ошибки ``(message, errno)`` в stderr."""
+    for message, _code in errors:
+        _emit_error(ctx, message)
 
 
 def _fmt_time(ts: float) -> str:
@@ -43,6 +58,7 @@ def cmd_ls(ctx, args, stdin):
         paths = [ctx.cwd]
 
     out_lines = []
+    errors = []
     multi = len(paths) > 1
     for idx, path in enumerate(paths):
         try:
@@ -50,14 +66,17 @@ def cmd_ls(ctx, args, stdin):
             node = ctx.fs.lookup(path, ctx.cwd, ctx.home,
                                  follow=not long_fmt, user=ctx.user)
         except PyOSError as exc:
-            out_lines.append(f"ls: cannot access '{path}': {exc.message}")
+            errors.append(
+                (f"ls: cannot access '{path}': {exc.message}", exc.errno or 1))
             continue
 
         if node.is_dir():
             try:
                 entries = ctx.fs.listdir(path, ctx.user, ctx.cwd, ctx.home)
             except PyOSError as exc:
-                out_lines.append(f"ls: cannot open directory '{path}': {exc.message}")
+                errors.append(
+                    (f"ls: cannot open directory '{path}': {exc.message}",
+                     exc.errno or 1))
                 continue
             if not show_all:
                 entries = [e for e in entries if not e.name.startswith(".")]
@@ -77,6 +96,9 @@ def cmd_ls(ctx, args, stdin):
                 out_lines.append(_long_line(ctx, node, human))
             else:
                 out_lines.append(node.name)
+    if errors:
+        _report_errors(ctx, errors)
+        return "\n".join(out_lines), errors[-1][1]
     return "\n".join(out_lines)
 
 
@@ -198,16 +220,22 @@ def cmd_rm(ctx, args, stdin):
         try:
             ctx.fs.unlink(path, ctx.user, ctx.cwd, ctx.home, recursive=recursive)
         except IsADirectory:
-            errors.append(f"rm: cannot remove '{path}': Is a directory")
+            errors.append((f"rm: cannot remove '{path}': Is a directory",
+                           IsADirectory.errno))
         except DirectoryNotEmpty:
-            errors.append(f"rm: cannot remove '{path}': Directory not empty")
+            errors.append((f"rm: cannot remove '{path}': Directory not empty",
+                           DirectoryNotEmpty.errno))
         except NoSuchFileOrDirectory:
             if not force:
-                errors.append(f"rm: cannot remove '{path}': No such file or directory")
+                errors.append(
+                    (f"rm: cannot remove '{path}': No such file or directory",
+                     NoSuchFileOrDirectory.errno))
         except PyOSError as exc:
-            errors.append(f"rm: cannot remove '{path}': {exc.message}")
+            errors.append((f"rm: cannot remove '{path}': {exc.message}",
+                           exc.errno or 1))
     if errors:
-        return ("\n".join(errors), 1)
+        _report_errors(ctx, errors)
+        return None, errors[-1][1]
     return None
 
 
