@@ -93,3 +93,41 @@ def test_input_redirect_error_sets_exit_code(kernel, root, capsys):
 
     sh.handle_line("echo $?")
     assert capsys.readouterr().out.strip() == "1"
+
+
+def test_failed_output_redirect_does_not_print_stdout(kernel, root, capsys):
+    """При ошибке '>' вывод команды не попадает в терминал."""
+    sh = Shell(kernel, root)
+
+    sh.handle_line("echo hi > /nonexistent-root/x")
+    captured = capsys.readouterr()
+
+    assert "hi" not in captured.out
+    assert "hi" not in captured.err
+    assert "No such file or directory" in captured.err
+
+
+def test_failed_output_redirect_returns_errno(kernel, root, capsys):
+    """Неудачный '>' возвращает errno (2), а не универсальную 1."""
+    sh = Shell(kernel, root)
+
+    sh.handle_line("echo hi > /nonexistent-root/x")
+    capsys.readouterr()
+
+    assert sh.last_code == 2
+    assert sh.exit_code == 2
+
+    sh.handle_line("echo $?")
+    assert capsys.readouterr().out.strip() == "2"
+
+
+def test_input_redirect_failure_still_works_as_before(kernel, root, capsys):
+    """'<' по-прежнему не запускает команду и возвращает 1."""
+    sh = Shell(kernel, root)
+
+    sh.handle_line("cat < /tmp/no-such-input.txt")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "No such file or directory" in captured.err
+    assert sh.last_code == 1

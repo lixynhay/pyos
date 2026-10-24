@@ -481,6 +481,7 @@ class Shell:
                 out, err, code = "", "", 0
 
             wrote_file = False
+            redirect_failed = False
             for op, target in redirects:
                 if op in (">", ">>"):
                     try:
@@ -489,13 +490,14 @@ class Shell:
                     except PyOSError as exc:
                         self.write_stderr(
                             f"{argv[0] if argv else 'pyos'}: {target}: {exc.message}")
-                        code = 1
+                        code = exc.errno or 1
+                        redirect_failed = True
 
             if err:
                 self.write_stderr(err)
             if idx < total - 1:
                 stdin_data = out
-            elif not wrote_file:
+            elif not wrote_file and not redirect_failed:
                 self.write_stdout(out)
 
         self.last_code = code
