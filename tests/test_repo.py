@@ -675,6 +675,94 @@ def test_installed_and_owners_db_untouched_by_repo_commands(kernel, root):
     assert kernel.fs.read_file(manifest_path, root, "/", "/") == manifest_before
     assert kernel.fs.read_file(owners_path, root, "/", "/") == owners_before
     assert kernel.fs.read_file("/usr/bin/demo", root, "/", "/") == "demo"
+# -- pkg info из кэшированных индексов -------------------------------------
+
+
+def test_pkg_info_finds_package_in_cached_repo_index(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.5", "release": 2,
+         "description": "cached hello"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["info", "hello"], "")
+
+    assert "Package:    hello" in result
+    assert "Version:    1.5-2" in result
+    assert "cached hello" in result
+    assert "Status: not installed" in result
+    assert _manifest(kernel, root, "hello") is None
+
+
+def test_pkg_info_prefers_installed_over_repo_index(kernel, root):
+    ctx = _ctx(kernel, root)
+    kernel.fs.write_file(
+        "/root/local-hello.pkg.json",
+        json.dumps(_package_json(name="hello", version="2.1")), root, "/", "/")
+    cmd_pkg(ctx, ["install", "/root/local-hello.pkg.json"], "")
+
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "9.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["info", "hello"], "")
+
+    assert "Version:    2.1-1" in result
+    assert "9.0" not in result
+    assert "Status: installed" in result
+
+
+def test_pkg_info_uses_pkgvercmp_for_repo_candidates(kernel, root):
+    ctx = _ctx(kernel, root)
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "tool", "version": "1.9"},
+        {"name": "tool", "version": "1.10"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    result = cmd_pkg(ctx, ["info", "tool"], "")
+
+    assert "Version:    1.10-1" in result
+    assert "1.9-1" not in result
+
+
+def test_pkg_info_ambiguity_same_priority_errors(kernel, root):
+    ctx = _ctx(kernel, root)
+    first = _make_repo(kernel, root, name="arepo", priority=100, packages=[
+        {"name": "hello", "version": "2.0"},
+    ])
+    second = _make_repo(kernel, root, name="brepo", priority=100, packages=[
+        {"name": "hello", "version": "2.0"},
+    ])
+    _use_repos(kernel, root, [first, second])
+
+    with pytest.raises(InvalidArgument, match="ambiguous"):
+        cmd_pkg(ctx, ["info", "hello"], "")
+
+
+def test_pkg_info_does_not_use_network(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [
+        _repo("core", "https://example.com/p/", "http"),
+    ])
+    _cache_index(kernel, root, "core", _index([
+        _entry(name="hello", version="1.5"),
+    ], repo="core"))
+
+    with mock.patch(
+            "pyos.commands.network_cmds._http_get_text",
+            side_effect=AssertionError("network used")), \
+            mock.patch(
+                "pyos.commands.network_cmds._http_get_bytes",
+                side_effect=AssertionError("network used")):
+        result = cmd_pkg(ctx, ["info", "hello"], "")
+
+    assert "Version:    1.5-1" in result
+    assert "Status: not installed" in result
+
+
 # -- pkg search -------------------------------------------------------------
 
 

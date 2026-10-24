@@ -833,6 +833,27 @@ def find_upgrade_candidate(indexes, name, pkgvercmp):
     return same[0]
 
 
+def read_cached_indexes(ctx):
+    """Читает кэшированные индексы включённых репо без сети.
+
+    Возвращает ``(indexes, missing)``: ``indexes`` — список ``(repo, index)``
+    в порядке priority desc/name asc, ``missing`` — имена репо без кэша.
+    """
+    config = read_repos(ctx.fs, ctx.user)
+    repos = [repo for repo in config["repos"] if repo["enabled"]]
+    repos.sort(key=lambda repo: (-repo["priority"], repo["name"]))
+    indexes = []
+    missing = []
+    for repo in repos:
+        try:
+            index = read_cached_index(ctx.fs, ctx.user, repo)
+        except InvalidArgument:
+            missing.append(repo["name"])
+            continue
+        indexes.append((repo, index))
+    return indexes, missing
+
+
 class _DependencyResolver:
     """Жадный DFS-резолвер с post-order планом установки."""
 

@@ -2096,10 +2096,23 @@ def _show_package_info(ctx, pkgname):
     except (NoSuchFileOrDirectory, PyOSError, json.JSONDecodeError):
         pass
 
+    # Затем — кэшированные индексы репозиториев (без сети и без update).
+    from ..repo import find_upgrade_candidate, read_cached_indexes
+
+    indexes, missing = read_cached_indexes(ctx)
+    found = find_upgrade_candidate(indexes, pkgname, pkgvercmp)
+    if found is not None:
+        _repo, package = found
+        return _format_pkg_info(package, status="not installed")
+    if missing and not indexes:
+        raise InvalidArgument(
+            f"pkg: package '{pkgname}' not found "
+            "(no cached repository indexes; run pkg repo update)")
+
     raise InvalidArgument(f"pkg: package '{pkgname}' not found")
 
 
-def _format_pkg_info(data, installed=False):
+def _format_pkg_info(data, installed=False, status=None):
     """Форматирует метаданные пакета для вывода."""
     name = data.get("pkgname", data.get("name", "?"))
     version = data.get("pkgver", data.get("version", "?"))
@@ -2122,7 +2135,9 @@ def _format_pkg_info(data, installed=False):
     conflicts = data.get("conflicts", [])
     if conflicts:
         lines.append(f"Conflicts: {', '.join(conflicts)}")
-    lines.append(f"Status: {'installed' if installed else 'in cache'}")
+    if status is None:
+        status = "installed" if installed else "in cache"
+    lines.append(f"Status: {status}")
     files = data.get("files")
     if files is not None:
         lines.append(f"Files: {len(files)}")
