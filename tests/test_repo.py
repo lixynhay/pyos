@@ -292,7 +292,7 @@ def test_repo_list_shows_entries(kernel, root, user):
     # list доступен обычному пользователю
     result = cmd_pkg(_ctx(kernel, user), ["repo", "list"], "")
     for expected in ("core", "local", "https", "/srv/repo/", "path",
-                     "True", "5", "100"):
+                     "enabled", "5", "100"):
         assert expected in result
 
 
@@ -355,8 +355,39 @@ def test_repo_list_shows_enabled_state(kernel, root):
 
     result = cmd_pkg(ctx, ["repo", "list"], "")
 
-    assert "core" in result and "True" in result
-    assert "local" in result and "False" in result
+    core_line = next(l for l in result.splitlines() if l.startswith("core"))
+    local_line = next(l for l in result.splitlines() if l.startswith("local"))
+    assert "enabled" in core_line
+    assert "disabled" not in core_line
+    assert "disabled" in local_line
+    assert "enabled" not in local_line
+
+
+def test_pkg_repo_list_no_duplicate_enabled_column(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [_repo("core", enabled=True)])
+
+    result = cmd_pkg(ctx, ["repo", "list"], "")
+
+    assert "STATE" in result.splitlines()[0]
+    assert "ENABLED" not in result
+
+
+def test_pkg_repo_list_shows_state(kernel, root):
+    ctx = _ctx(kernel, root)
+    _write_config(kernel, root, [
+        _repo("core", enabled=True),
+        _repo("local", enabled=False),
+    ])
+
+    result = cmd_pkg(ctx, ["repo", "list"], "")
+
+    assert "True" not in result
+    assert "False" not in result
+    core_line = next(l for l in result.splitlines() if l.startswith("core"))
+    local_line = next(l for l in result.splitlines() if l.startswith("local"))
+    assert "enabled" in core_line
+    assert "disabled" in local_line
 
 
 # -- чтение index.json ------------------------------------------------------

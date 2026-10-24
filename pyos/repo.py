@@ -225,16 +225,14 @@ def list_repos(ctx):
         return "repo: no repositories configured"
 
     lines = [
-        f"{'NAME':<16} {'TYPE':<5} {'ENABLED':<8} {'STATE':<9} "
-        f"{'PRIORITY':<9} URL"
+        f"{'NAME':<16} {'TYPE':<5} {'STATE':<9} {'PRIORITY':<9} URL"
     ]
-    lines.append("-" * 82)
+    lines.append("-" * 72)
     for repo in config["repos"]:
         state = "enabled" if repo["enabled"] else "disabled"
         lines.append(
             f"{repo['name']:<16} {repo['type']:<5} "
-            f"{str(repo['enabled']):<8} {state:<9} "
-            f"{repo['priority']:<9} {repo['url']}")
+            f"{state:<9} {repo['priority']:<9} {repo['url']}")
     return "\n".join(lines)
 
 
