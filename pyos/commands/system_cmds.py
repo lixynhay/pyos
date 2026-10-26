@@ -3,7 +3,12 @@
 import sys
 import time
 
-from ..errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
+from ..errors import (
+    InvalidArgument,
+    NoSuchFileOrDirectory,
+    PermissionDenied,
+    PyOSError,
+)
 from .registry import all_commands, get, register
 
 
@@ -59,12 +64,15 @@ def cmd_uname(ctx, args, stdin):
     return k.name
 
 
-@register("hostname", usage="hostname", summary="Имя хоста", category="system")
+@register("hostname", usage="hostname [name]", summary="Имя хоста",
+          category="system")
 def cmd_hostname(ctx, args, stdin):
-    if args:
-        ctx.kernel.hostname = args[0]
-        return None
-    return ctx.kernel.hostname
+    if not args:
+        return ctx.kernel.hostname
+    if ctx.user is None or not ctx.user.is_root:
+        raise PermissionDenied()
+    ctx.kernel.hostname = args[0]
+    return None
 
 
 @register("date", usage="date", summary="Текущая дата и время",

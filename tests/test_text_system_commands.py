@@ -336,6 +336,61 @@ def test_hostname_set(kernel, root, capsys):
     assert capsys.readouterr().out.strip() == "mybox"
 
 
+def test_hostname_read_available_to_nonroot(kernel, user, capsys):
+    sh = Shell(kernel, user)
+    sh.handle_line("hostname")
+    captured = capsys.readouterr()
+
+    assert captured.out.strip() == "pyos"
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_hostname_change_root_succeeds(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("hostname mybox")
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert kernel.hostname == "mybox"
+
+
+def test_hostname_change_nonroot_denied_stderr_code_13(kernel, user, capsys):
+    sh = Shell(kernel, user)
+    before = kernel.hostname
+    sh.handle_line("hostname hacked")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "Permission denied" in captured.err
+    assert sh.last_code == 13
+    assert kernel.hostname == before
+
+
+def test_hostname_change_updates_prompt_only_for_root(kernel, root, user,
+                                                     capsys):
+    user_shell = Shell(kernel, user)
+    root_shell = Shell(kernel, root)
+    user_prompt = user_shell.prompt()
+
+    user_shell.handle_line("hostname hacked")
+    capsys.readouterr()
+
+    assert user_shell.prompt() == user_prompt
+    assert "hacked" not in root_shell.prompt()
+    user_shell.handle_line("uname -n")
+    assert capsys.readouterr().out.strip() == "pyos"
+
+    root_shell.handle_line("hostname rootbox")
+    capsys.readouterr()
+
+    assert "rootbox" in root_shell.prompt()
+    assert "rootbox" in user_shell.prompt()
+    user_shell.handle_line("uname -n")
+    assert capsys.readouterr().out.strip() == "rootbox"
+
+
 # -- date -------------------------------------------------------------------
 
 
