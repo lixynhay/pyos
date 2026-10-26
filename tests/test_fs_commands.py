@@ -66,6 +66,77 @@ def test_ls_non_existent(kernel, root, capsys):
     assert "No such" in captured.out + captured.err
 
 
+# --- ls -l: POSIX-подобный total в 1K-блоках -------------------------------
+# Это UX-фикс формата вывода, а не ослабление проверок размера: размеры
+# отдельных файлов в длинном листинге не меняются.
+
+def _ls_total(out):
+    return int(out.splitlines()[0].split()[1])
+
+
+def test_ls_l_total_uses_1k_blocks(kernel, root, capsys):
+    """total = (сумма байт + 1023) // 1024, а не сумма байт."""
+    fs = kernel.fs
+    fs.mkdir("/tmp/ls_total", root)
+    fs.create_file("/tmp/ls_total/a", root, data="1234567")   # 7 байт
+    fs.create_file("/tmp/ls_total/b", root, data="x" * 20)    # 20 байт
+    fs.create_file("/tmp/ls_total/c", root, data="abcdefg")   # 7 байт
+
+    Shell(kernel, root).handle_line("ls -l /tmp/ls_total")
+    assert _ls_total(capsys.readouterr().out) == 1
+
+
+def test_ls_l_empty_dir_total_zero(kernel, root, capsys):
+    kernel.fs.mkdir("/tmp/ls_empty", root)
+    Shell(kernel, root).handle_line("ls -l /tmp/ls_empty")
+    assert _ls_total(capsys.readouterr().out) == 0
+
+
+def test_ls_l_small_files_total_one_block(kernel, root, capsys):
+    fs = kernel.fs
+    fs.mkdir("/tmp/ls_small", root)
+    fs.create_file("/tmp/ls_small/a", root, data="ab")   # 2 байта
+    Shell(kernel, root).handle_line("ls -l /tmp/ls_small")
+    assert _ls_total(capsys.readouterr().out) == 1
+
+
+def test_ls_l_directory_sizes_still_reported_as_before_in_long_listing(
+        kernel, root, capsys):
+    """total в блоках не меняет размеры отдельных файлов и каталогов."""
+    fs = kernel.fs
+    fs.mkdir("/tmp/ls_sizes", root)
+    fs.mkdir("/tmp/ls_sizes/sub", root)
+    fs.create_file("/tmp/ls_sizes/file", root, data="0123456789")  # 10 байт
+
+    Shell(kernel, root).handle_line("ls -l /tmp/ls_sizes")
+    lines = capsys.readouterr().out.splitlines()[1:]
+    sizes = {line.split()[-1]: line.split()[4] for line in lines}
+    assert sizes["file"] == "10"
+    assert sizes["sub"] == str(fs.lookup("/tmp/ls_sizes/sub", root, "/", "/").size)
+
+
+def test_ls_l_symlink_hardlink_permissions_regression(kernel, root, capsys):
+    fs = kernel.fs
+    fs.mkdir("/tmp/ls_links", root)
+    fs.create_file("/tmp/ls_links/target", root, data="hi")
+    Shell(kernel, root).handle_line("ln /tmp/ls_links/target /tmp/ls_links/hard")
+    Shell(kernel, root).handle_line(
+        "ln -s /tmp/ls_links/target /tmp/ls_links/link")
+    Shell(kernel, root).handle_line("chmod 755 /tmp/ls_links/target")
+    capsys.readouterr()
+
+    Shell(kernel, root).handle_line("ls -l /tmp/ls_links")
+    lines = capsys.readouterr().out.splitlines()[1:]
+    link_line = next(line for line in lines if " link -> " in line)
+    hard_line = next(line for line in lines if line.endswith(" hard"))
+    target_line = next(line for line in lines if line.endswith(" target"))
+
+    assert link_line.startswith("l")
+    assert hard_line.split()[1] == "2"
+    assert target_line.split()[0] == "-rwxr-xr-x"
+    assert target_line.split()[4] == "2"
+
+
 # ============================================================================
 # cat
 # ============================================================================

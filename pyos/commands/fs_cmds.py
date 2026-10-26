@@ -85,8 +85,10 @@ def cmd_ls(ctx, args, stdin):
                     out_lines.append("")
                 out_lines.append(f"{path}:")
             if long_fmt:
-                total = sum(getattr(e, "size", 0) for e in entries)
-                out_lines.append(f"total {_fmt_size(total, human)}")
+                # POSIX-подобный total: сумма размеров в 1K-блоках.
+                total_bytes = sum(getattr(e, "size", 0) for e in entries)
+                total_blocks = (total_bytes + 1023) // 1024
+                out_lines.append(f"total {_fmt_size(total_blocks, human)}")
                 for e in entries:
                     out_lines.append(_long_line(ctx, e, human))
             else:
