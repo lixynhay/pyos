@@ -9,7 +9,7 @@
 ## Запуск
 
 ```bash
-# из каталога D:\code
+# из корня репозитория
 python -m pyos
 ```
 
@@ -548,7 +548,7 @@ ulimit -f 4                          # лимит 4 КБ на запись че�
 ## Тестирование
 
 ```bash
-# из каталога D:\code
+# из корня репозитория
 python -m pytest tests
 ```
 
@@ -558,6 +558,9 @@ python -m pytest tests
 - Фикстуры в `tests/conftest.py`: `kernel`, `root`, `user`, `shell`.
 - Новые тесты добавляются как `tests/test_*.py`; интеграционные тесты идут
   через `Shell(...).handle_line(...)` + `capsys`.
+- Порядок работы с ПК и телефоном через Codespaces — в
+  [docs/DEV_WORKFLOW.md](../docs/DEV_WORKFLOW.md). CI прогоняет эту же
+  команду pytest на push в `main` и на pull request.
 
 ## Архитектура
 
