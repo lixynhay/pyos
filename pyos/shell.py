@@ -471,7 +471,9 @@ class Shell:
                 if background:
                     self.execute_background(self._tokenize_chain(segments))
                 else:
-                    self.run_segments(segments)
+                    code = self.run_segments(segments)
+                    self.last_code = code
+                    self.exit_code = code
             except PyOSError as exc:
                 # Ошибка раскрытия переменных прерывает строку целиком.
                 self.write_stderr(f"pyos: {exc.message}")

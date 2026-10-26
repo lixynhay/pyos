@@ -295,6 +295,77 @@ def test_valid_or_chain_still_works(kernel, root, capsys):
     assert captured.err == ""
 
 
+# --- exit code синтаксической ошибки после && / || -------------------------
+
+def test_syntax_error_after_and_sets_last_code_two(kernel, root, capsys):
+    """Пустая команда после && выставляет $? = 2."""
+    sh = Shell(kernel, root)
+    sh.handle_line("echo hi &&")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "hi"
+    assert "syntax error: empty command" in captured.err
+    assert sh.last_code == 2
+    assert sh.exit_code == 2
+
+
+def test_syntax_error_after_or_sets_last_code_two(kernel, root, capsys):
+    """Пустая команда после || выставляет $? = 2, а не код слева."""
+    sh = Shell(kernel, root)
+    sh.handle_line("false ||")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "syntax error: empty command" in captured.err
+    assert sh.last_code == 2
+    assert sh.exit_code == 2
+
+
+def test_syntax_error_does_not_override_previous_stdout(kernel, root, capsys):
+    """Ошибка разбора не подавляет вывод уже выполненной команды."""
+    sh = Shell(kernel, root)
+    sh.handle_line("echo keep-me &&")
+    captured = capsys.readouterr()
+    assert "keep-me" in captured.out
+    assert "syntax error: empty command" in captured.err
+    assert sh.last_code == 2
+
+
+def test_valid_and_chain_still_sets_zero(kernel, root, capsys):
+    """Корректная цепочка && оставляет $? = 0."""
+    sh = Shell(kernel, root)
+    sh.handle_line("echo hi && echo bye")
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["hi", "bye"]
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_valid_or_chain_still_sets_zero(kernel, root, capsys):
+    """Корректная цепочка || после успеха оставляет $? = 0."""
+    sh = Shell(kernel, root)
+    sh.handle_line("echo hi || true")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "hi"
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_short_circuit_after_syntax_error_policy(kernel, root, capsys):
+    """Syntax error — неуспех: || выполняет правую часть, && пропускает."""
+    sh = Shell(kernel, root)
+
+    sh.handle_line("echo hi && || echo recovered")
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["hi", "recovered"]
+    assert "syntax error: empty command" in captured.err
+    assert sh.last_code == 0
+
+    sh.handle_line("&& echo skipped")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "syntax error: empty command" in captured.err
+    assert sh.last_code == 2
+
+
 def test_background_chain_still_works(kernel, root, capsys):
     """Фоновая цепочка && по-прежнему выполняется целиком."""
     sh = Shell(kernel, root)
