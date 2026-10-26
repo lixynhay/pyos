@@ -53,8 +53,8 @@ def login(kernel: Kernel, max_attempts: int = 3):
             return user
         except UserError as exc:
             print(str(exc))
-    print("login: too many failed attempts, falling back to root")
-    return kernel.users.get_by_name("root")
+    print("login: authentication failure", file=sys.stderr)
+    return None
 
 
 def main(argv=None):
@@ -64,6 +64,8 @@ def main(argv=None):
     print(kernel.uname())
     print()
     user = login(kernel)
+    if user is None:
+        return 1
     shell = Shell(kernel, user)
     print(f"Welcome, {user.name}! (uid={user.uid})")
     print()
