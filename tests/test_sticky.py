@@ -9,8 +9,9 @@ POSIX-подобное правило pyos: запись в каталоге с 
   enforcement, теперь проверяют отказ. Имена сохранены по конвенции
   characterization-тестов: правится assert, тест не удаляется.
 * ``# GUARD:`` — корректное поведение, не зависящее от sticky.
-* ``# KNOWN DEFECT:`` — отдельный дефект вне sticky-скоупа (пустые
-  подкаталоги в ``_check_rmtree``), не чинится.
+* ``# POSIX:`` — поведение, которое раньше ошибочно считалось дефектом:
+  ``W|X`` для пустых подкаталогов в ``_check_rmtree`` не нужны, потому что
+  запись удаляется по правам на её родителя.
 
 Тесты детерминированы: без сети, без wall-clock, без реальных процессов ОС.
 """
@@ -200,13 +201,14 @@ def test_sticky_generic_dir_1777_not_only_tmp_currently(
     assert _exists(fs, "/tmp/sub/root_file")
 
 
-def test_rm_r_world_dir_with_empty_locked_subdir_currently_succeeds(
+def test_rm_r_world_dir_with_empty_locked_subdir_succeeds(
         kernel, root, user, capsys):
-    # KNOWN DEFECT (не sticky): _check_rmtree пропускает проверку W|X у
-    # пустых подкаталогов, поэтому rm -r 0777-дерева с пустым 0555-каталогом
-    # внутри проходит. Не чинится в STICKY-2.
+    # POSIX: для удаления directory entry нужны W|X на её родителе; W|X на
+    # самом каталоге нужны только чтобы удалить его детей. У пустого
+    # каталога детей нет, поэтому rm -r 0777-дерева с пустым 0555-подкаталогом
+    # завершается успешно. Это не дефект.
     # Дерево живёт в non-sticky родителе (0777), иначе отказ по sticky на
-    # верхнем entry /tmp замаскировал бы дефект.
+    # верхнем entry /tmp замаскировал бы именно W|X-сценарий.
     fs = kernel.fs
     fs.mkdir("/tmp/holder", root, "/", "/", mode=0o777)
     fs.mkdir("/tmp/holder/world_tree", root, "/", "/", mode=0o777)
@@ -218,6 +220,31 @@ def test_rm_r_world_dir_with_empty_locked_subdir_currently_succeeds(
     assert out == ""
     assert sh.last_code == 0
     assert not _exists(fs, "/tmp/holder/world_tree")
+
+
+def test_rm_r_world_dir_with_nonempty_locked_subdir_denies_without_partial_delete(
+        kernel, root, user, capsys):
+    # POSIX: чтобы удалить файл внутри 0555-каталога, нужны W|X на нём самом.
+    # rm -r отклоняется целиком, без частичного удаления: соседние записи
+    # и содержимое locked-каталога остаются на месте.
+    fs = kernel.fs
+    fs.mkdir("/tmp/holder", root, "/", "/", mode=0o777)
+    fs.mkdir("/tmp/holder/world_tree", root, "/", "/", mode=0o777)
+    fs.mkdir("/tmp/holder/world_tree/sibling", root, "/", "/", mode=0o777)
+    fs.create_file("/tmp/holder/world_tree/sibling/keep", root, "/", "/",
+                   data="keep")
+    fs.mkdir("/tmp/holder/world_tree/locked", root, "/", "/", mode=0o555)
+    fs.create_file("/tmp/holder/world_tree/locked/inside", root, "/", "/",
+                   data="root")
+
+    sh, out = _run(kernel, user, capsys, "rm -r /tmp/holder/world_tree")
+
+    assert "Permission denied" in out
+    assert sh.last_code == 13
+    assert _exists(fs, "/tmp/holder/world_tree")
+    assert _exists(fs, "/tmp/holder/world_tree/sibling/keep")
+    assert fs.read_bytes("/tmp/holder/world_tree/sibling/keep") == b"keep"
+    assert fs.read_bytes("/tmp/holder/world_tree/locked/inside") == b"root"
 
 
 # ============================================================================
