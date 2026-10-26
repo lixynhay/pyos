@@ -294,3 +294,147 @@ def test_background_ampersand_still_works():
     jobs = split_jobs(tokenize("sleep 1 &", {}))
     assert len(jobs) == 1
     assert jobs[0][1] is True
+
+
+# ============================================================================
+# Регрессия: присваивание в одном сегменте и раскрытие в следующем
+# ============================================================================
+
+def test_assignment_before_semicolon_visible_to_next_command(kernel, root,
+                                                             capsys):
+    """VAR=value до ; виден следующей команде той же строки."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X; echo $NAME")
+    assert capsys.readouterr().out.strip() == "X"
+
+
+def test_assignment_before_semicolon_default_operator(kernel, root, capsys):
+    """${VAR:-word} видит присваивание из предыдущего сегмента строки."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X; echo ${NAME:-guest}")
+    assert capsys.readouterr().out.strip() == "X"
+
+
+def test_multiple_assignments_before_semicolon(kernel, root, capsys):
+    """Несколько присваиваний подряд видны последней команде."""
+    shell = Shell(kernel, root)
+    shell.handle_line("A=1; B=2; echo $A$B")
+    assert capsys.readouterr().out.strip() == "12"
+
+
+def test_assignment_before_and_operator(kernel, root, capsys):
+    """VAR=value до && виден следующему сегменту."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X && echo $NAME")
+    assert capsys.readouterr().out.strip() == "X"
+
+
+def test_assignment_before_or_operator(kernel, root, capsys):
+    """VAR=value до || выполняется, печати нет, код 0."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X || echo fail")
+    assert capsys.readouterr().out.strip() == ""
+    assert shell.last_code == 0
+    assert shell._locals.get("NAME") == "X"
+
+
+def test_short_circuit_prevents_assignment(kernel, root, capsys):
+    """Пропущенный по && сегмент не устанавливает переменную."""
+    shell = Shell(kernel, root)
+    shell.handle_line("false && NAME=X; echo ${NAME:-guest}")
+    assert capsys.readouterr().out.strip() == "guest"
+
+
+def test_empty_assignment_default_operator(kernel, root, capsys):
+    """Пустое присваивание и ${VAR:=word} в одной строке."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=; echo ${NAME:-guest}")
+    assert capsys.readouterr().out.strip() == "guest"
+    shell.handle_line("NAME=; echo ${NAME:=guest}; echo $NAME")
+    assert capsys.readouterr().out.strip().splitlines() == ["guest", "guest"]
+
+
+def test_export_assignment_same_line(kernel, root, capsys):
+    """export VAR=value до ; виден следующей команде."""
+    shell = Shell(kernel, root)
+    shell.handle_line("export NAME=X; echo $NAME")
+    assert capsys.readouterr().out.strip() == "X"
+    assert shell.env.get("NAME") == "X"
+
+
+def test_unset_assignment_same_line(kernel, root, capsys):
+    """unset до ; действует на следующую команду той же строки."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X")
+    shell.handle_line("unset NAME; echo ${NAME:-guest}")
+    assert capsys.readouterr().out.strip() == "guest"
+
+
+def test_env_prefix_assignment_does_not_persist(kernel, root, capsys):
+    """VAR=value command не сохраняет переменную в шелле."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X echo hi")
+    assert capsys.readouterr().out.strip() == "hi"
+    shell.handle_line("echo [$NAME]")
+    assert capsys.readouterr().out.strip() == "[]"
+
+
+def test_single_quotes_prevent_expansion_same_line(kernel, root, capsys):
+    """Одинарные кавычки не раскрывают переменную из той же строки."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X; echo '$NAME'")
+    assert capsys.readouterr().out.strip() == "$NAME"
+
+
+def test_double_quotes_expand_assignment_same_line(kernel, root, capsys):
+    """Двойные кавычки раскрывают переменную из того же сегмента строки."""
+    shell = Shell(kernel, root)
+    shell.handle_line('NAME=X; echo "$NAME"')
+    assert capsys.readouterr().out.strip() == "X"
+
+
+def test_backslash_preserved_same_line(kernel, root, capsys):
+    """Экранирование не ломается рядом с присваиванием в той же строке."""
+    shell = Shell(kernel, root)
+    shell.handle_line(r"NAME=X; echo a\ b $NAME")
+    assert capsys.readouterr().out.strip() == "a b X"
+
+
+def test_special_question_mark_same_line(kernel, root, capsys):
+    """$? обновляется между сегментами, $$ остаётся PID init."""
+    shell = Shell(kernel, root)
+    shell.handle_line("false; echo $?")
+    assert capsys.readouterr().out.strip() == "1"
+    shell.handle_line("true; echo $?")
+    assert capsys.readouterr().out.strip() == "0"
+    shell.handle_line("echo $$")
+    assert capsys.readouterr().out.strip() == "1"
+
+
+def test_pipeline_after_assignment_same_line(kernel, root, capsys):
+    """Пайп после присваивания раскрывает переменную и работает как раньше."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X; echo $NAME | tr a-z A-Z")
+    assert capsys.readouterr().out.strip() == "X"
+    shell.handle_line("NAME=X; echo hello | cat")
+    assert capsys.readouterr().out.strip() == "hello"
+
+
+def test_background_after_assignment_same_line(kernel, root, capsys):
+    """Присваивание до фоновой команды сохраняется после wait."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X; sleep 1 &")
+    assert "[1]" in capsys.readouterr().out
+    shell.handle_line("jobs")
+    assert "sleep 1" in capsys.readouterr().out
+    shell.handle_line("wait")
+    assert "Done(0)" in capsys.readouterr().out
+    shell.handle_line("echo $NAME")
+    assert capsys.readouterr().out.strip() == "X"
+
+
+def test_readme_example_name_alice_default_guest(kernel, root, capsys):
+    """Пример из README: NAME=Alice; echo ${NAME:-guest} печатает Alice."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=Alice; echo ${NAME:-guest}")
+    assert capsys.readouterr().out.strip() == "Alice"

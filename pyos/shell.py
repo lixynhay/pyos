@@ -306,6 +306,73 @@ def split_and_or(tokens: list[Token]):
     return segments
 
 
+def _without_empty_segments(segments):
+    """Убирает сегменты, состоящие только из пробелов."""
+    return [(raw, connector) for raw, connector in segments if raw.strip()]
+
+
+def split_raw_jobs(line: str):
+    """Делит строку на задания по ``;`` / ``&`` без раскрытия переменных.
+
+    Возвращает список ``(segments, background)``, где ``segments`` — список
+    пар ``(сырой_текст, коннектор)``, а коннектор — ``"&&"``, ``"||"`` или
+    ``None``. Кавычки и экранирование учитываются, поэтому разделители внутри
+    них не действуют. Одиночный ``|`` остаётся внутри сегмента: пайп
+    разбирается позже, при токенизации сегмента.
+    """
+    jobs = []
+    segments = []
+    start = 0
+    i = 0
+    n = len(line)
+    quote = None
+    while i < n:
+        c = line[i]
+        if quote is not None:
+            if c == "\\" and quote == '"' and i + 1 < n:
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if c == ";":
+            segments.append((line[start:i], None))
+            jobs.append((_without_empty_segments(segments), False))
+            segments = []
+            i += 1
+            start = i
+            continue
+        if c == "&":
+            if i + 1 < n and line[i + 1] == "&":
+                segments.append((line[start:i], "&&"))
+                i += 2
+                start = i
+                continue
+            segments.append((line[start:i], None))
+            jobs.append((_without_empty_segments(segments), True))
+            segments = []
+            i += 1
+            start = i
+            continue
+        if c == "|" and i + 1 < n and line[i + 1] == "|":
+            segments.append((line[start:i], "||"))
+            i += 2
+            start = i
+            continue
+        i += 1
+    segments.append((line[start:], None))
+    jobs.append((_without_empty_segments(segments), False))
+    return jobs
+
+
 # ---------------------------------------------------------------------------
 # Шелл
 # ---------------------------------------------------------------------------
@@ -385,29 +452,81 @@ class Shell:
         return self.exit_code
 
     def handle_line(self, line: str):
+        if not line.strip():
+            return
+        self.history.append(line)
+        for segments, background in split_raw_jobs(line):
+            if not segments:
+                continue
+            try:
+                if background:
+                    self.execute_background(self._tokenize_chain(segments))
+                else:
+                    self.run_segments(segments)
+            except PyOSError as exc:
+                # Ошибка раскрытия переменных прерывает строку целиком.
+                self.write_stderr(f"pyos: {exc.message}")
+                self.last_code = 1
+                self.exit_code = 1
+                return
+
+    # -- окружение и раскрытие переменных -----------------------------------
+    def _segment_env(self):
+        """Окружение раскрытия для очередного сегмента строки."""
         self.env["PWD"] = self.cwd
         self.env["HOME"] = self.user.home
         self.env["USER"] = self.user.name
         self.env["?"] = str(self.last_code)
         self.env.setdefault("$", str(self.kernel.init.pid))
-        if not line.strip():
-            return
-        self.history.append(line)
         # Мёрж локальных и экспортированных переменных для раскрытия $VAR
-        merged = {**self._locals, **self.env}
-        try:
-            tokens = tokenize(line, merged)
-        except PyOSError as exc:
-            self.write_stderr(f"pyos: {exc.message}")
-            self.last_code = 1
-            return
-        for job_tokens, background in split_jobs(tokens):
-            if not job_tokens:
+        return {**self._locals, **self.env}
+
+    def _persist_expansions(self, before, after):
+        """Сохраняет присваивания ``${VAR:=word}`` в состоянии шелла."""
+        for key, value in after.items():
+            if before.get(key) == value:
                 continue
-            if background:
-                self.execute_background(job_tokens)
+            if key in self.env:
+                self.env[key] = value
             else:
-                self.run_and_or(job_tokens)
+                self._locals[key] = value
+
+    def run_segments(self, segments, user=None):
+        """Выполняет сегменты строки, раскрывая переменные перед каждым.
+
+        ``segments`` — пары ``(сырой_текст, коннектор)``. Раскрытие идёт
+        непосредственно перед запуском сегмента, поэтому присваивания из
+        предыдущих сегментов уже видны, а внутри одного конвейера раскрытие
+        остаётся однократным.
+        """
+        code = 0
+        run = True
+        for raw, connector in segments:
+            if run:
+                env = self._segment_env()
+                before = dict(env)
+                tokens = tokenize(raw, env)
+                self._persist_expansions(before, env)
+                code = self.run_and_or(tokens, user)
+            if connector == "&&":
+                run = (code == 0)
+            elif connector == "||":
+                run = (code != 0)
+            else:
+                run = True
+        return code
+
+    def _tokenize_chain(self, segments):
+        """Токенизирует фоновую цепочку целиком, до постановки задания."""
+        env = self._segment_env()
+        before = dict(env)
+        tokens: list[Token] = []
+        for raw, connector in segments:
+            tokens.extend(tokenize(raw, env))
+            if connector:
+                tokens.append(Token(connector, False))
+        self._persist_expansions(before, env)
+        return tokens
 
     # -- выполнение цепочек && / || -----------------------------------------
     def run_and_or(self, tokens, user=None):
