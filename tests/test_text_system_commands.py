@@ -115,6 +115,16 @@ def test_head_pipe(kernel, root, capsys):
     assert len(lines) == 2
 
 
+def test_head_negative_n_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("head -n -1")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "invalid number of lines" in captured.err
+    assert sh.last_code != 0
+
+
 # -- tail -------------------------------------------------------------------
 
 
@@ -139,6 +149,28 @@ def test_tail_small_file(kernel, root, capsys):
     fs.create_file("/tmp/tail_small.txt", root, data="hello\n")
     Shell(kernel, root).handle_line("tail /tmp/tail_small.txt")
     assert capsys.readouterr().out.strip() == "hello"
+
+
+def test_tail_n_zero_prints_empty(kernel, root, capsys):
+    fs = kernel.fs
+    fs.create_file("/tmp/tail_zero.txt", root, data="a\nb\n")
+    sh = Shell(kernel, root)
+    sh.handle_line("tail -n 0 /tmp/tail_zero.txt")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_tail_negative_n_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("tail -n -1")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "invalid number of lines" in captured.err
+    assert sh.last_code != 0
 
 
 # -- sort -------------------------------------------------------------------
@@ -258,6 +290,58 @@ def test_tr_expand_set_escapes():
 def test_cut_fields_pipe(kernel, root, capsys):
     Shell(kernel, root).handle_line("echo 'a:b:c' | cut -d: -f2")
     assert capsys.readouterr().out.strip() == "b"
+
+
+def test_cut_normal_fields_still_work(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("echo 'a:b:c' | cut -d: -f1,3")
+    captured = capsys.readouterr()
+
+    assert captured.out.strip() == "a:c"
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_cut_invalid_field_list_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("echo 'a:b' | cut -d: -fabc")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "invalid field list" in captured.err
+    assert sh.last_code != 0
+
+
+def test_cut_preserves_trailing_empty_line(kernel, root, capsys):
+    fs = kernel.fs
+    fs.create_file("/tmp/cut_empty.txt", root, data="a:b:\nc:d:\n")
+    sh = Shell(kernel, root)
+    sh.handle_line("cut -d: -f3 /tmp/cut_empty.txt")
+    captured = capsys.readouterr()
+
+    assert captured.out == "\n\n"
+    assert len(captured.out.splitlines()) == 2
+    assert sh.last_code == 0
+
+
+@pytest.mark.parametrize("line, expected", [
+    ("echo 'a\nb\nc' | wc -l", "3"),
+    ("echo 'a\nb\nc' | head -n 2", "a\nb"),
+    ("echo 'a\nb\nc' | tail -n 2", "b\nc"),
+    ("echo 'c\nb\na' | sort", "a\nb\nc"),
+    ("echo 'a\na\nb' | uniq", "a\nb"),
+    ("echo 'ab\ncd' | rev", "ba\ndc"),
+    ("echo 'a b' | tr ' ' '-'", "a-b"),
+    ("echo 'a:b:c' | cut -d: -f2", "b"),
+])
+def test_text_pipeline_regression(kernel, root, capsys, line, expected):
+    sh = Shell(kernel, root)
+    sh.handle_line(line)
+    captured = capsys.readouterr()
+
+    assert captured.out.strip() == expected
+    assert captured.err == ""
+    assert sh.last_code == 0
 
 
 # ============================================================================

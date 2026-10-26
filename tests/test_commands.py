@@ -60,6 +60,66 @@ def test_top_header_has_nice_column(kernel, root, capsys):
     assert "CPU" not in out
 
 
+def test_top_n_zero_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("top -n 0")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "must be positive" in captured.err
+    assert sh.last_code != 0
+
+
+def test_top_n_negative_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("top -n -1")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "must be positive" in captured.err
+    assert sh.last_code != 0
+
+
+def test_sleep_negative_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("sleep -1")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "invalid time interval" in captured.err
+    assert sh.last_code != 0
+
+
+def test_sleep_nan_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("sleep nan")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "invalid time interval" in captured.err
+    assert sh.last_code != 0
+
+
+def test_sleep_inf_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("sleep inf")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "invalid time interval" in captured.err
+    assert sh.last_code != 0
+
+
+def test_sleep_zero_allowed(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("sleep 0")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
 def test_error_message_reaches_stderr(kernel, root, capsys):
     """Ошибка пути печатает текст, а не безликое 'Error'."""
     Shell(kernel, root).handle_line("cat /tmp/no-such-file.txt")

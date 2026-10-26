@@ -1,5 +1,6 @@
 """Команды для работы с процессами и планировщиком."""
 
+import math
 import sys
 
 from ..errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
@@ -107,8 +108,12 @@ def cmd_top(ctx, args, stdin):
             iterations = int(args[args.index("-n") + 1])
         except (IndexError, ValueError):
             raise InvalidArgument("top: invalid iteration count")
+        if iterations <= 0:
+            raise InvalidArgument("top: iteration count must be positive")
     elif len(args) == 1 and args[0].isdigit():
         iterations = int(args[0])
+        if iterations <= 0:
+            raise InvalidArgument("top: iteration count must be positive")
 
     frames = []
     for i in range(iterations):
@@ -181,7 +186,12 @@ def cmd_sleep(ctx, args, stdin):
             seconds = float(a)
         except ValueError:
             raise InvalidArgument(f"sleep: invalid time interval '{a}'")
-        total_ticks += int(seconds * TICKS_PER_SECOND)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise InvalidArgument(f"sleep: invalid time interval '{a}'")
+        ticks = seconds * TICKS_PER_SECOND
+        if not math.isfinite(ticks):
+            raise InvalidArgument(f"sleep: invalid time interval '{a}'")
+        total_ticks += int(ticks)
     ctx.kernel.sleep_ticks(total_ticks)
     return None
 

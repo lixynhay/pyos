@@ -193,19 +193,29 @@ def cmd_wc(ctx, args, stdin):
     return " ".join(parts)
 
 
-@register("head", usage="head [-n N] [file ...]", summary="Первые строки",
-          category="text")
-def cmd_head(ctx, args, stdin):
+def _parse_line_count(command, opts):
+    """Разбирает ``-n N`` / ``-N`` и отклоняет отрицательные значения."""
     n = 10
-    opts, pos = _split_opts(args)
     if "-n" in opts:
+        idx = opts.index("-n")
+        raw = opts[idx + 1] if idx + 1 < len(opts) else None
         try:
-            n = int(opts[opts.index("-n") + 1])
-        except (IndexError, ValueError):
-            raise InvalidArgument("head: invalid number of lines")
+            n = int(raw) if raw is not None else None
+        except ValueError:
+            raise InvalidArgument(f"{command}: invalid number of lines")
+        if n is None or n < 0:
+            raise InvalidArgument(f"{command}: invalid number of lines")
     for o in opts:
         if o.startswith("-") and o[1:].isdigit():
             n = int(o[1:])
+    return n
+
+
+@register("head", usage="head [-n N] [file ...]", summary="Первые строки",
+          category="text")
+def cmd_head(ctx, args, stdin):
+    opts, pos = _split_opts(args)
+    n = _parse_line_count("head", opts)
     text = _read_input(ctx, pos, stdin, "head")
     return "\n".join(text.splitlines()[:n])
 
@@ -213,17 +223,11 @@ def cmd_head(ctx, args, stdin):
 @register("tail", usage="tail [-n N] [file ...]", summary="Последние строки",
           category="text")
 def cmd_tail(ctx, args, stdin):
-    n = 10
     opts, pos = _split_opts(args)
-    if "-n" in opts:
-        try:
-            n = int(opts[opts.index("-n") + 1])
-        except (IndexError, ValueError):
-            raise InvalidArgument("tail: invalid number of lines")
-    for o in opts:
-        if o.startswith("-") and o[1:].isdigit():
-            n = int(o[1:])
+    n = _parse_line_count("tail", opts)
     text = _read_input(ctx, pos, stdin, "tail")
+    if n == 0:
+        return ""
     return "\n".join(text.splitlines()[-n:])
 
 
@@ -340,10 +344,17 @@ def cmd_cut(ctx, args, stdin):
             i += 1
     if field is None:
         raise InvalidArgument("cut: you must specify a field list")
-    indices = [int(x) - 1 for x in field.split(",") if x.strip().isdigit()]
+    tokens = [token.strip() for token in field.split(",")]
+    if (not tokens
+            or any(not token.isdigit() or int(token) <= 0
+                   for token in tokens)):
+        raise InvalidArgument(f"cut: invalid field list '{field}'")
+    indices = [int(token) - 1 for token in tokens]
     text = _read_input(ctx, pos, stdin, "cut")
     out = []
     for line in text.splitlines():
         parts = line.split(delim)
         out.append(delim.join(parts[i] for i in indices if 0 <= i < len(parts)))
+    if out and out[-1] == "":
+        return "\n".join(out) + "\n"
     return "\n".join(out)
