@@ -581,21 +581,23 @@ def test_glob_absolute_output_remains_documented_limit(kernel, root, user,
 
 # ============================================================================
 # DOCUMENTED LIMIT — регресс-страховка, НЕ инвертировать
+# (исключение: sticky /tmp инвертирован в STICKY-2, см. тест ниже)
 # ============================================================================
 
 
 def test_sticky_tmp_not_enforced_currently(kernel, root, user, capsys):
-    # DOCUMENTED LIMIT: sticky-бит /tmp (1777) не enforced — rm чужого файла
-    # проходит при праве w на каталоге; README:70-72, 618-619.
+    # FIXED in STICKY-2: sticky-бит /tmp (1777) enforced — rm чужого файла
+    # отклоняется с PermissionDenied (errno 13), файл остаётся на месте.
+    # Имя сохранено по конвенции: characterization-тест инвертирован, не удалён.
     fs = kernel.fs
     fs.create_file("/tmp/root_file", root, "/", "/",
                    data="root", mode=0o644)
 
     sh = Shell(kernel, user)
     out = _run(sh, capsys, "rm /tmp/root_file")
-    assert "Permission denied" not in out
-    with pytest.raises(NoSuchFileOrDirectory):
-        fs.lookup("/tmp/root_file", root, "/", "/")
+    assert "Permission denied" in out
+    assert sh.last_code == 13
+    assert fs.lookup("/tmp/root_file", root, "/", "/").is_file()
 
 
 def test_save_load_hardlinks_independent_currently(kernel, root):

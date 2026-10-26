@@ -29,6 +29,7 @@ from .errors import (
 R_BIT = 4
 W_BIT = 2
 X_BIT = 1
+STICKY_BIT = 0o1000
 
 S_IFDIR = 0o040000
 S_IFREG = 0o100000
@@ -447,6 +448,24 @@ class FileSystem:
     def _require_parent(self, parent, user, bits, path):
         self._require(parent, user, bits, path)
 
+    def _sticky_allows_removal(self, parent: Node, node: Node, user) -> bool:
+        """POSIX sticky: кто вправе удалить/переименовать запись ``node``.
+
+        Проверяется только непосредственный родитель ``parent``. Разрешено
+        внутренним вызовам (``user is None``), root, владельцу каталога и
+        владельцу самой записи (для hardlink это uid общего inode, для
+        symlink — uid ссылки).
+        """
+        if user is None or getattr(user, "is_root", False):
+            return True
+        if not (parent.mode & STICKY_BIT):
+            return True
+        return parent.uid == user.uid or node.uid == user.uid
+
+    def _require_sticky(self, parent: Node, node: Node, user, path):
+        if not self._sticky_allows_removal(parent, node, user):
+            raise PermissionDenied(path)
+
     @staticmethod
     def _refresh(node: Node):
         """Пересобирает содержимое каталога, если задан refresh (/proc и т.п.)."""
@@ -634,12 +653,20 @@ class FileSystem:
             if not recursive:
                 raise IsADirectory(norm)
             self._check_rmtree(node, user, norm)
+        self._require_sticky(parent, node, user, norm)
+        if node.is_dir():
             self._rmtree(node)
         self._drop_entry(parent, name)
         parent.touch_mtime()
 
     def _check_rmtree(self, node: Dir, user, path):
-        """Проверяет права на всё дерево до удаления (без частичного rm -r)."""
+        """Проверяет права на всё дерево до удаления (без частичного rm -r).
+
+        Sticky-проверка выполняется для каждого потомка относительно его
+        непосредственного родителя: иначе ``rm -r`` мог бы обойти защиту
+        вложенного sticky-каталога. W|X-логика для пустых подкаталогов
+        оставлена как есть (известный долг).
+        """
         if user is None or getattr(user, "is_root", False):
             return
         if node.children:
@@ -647,6 +674,8 @@ class FileSystem:
         for child in node.children.values():
             if child.is_dir():
                 self._check_rmtree(child, user, self.path_of(child))
+            if not self._sticky_allows_removal(node, child, user):
+                raise PermissionDenied(self.path_of(child))
 
     def _rmtree(self, node: Dir):
         for child in list(node.children.values()):
@@ -662,6 +691,7 @@ class FileSystem:
         if not node.is_dir():
             raise NotADirectory(norm)
         self._require_parent(parent, user, W_BIT | X_BIT, norm)
+        self._require_sticky(parent, node, user, norm)
         if node.children:
             raise DirectoryNotEmpty(norm)
         del parent.children[name]
@@ -731,6 +761,9 @@ class FileSystem:
                 raise NotADirectory(dnorm)
             if existing.is_dir() and existing.children:
                 raise DirectoryNotEmpty(dnorm)
+            self._require_sticky(dparent, existing, user, dnorm)
+        self._require_sticky(sparent, node, user, snorm)
+        if existing is not None:
             self._drop_entry(dparent, dname)
 
         del sparent.children[sname]
