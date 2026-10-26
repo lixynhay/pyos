@@ -226,6 +226,24 @@ def test_pkg_info(kernel, root):
     assert "A friendly greeting" in result
 
 
+def test_pkg_info_rejects_extra_args(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+    from pyos.context import Context
+
+    ctx = Context(kernel, root, "/root", shell=Shell(kernel, root))
+    with pytest.raises(InvalidArgument, match="too many arguments"):
+        cmd_pkg(ctx, ["info", "hello", "extra"], "")
+
+
+def test_pkg_list_rejects_extra_args(kernel, root):
+    from pyos.commands.package_cmds import cmd_pkg
+    from pyos.context import Context
+
+    ctx = Context(kernel, root, "/root", shell=Shell(kernel, root))
+    with pytest.raises(InvalidArgument, match="too many arguments"):
+        cmd_pkg(ctx, ["list", "extra"], "")
+
+
 # -- pkg remove -------------------------------------------------------------
 
 def test_pkg_remove(kernel, root):

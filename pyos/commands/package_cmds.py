@@ -2280,12 +2280,18 @@ def cmd_pkg(ctx, args, stdin):
                                dry_run="--dry-run" in cmd_args)
 
     elif subcmd == "list":
+        if cmd_args:
+            raise InvalidArgument(
+                "list: too many arguments (usage: pkg list)")
         return _list_packages(ctx)
 
     elif subcmd == "info":
         if not cmd_args:
             raise InvalidArgument(
                 "info: missing package name (usage: pkg info <name>)")
+        if len(cmd_args) > 1:
+            raise InvalidArgument(
+                "info: too many arguments (usage: pkg info <name>)")
         return _show_package_info(ctx, cmd_args[0])
 
     elif subcmd == "pack":

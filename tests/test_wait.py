@@ -166,6 +166,73 @@ def test_fg_waits_until_done_not_blind_run_until(kernel, root, capsys):
     assert sh.last_code == 0
 
 
+def test_fg_percent_job_spec_works(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("false &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+
+    sh.handle_line(f"fg %{job['id']}")
+    capsys.readouterr()
+
+    assert job["done"] is True
+    assert job["proc"].exit_code == 1
+    assert sh.last_code == 1
+
+
+def test_fg_pid_spec_works_if_supported(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("false &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+
+    sh.handle_line(f"fg {job['pid']}")
+    capsys.readouterr()
+
+    assert job["done"] is True
+    assert job["proc"].exit_code == 1
+    assert sh.last_code == 1
+
+
+def test_fg_unknown_job_errors(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("fg %99")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "no such job" in captured.err
+    assert sh.last_code == 1
+
+
+def test_background_jobs_wait_fg_regression(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("sleep 1 &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+
+    sh.handle_line("jobs")
+    out = capsys.readouterr().out
+    assert f"[{job['id']}]" in out
+    assert "Running" in out
+
+    sh.handle_line("wait")
+    capsys.readouterr()
+    assert job["done"] is True
+    assert sh.last_code == 0
+
+    sh.handle_line("false &")
+    capsys.readouterr()
+    failed = sh.jobs[1]
+    sh.handle_line("fg")
+    capsys.readouterr()
+    assert failed["done"] is True
+    assert sh.last_code == 1
+
+
 # ---------------------------------------------------------------------------
 # bg
 # ---------------------------------------------------------------------------
@@ -189,9 +256,82 @@ def test_bg_without_jobs_stdout_empty(kernel, root, capsys):
     assert captured.out == ""
 
 
+def test_bg_percent_job_spec_works(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("sleep 100 &")
+    sh.handle_line("sleep 200 &")
+    capsys.readouterr()
+    first, second = sh.jobs
+
+    sh.handle_line(f"bg %{first['id']}")
+    captured = capsys.readouterr()
+
+    assert f"[{first['id']}] sleep 100 &" in captured.out
+    assert f"[{second['id']}]" not in captured.out
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_bg_uses_finished_helper(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("sleep 100 &")
+    sh.handle_line("false &")
+    capsys.readouterr()
+    active, killed = sh.jobs
+
+    sh.handle_line(f"kill {killed['pid']}")
+    capsys.readouterr()
+    assert killed["done"] is False
+    assert killed["proc"].is_alive is False
+
+    sh.handle_line("bg")
+    captured = capsys.readouterr()
+
+    assert f"[{active['id']}] sleep 100 &" in captured.out
+    assert f"[{killed['id']}]" not in captured.out
+    assert "Running" not in captured.out
+    assert sh.last_code == 0
+
+
+def test_bg_after_kill_does_not_show_running(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("sleep 100 &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+
+    sh.handle_line(f"kill {job['pid']}")
+    capsys.readouterr()
+
+    sh.handle_line("bg")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "bg: no current job" in captured.err
+    assert sh.last_code == 1
+
+    sh.handle_line(f"bg %{job['id']}")
+    captured = capsys.readouterr()
+    assert "Running" not in captured.out
+    assert f"Done({job['proc'].exit_code})" in captured.out
+
+
 # ---------------------------------------------------------------------------
 # jobs output
 # ---------------------------------------------------------------------------
+
+def test_jobs_rejects_extra_arguments(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("jobs --all")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "too many arguments" in captured.err
+    assert "usage: jobs" in captured.err
+    assert sh.last_code != 0
+
 
 def test_jobs_shows_terminated_with_code_for_killed_job(
         kernel, root, capsys):

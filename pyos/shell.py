@@ -838,6 +838,27 @@ class Shell:
                 return job
         return None
 
+    def _select_job(self, command, args):
+        """Выбирает job по ``%N``/PID или последний активный.
+
+        Возвращает ``None`` (и пишет ошибку в stderr), если job не найден.
+        """
+        if len(args) > 1:
+            raise InvalidArgument(
+                f"{command}: too many arguments "
+                f"(usage: {command} [%job|pid])")
+        if args:
+            job = self._find_job(args[0])
+            if job is None:
+                self.write_stderr(f"{command}: {args[0]}: no such job")
+                return None
+            return job
+        active = [j for j in self.jobs if not self._job_finished(j)]
+        if not active:
+            self.write_stderr(f"{command}: no current job")
+            return None
+        return active[-1]
+
     def _set_job_code(self, code):
         """Делает код задания текущим $? (только явный wait/fg)."""
         self.last_code = code
@@ -1018,6 +1039,8 @@ class Shell:
         return None
 
     def _bi_jobs(self, args, stdin, user):
+        if args:
+            raise InvalidArgument("jobs: too many arguments (usage: jobs)")
         for job in self.jobs:
             if self._job_finished(job):
                 status = f"Done({job['proc'].exit_code})"
@@ -1043,22 +1066,22 @@ class Shell:
         return self._bi_wait(args, stdin, user)
 
     def _bi_fg(self, args, stdin, user):
-        active = [j for j in self.jobs if not self._job_finished(j)]
-        if not active:
-            self.write_stderr("fg: no current job")
+        job = self._select_job("fg", args)
+        if job is None:
             return None, 1
-        job = active[-1]
         code = self._wait_job(job)
         self._set_job_code(code)
         return None, code
 
     def _bi_bg(self, args, stdin, user):
-        active = [j for j in self.jobs if not j["done"]]
-        if not active:
-            self.write_stderr("bg: no current job")
+        job = self._select_job("bg", args)
+        if job is None:
             return None, 1
-        job = active[-1]
-        self.write_stdout(f"[{job['id']}] {job['cmdline']} &")
+        if self._job_finished(job):
+            status = f"Done({job['proc'].exit_code})"
+            self.write_stdout(self._format_job_line(job, status))
+        else:
+            self.write_stdout(f"[{job['id']}] {job['cmdline']} &")
         return None
 
     def _bi_su(self, args, stdin, user):
