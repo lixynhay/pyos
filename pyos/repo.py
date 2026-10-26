@@ -218,6 +218,20 @@ def set_repo_enabled(ctx, name, enabled):
     return f"repo: {state} '{name}'"
 
 
+def display_repo_type(repo):
+    """Транспорт репозитория для вывода в ``pkg repo list``.
+
+    Историческое имя поля ``type`` — ``"http"``; фактический транспорт
+    определяется URL. Для ``https://`` показываем ``https``, для ``path`` —
+    ``path``. На валидацию и сетевой слой это не влияет.
+    """
+    if repo["type"] == "path":
+        return "path"
+    if str(repo["url"]).startswith("https://"):
+        return "https"
+    return "http"
+
+
 def list_repos(ctx):
     """Печатает репозитории из конфига."""
     config = read_repos(ctx.fs, ctx.user)
@@ -231,7 +245,7 @@ def list_repos(ctx):
     for repo in config["repos"]:
         state = "enabled" if repo["enabled"] else "disabled"
         lines.append(
-            f"{repo['name']:<16} {repo['type']:<5} "
+            f"{repo['name']:<16} {display_repo_type(repo):<5} "
             f"{state:<9} {repo['priority']:<9} {repo['url']}")
     return "\n".join(lines)
 

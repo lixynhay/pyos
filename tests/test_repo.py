@@ -296,6 +296,60 @@ def test_repo_list_shows_entries(kernel, root, user):
         assert expected in result
 
 
+def _repo_list_rows(result):
+    """Строки pkg repo list без заголовка и разделителя."""
+    lines = [line for line in result.splitlines()
+             if line and not line.startswith("-")]
+    return [line.split() for line in lines]
+
+
+def test_pkg_repo_list_shows_https_for_https_url(kernel, root):
+    """Для https:// URL в колонке TYPE показывается https, не http."""
+    ctx = _ctx(kernel, root)
+    cmd_pkg(ctx, ["repo", "add", "core", "https://example.com/p/"], "")
+
+    rows = _repo_list_rows(cmd_pkg(ctx, ["repo", "list"], ""))
+    assert rows[0] == ["NAME", "TYPE", "STATE", "PRIORITY", "URL"]
+    assert rows[1][1] == "https"
+
+
+def test_pkg_repo_list_shows_path_for_path_repo(kernel, root):
+    """Для path-репозитория колонка TYPE остаётся path."""
+    ctx = _ctx(kernel, root)
+    cmd_pkg(ctx, ["repo", "add", "local", "/srv/repo/",
+                  "--type", "path"], "")
+
+    rows = _repo_list_rows(cmd_pkg(ctx, ["repo", "list"], ""))
+    assert rows[1][1] == "path"
+
+
+def test_pkg_repo_list_does_not_allow_http_transport_regression(kernel, root):
+    """http:// в конфиге по-прежнему отклоняется, а не показывается в списке."""
+    _write_config(kernel, root, [
+        _repo(name="core", url="http://example.com/p/", repo_type="http"),
+    ])
+
+    with pytest.raises(InvalidArgument, match="https"):
+        cmd_pkg(_ctx(kernel, root), ["repo", "list"], "")
+
+
+def test_pkg_repo_list_columns_stable(kernel, root):
+    """Колонки и их позиции в pkg repo list не смещаются."""
+    ctx = _ctx(kernel, root)
+    cmd_pkg(ctx, ["repo", "add", "core", "https://example.com/p/"], "")
+    cmd_pkg(ctx, ["repo", "add", "local", "/srv/repo/",
+                  "--type", "path"], "")
+
+    lines = cmd_pkg(ctx, ["repo", "list"], "").splitlines()
+    assert lines[0].split() == ["NAME", "TYPE", "STATE", "PRIORITY", "URL"]
+    for line in lines[2:]:
+        parts = line.split()
+        assert len(parts) == 5
+        assert parts[1] in ("https", "path")
+        # NAME занимает 16 символов, дальше пробел — TYPE начинается с 17-й.
+        assert line.index(parts[1]) == 17
+
+
 # -- pkg repo enable/disable ------------------------------------------------
 
 

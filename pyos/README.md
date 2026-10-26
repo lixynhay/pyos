@@ -377,7 +377,9 @@ repo: no cached index for 'core', run pkg repo update first
 priority и одинаковом имени пакета установка не выбирает репозиторий наугад, а
 завершается ошибкой `ambiguous package`. `enabled: false` исключает репозиторий
 из `update`, `search`, `install` и `upgrade`; `pkg repo list` показывает
-состояние.
+состояние, а в колонке `TYPE` — фактический транспорт: `https` для `https://`
+URL (даже если в конфиге поле `type` исторически равно `"http"`) и `path` для
+`path`-репозиториев.
 
 #### Формат `index.json`
 
