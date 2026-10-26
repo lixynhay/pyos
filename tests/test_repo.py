@@ -544,15 +544,48 @@ def test_repo_update_path_populates_cache_and_meta(kernel, root):
     assert meta["repo_matches"] is True
 
 
-def test_repo_update_path_records_repo_mismatch(kernel, root):
+def test_pkg_repo_update_success_message_to_stdout(kernel, root, capsys):
+    _write_config(kernel, root, [_repo()])
+    _write_index(kernel, root, "/srv/repo/", _index([_entry()]))
+
+    sh = Shell(kernel, root)
+    sh.handle_line("pkg repo update local")
+    captured = capsys.readouterr()
+
+    assert "updated 'local'" in captured.out
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_pkg_repo_update_warnings_to_stderr(kernel, root, capsys):
+    _write_config(kernel, root, [_repo()])
+    _write_index(kernel, root, "/srv/repo/",
+                 _index([_entry()], repo="other"))
+
+    sh = Shell(kernel, root)
+    sh.handle_line("pkg repo update local")
+    captured = capsys.readouterr()
+
+    assert "updated 'local'" in captured.out
+    assert "warning" not in captured.out
+    assert "warning" in captured.err
+    assert "does not match" in captured.err
+    assert sh.last_code == 0
+
+
+def test_repo_update_path_records_repo_mismatch(kernel, root, capsys):
     ctx = _ctx(kernel, root)
     _write_config(kernel, root, [_repo()])
     _write_index(kernel, root, "/srv/repo/",
                  _index([_entry()], repo="other"))
 
     result = cmd_pkg(ctx, ["repo", "update"], "")
-    assert "warning" in result
-    assert "does not match" in result
+    err = capsys.readouterr().err
+    # Stream fix (PYOS-FIX-C2): warnings идут в stderr, не в stdout.
+    assert "updated 'local'" in result
+    assert "warning" not in result
+    assert "warning" in err
+    assert "does not match" in err
 
     meta = json.loads(kernel.fs.read_file(
         "/var/cache/repos/local/index.meta.json", root, "/", "/"))
@@ -596,7 +629,7 @@ def test_repo_update_http_populates_cache_and_meta(kernel, root):
     assert kwargs["raise_for_status"] is True
 
 
-def test_repo_update_http_validates_index(kernel, root):
+def test_repo_update_http_validates_index(kernel, root, capsys):
     ctx = _ctx(kernel, root)
     _write_config(kernel, root, [
         _repo("core", "https://example.com/p/", "http"),
@@ -608,8 +641,11 @@ def test_repo_update_http_validates_index(kernel, root):
             return_value=broken):
         result = cmd_pkg(ctx, ["repo", "update", "core"], "")
 
-    assert "warning" in result
-    assert "format" in result
+    err = capsys.readouterr().err
+    # Stream fix (PYOS-FIX-C2): warning уходит в stderr.
+    assert result == ""
+    assert "warning" in err
+    assert "format" in err
 
     # Битый индекс не кэшируется.
     with pytest.raises(NoSuchFileOrDirectory):
@@ -629,7 +665,7 @@ def test_repo_update_http_rejects_http_scheme(kernel, root):
     mock_get.assert_not_called()
 
 
-def test_repo_update_http_one_repo_fails_others_continue(kernel, root):
+def test_repo_update_http_one_repo_fails_others_continue(kernel, root, capsys):
     ctx = _ctx(kernel, root)
     _write_config(kernel, root, [
         _repo("core", "https://core.example/", "http"),
@@ -647,9 +683,11 @@ def test_repo_update_http_one_repo_fails_others_continue(kernel, root):
             side_effect=fake_get):
         result = cmd_pkg(ctx, ["repo", "update"], "")
 
+    err = capsys.readouterr().err
     assert "updated 'core'" in result
-    assert "warning: 'broken'" in result
-    assert "500" in result
+    assert "warning: 'broken'" not in result
+    assert "warning: 'broken'" in err
+    assert "500" in err
 
     cached = kernel.fs.read_file(
         "/var/cache/repos/core/index.json", root, "/", "/")
@@ -658,7 +696,7 @@ def test_repo_update_http_one_repo_fails_others_continue(kernel, root):
         kernel.fs.lookup("/var/cache/repos/broken", root, "/", "/")
 
 
-def test_repo_update_http_429_single_attempt_no_retry(kernel, root):
+def test_repo_update_http_429_single_attempt_no_retry(kernel, root, capsys):
     ctx = _ctx(kernel, root)
     _write_config(kernel, root, [
         _repo("core", "https://example.com/p/", "http"),
@@ -669,8 +707,10 @@ def test_repo_update_http_429_single_attempt_no_retry(kernel, root):
             return_value=(429, {}, b"rate limited")) as mock_do:
         result = cmd_pkg(ctx, ["repo", "update", "core"], "")
 
-    assert "warning: 'core'" in result
-    assert "429" in result
+    err = capsys.readouterr().err
+    assert "warning: 'core'" not in result
+    assert "warning: 'core'" in err
+    assert "429" in err
     assert mock_do.call_count == 1
 
     mock_do.assert_called_once()
@@ -682,7 +722,7 @@ def test_repo_update_http_429_single_attempt_no_retry(kernel, root):
         kernel.fs.lookup("/var/cache/repos/core", root, "/", "/")
 
 
-def test_repo_update_http_index_too_large(kernel, root):
+def test_repo_update_http_index_too_large(kernel, root, capsys):
     ctx = _ctx(kernel, root)
     _write_config(kernel, root, [
         _repo("core", "https://example.com/p/", "http"),
@@ -694,27 +734,30 @@ def test_repo_update_http_index_too_large(kernel, root):
             return_value=huge):
         result = cmd_pkg(ctx, ["repo", "update", "core"], "")
 
-    assert "index too large" in result
-    assert "warning: 'core'" in result
+    err = capsys.readouterr().err
+    assert "index too large" not in result
+    assert "index too large" in err
+    assert "warning: 'core'" in err
 
     with pytest.raises(NoSuchFileOrDirectory):
         kernel.fs.lookup("/var/cache/repos/core", root, "/", "/")
 
 
-def test_repo_update_live_skip_when_offline(kernel, root):
+def test_repo_update_live_skip_when_offline(kernel, root, capsys):
     ctx = _ctx(kernel, root)
     _write_config(kernel, root, [
         _repo("live", "https://example.com/", "http"),
     ])
 
     result = cmd_pkg(ctx, ["repo", "update", "live"], "")
+    err = capsys.readouterr().err
 
-    if "cannot fetch" in result:
+    if "cannot fetch" in err:
         pytest.skip("network unavailable")
 
     # example.com отдаёт HTML, а не index.json: сетевая попытка реально была.
-    assert "warning: 'live'" in result
-    assert "invalid index" in result
+    assert "warning: 'live'" in err
+    assert "invalid index" in err
 
 
 # -- repo-команды не трогают installed/owners DB ----------------------------

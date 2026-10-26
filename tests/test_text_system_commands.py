@@ -387,15 +387,22 @@ def test_false_registered():
 # -- which ------------------------------------------------------------------
 
 
-def test_which_found(kernel, root, capsys):
-    Shell(kernel, root).handle_line("which ls")
-    assert capsys.readouterr().out.strip() == "/bin/ls"
+def test_which_found_stdout_zero(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("which ls")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "/bin/ls"
+    assert captured.err == ""
+    assert sh.last_code == 0
 
 
-def test_which_not_found(kernel, root, capsys):
-    Shell(kernel, root).handle_line("which nonexistent_cmd_xyz")
-    out = capsys.readouterr().out.strip()
-    assert "no " in out
+def test_which_not_found_stderr_one(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("which nonexistent_cmd_xyz")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "which: no nonexistent_cmd_xyz" in captured.err
+    assert sh.last_code == 1
 
 
 # -- df ---------------------------------------------------------------------
@@ -436,10 +443,14 @@ def test_ps_aux(kernel, root, capsys):
 # -- kill -------------------------------------------------------------------
 
 
-def test_kill_nonexistent(kernel, root, capsys):
-    Shell(kernel, root).handle_line("kill 99999")
+def test_kill_missing_process_error_to_stderr_and_nonzero(kernel, root,
+                                                          capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("kill 99999")
     captured = capsys.readouterr()
-    assert "No such process" in captured.out + captured.err
+    assert captured.out == ""
+    assert "No such process" in captured.err
+    assert sh.last_code != 0
 
 
 def _spawn_victim(kernel):
@@ -457,8 +468,8 @@ def test_kill_accepts_signal_specs(kernel, root, capsys, signal_spec):
     assert captured.err == ""
 
 
-def test_kill_rejects_invalid_signal_name(kernel, root, capsys):
-    """Неизвестный сигнал — ошибка invalid signal specification."""
+def test_kill_invalid_signal_still_stderr(kernel, root, capsys):
+    """Неизвестный сигнал — ошибка invalid signal specification в stderr."""
     proc = _spawn_victim(kernel)
     sh = Shell(kernel, root)
     sh.handle_line(f"kill -BOGUS {proc.pid}")

@@ -28,10 +28,10 @@ def _do_request(url, follow_redirects=False, timeout=REQUEST_TIMEOUT):
 
         if parsed.scheme not in ("http", "https"):
             raise InvalidArgument(
-                f"curl: unsupported scheme '{parsed.scheme}' (use http/https)"
+                f"unsupported scheme '{parsed.scheme}' (use http/https)"
             )
     except (ValueError, AttributeError) as exc:
-        raise InvalidArgument(f"curl: invalid URL: {exc}")
+        raise InvalidArgument(f"invalid URL: {exc}")
 
     req = urllib.request.Request(
         url,
@@ -58,11 +58,11 @@ def _do_request(url, follow_redirects=False, timeout=REQUEST_TIMEOUT):
         body = exc.read()
         return exc.code, exc.headers, body
     except urllib.error.URLError as exc:
-        raise PyOSError(f"curl: {exc.reason}")
+        raise PyOSError(f"network error: {exc.reason}")
     except OSError as exc:
-        raise PyOSError(f"curl: network error: {exc}")
+        raise PyOSError(f"network error: {exc}")
     except Exception as exc:
-        raise PyOSError(f"curl: request failed: {exc}")
+        raise PyOSError(f"request failed: {exc}")
 
 
 class HttpText(str):

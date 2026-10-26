@@ -196,6 +196,40 @@ def test_wget_no_url(kernel, root):
         cmd_wget(ctx, [], "")
 
 
+def test_wget_network_error_does_not_use_curl_prefix(kernel, root, capsys):
+    """wget не наследует curl-префикс из общего network helper."""
+    import urllib.error
+
+    sh = Shell(kernel, root)
+    with mock.patch(
+            "pyos.commands.network_cmds.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("boom")):
+        sh.handle_line("wget http://example.com/x")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "wget: network error: boom" in captured.err
+    assert "curl" not in captured.err
+    assert sh.last_code != 0
+
+
+def test_curl_network_error_keeps_curl_prefix(kernel, root, capsys):
+    """curl по-прежнему сообщает об ошибке с префиксом curl:."""
+    import urllib.error
+
+    sh = Shell(kernel, root)
+    with mock.patch(
+            "pyos.commands.network_cmds.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("boom")):
+        sh.handle_line("curl -L http://example.com/x")
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "curl: network error: boom" in captured.err
+    assert "wget:" not in captured.err
+    assert sh.last_code != 0
+
+
 def test_wget_filename_from_url(kernel, root):
     """wget извлекает имя файла из URL."""
     from pyos.commands.network_cmds import cmd_wget

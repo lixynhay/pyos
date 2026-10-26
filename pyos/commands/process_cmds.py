@@ -1,5 +1,7 @@
 """Команды для работы с процессами и планировщиком."""
 
+import sys
+
 from ..errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
 from ..process import ProcessState
 from ..scheduler import TICKS_PER_SECOND
@@ -21,6 +23,14 @@ def _supported_signals():
         for name, num in SIGNAL_BY_NAME.items()
         if name not in _UNSUPPORTED_SIGNAL_NAMES
     )
+
+
+def _emit_error(ctx, message):
+    """Пишет сообщение об ошибке в stderr (или в stderr процесса)."""
+    if ctx.shell is not None:
+        ctx.shell.write_stderr(message)
+    else:
+        print(message, file=sys.stderr)
 
 
 def _format_signal_list():
@@ -139,21 +149,24 @@ def cmd_kill(ctx, args, stdin):
         raise InvalidArgument("kill: usage: kill [-signum] pid ...")
     # Сигналы с игнорируемым действием доставляются, но процесс не завершают.
     ignore = DEFAULT_ACTION.get(signum) == "ign"
-    errs = []
+    failed = False
     for pid_s in pids:
         if not pid_s.lstrip("-").isdigit():
-            errs.append(f"kill: {pid_s}: arguments must be process IDs")
+            _emit_error(ctx, f"kill: {pid_s}: arguments must be process IDs")
+            failed = True
             continue
         pid = int(pid_s)
         if ignore:
             proc = ctx.kernel.get_process(pid)
             if proc is None or not proc.is_alive:
-                errs.append(f"kill: ({pid}) - No such process")
+                _emit_error(ctx, f"kill: ({pid}) - No such process")
+                failed = True
             continue
         if not ctx.kernel.kill(pid, signum):
-            errs.append(f"kill: ({pid}) - No such process")
-    if errs:
-        return ("\n".join(errs), 1)
+            _emit_error(ctx, f"kill: ({pid}) - No such process")
+            failed = True
+    if failed:
+        return ("", 1)
     return None
 
 

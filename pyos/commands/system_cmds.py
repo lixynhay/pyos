@@ -1,9 +1,18 @@
 """Системные команды: информация о пользователях, системе, справка."""
 
+import sys
 import time
 
 from ..errors import InvalidArgument, NoSuchFileOrDirectory, PyOSError
 from .registry import all_commands, get, register
+
+
+def _emit_error(ctx, message):
+    """Пишет сообщение об ошибке в stderr (или в stderr процесса)."""
+    if ctx.shell is not None:
+        ctx.shell.write_stderr(message)
+    else:
+        print(message, file=sys.stderr)
 
 
 @register("whoami", usage="whoami", summary="Имя текущего пользователя",
@@ -72,15 +81,20 @@ def cmd_env(ctx, args, stdin):
 @register("which", usage="which command ...", summary="Путь к команде",
           category="system")
 def cmd_which(ctx, args, stdin):
-    lines = []
+    found = []
+    missing = False
     for name in args:
         if get(name) is not None:
-            lines.append(f"/bin/{name}")
+            found.append(f"/bin/{name}")
         elif ctx.shell is not None and name in ctx.shell.builtins:
-            lines.append(f"builtin:{name}")
+            found.append(f"builtin:{name}")
         else:
-            lines.append(f"which: no {name} in (/bin)")
-    return "\n".join(lines)
+            _emit_error(ctx, f"which: no {name} in (/bin)")
+            missing = True
+    out = "\n".join(found)
+    if missing:
+        return (out, 1)
+    return out
 
 
 @register("clear", usage="clear", summary="Очистить экран",

@@ -541,7 +541,8 @@ def update_repos(ctx, names=None):
                     raise_for_status=True,
                 )
             except (PyOSError, InvalidArgument) as exc:
-                lines.append(
+                _write_warning(
+                    ctx,
                     f"repo: warning: '{repo['name']}': cannot fetch "
                     f"'{source}': {_clean_error(exc)}")
                 continue
@@ -550,7 +551,8 @@ def update_repos(ctx, names=None):
             if size is None:
                 size = len(raw.encode("utf-8"))
             if size > REPO_INDEX_MAX_BYTES:
-                lines.append(
+                _write_warning(
+                    ctx,
                     f"repo: warning: '{repo['name']}': index too large "
                     f"({size} bytes > {REPO_INDEX_MAX_BYTES})")
                 continue
@@ -558,14 +560,16 @@ def update_repos(ctx, names=None):
             try:
                 index = _parse_index(raw, source, repo)
             except InvalidArgument as exc:
-                lines.append(
+                _write_warning(
+                    ctx,
                     f"repo: warning: '{repo['name']}': {_clean_error(exc)}")
                 continue
         else:
             try:
                 index, raw = read_index(ctx.fs, ctx.user, repo)
             except InvalidArgument as exc:
-                lines.append(
+                _write_warning(
+                    ctx,
                     f"repo: warning: '{repo['name']}': {_clean_error(exc)}")
                 continue
 
@@ -574,7 +578,8 @@ def update_repos(ctx, names=None):
             f"repo: updated '{repo['name']}' "
             f"({meta['package_count']} packages)")
         if not meta["repo_matches"]:
-            lines.append(
+            _write_warning(
+                ctx,
                 f"repo: warning: index repo '{index['repo']}' does not match "
                 f"'{repo['name']}'")
 
