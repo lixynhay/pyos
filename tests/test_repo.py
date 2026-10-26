@@ -951,6 +951,53 @@ def test_search_empty_query_usage_error(kernel, root):
         cmd_pkg(ctx, ["search", "   "], "")
 
 
+def test_pkg_search_no_enabled_repos_warning_stderr(kernel, root, capsys):
+    _write_config(kernel, root, [_repo(enabled=False)])
+
+    sh = Shell(kernel, root)
+    sh.handle_line("pkg search hello")
+    captured = capsys.readouterr()
+
+    assert "warning" in captured.err
+    assert "no enabled repositories" in captured.err
+    assert "no enabled repositories" not in captured.out
+    assert sh.last_code == 0
+
+
+def test_pkg_search_no_enabled_repos_code_zero(kernel, root, capsys):
+    _write_config(kernel, root, [])
+
+    sh = Shell(kernel, root)
+    sh.handle_line("pkg search hello")
+    captured = capsys.readouterr()
+
+    assert captured.out.strip().startswith("REPO")
+    assert "warning" in captured.err
+    assert sh.last_code == 0
+
+
+def test_pkg_install_no_enabled_repos_still_error(kernel, root):
+    _write_config(kernel, root, [_repo(enabled=False)])
+
+    with pytest.raises(InvalidArgument, match="no enabled repositories"):
+        cmd_pkg(_ctx(kernel, root), ["install", "hello"], "")
+
+
+def test_pkg_search_with_repo_regression(kernel, root, capsys):
+    repo = _make_repo(kernel, root, packages=[
+        {"name": "hello", "version": "1.0"},
+    ])
+    _use_repos(kernel, root, [repo])
+
+    sh = Shell(kernel, root)
+    sh.handle_line("pkg search hello")
+    captured = capsys.readouterr()
+
+    assert "hello" in captured.out
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
 def test_search_output_sorted_by_repo_name_version(kernel, root):
     ctx = _ctx(kernel, root)
     zrepo = _make_repo(kernel, root, name="zrepo", priority=100, packages=[

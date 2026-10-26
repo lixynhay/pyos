@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from unittest import mock
 
 import pytest
 
@@ -289,6 +290,70 @@ def test_pkg_remove_not_installed(kernel, root):
     ctx = Context(kernel, root, "/root")
     with pytest.raises(InvalidArgument, match="not installed"):
         cmd_pkg(ctx, ["remove", "nonexistent"], "")
+
+
+def test_pkg_remove_success_stdout_zero(kernel, root, capsys):
+    from pyos.commands.package_cmds import cmd_pkg
+
+    ctx = _ctx(kernel, root)
+    path = _write_pkg(kernel, root, _make_package())
+    cmd_pkg(ctx, ["install", path], "")
+    capsys.readouterr()
+
+    sh = Shell(kernel, root)
+    sh.handle_line("pkg remove demo")
+    captured = capsys.readouterr()
+
+    assert "removed 'demo'" in captured.out
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_pkg_remove_partial_errors_stderr_nonzero(kernel, root, capsys):
+    from pyos.commands.package_cmds import cmd_pkg
+    from pyos.errors import PyOSError
+
+    ctx = _ctx(kernel, root)
+    pkg = _make_package(files=[
+        {
+            "path": "/usr/bin/demo",
+            "mode": "0755",
+            "owner": "root",
+            "group": "root",
+            "encoding": "utf-8",
+            "content": "demo\n",
+        },
+        {
+            "path": "/usr/bin/demo-broken",
+            "mode": "0755",
+            "owner": "root",
+            "group": "root",
+            "encoding": "utf-8",
+            "content": "broken\n",
+        },
+    ])
+    path = _write_pkg(kernel, root, pkg)
+    cmd_pkg(ctx, ["install", path], "")
+    capsys.readouterr()
+
+    real_unlink = kernel.fs.unlink
+
+    def flaky_unlink(target, *args, **kwargs):
+        if target == "/usr/bin/demo-broken":
+            raise PyOSError("simulated unlink failure")
+        return real_unlink(target, *args, **kwargs)
+
+    sh = Shell(kernel, root)
+    with mock.patch.object(kernel.fs, "unlink", side_effect=flaky_unlink):
+        sh.handle_line("pkg remove demo")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "simulated unlink failure" in captured.err
+    assert sh.last_code != 0
+    with pytest.raises(NoSuchFileOrDirectory):
+        kernel.fs.lookup("/usr/bin/demo", root, "/", "/")
+    assert kernel.fs.lookup("/usr/bin/demo-broken", root, "/", "/").is_file()
 
 
 # -- Интеграционный тест: build + install + use ----------------------------

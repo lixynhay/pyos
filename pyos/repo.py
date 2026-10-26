@@ -698,10 +698,13 @@ def search_packages(ctx, query):
     """
     from .commands.package_cmds import pkgvercmp
 
+    header = "  ".join([
+        "REPO", "NAME", "VERSION-RELEASE", "ARCH", "DESCRIPTION"])
     config = read_repos(ctx.fs, ctx.user)
     repos = [repo for repo in config["repos"] if repo["enabled"]]
     if not repos:
-        return "pkg: no enabled repositories"
+        _write_warning(ctx, "pkg: warning: no enabled repositories")
+        return header
 
     needle = query.casefold()
     hits = []
@@ -737,8 +740,7 @@ def search_packages(ctx, query):
 
     hits.sort(key=cmp_to_key(compare))
 
-    lines = ["  ".join([
-        "REPO", "NAME", "VERSION-RELEASE", "ARCH", "DESCRIPTION"])]
+    lines = [header]
     for repo_name, package in hits:
         description = package["description"].replace("\n", " ")
         lines.append("  ".join([

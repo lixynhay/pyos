@@ -9,6 +9,7 @@ PKGBUILD-подход (как в Arch Linux):
 import base64
 import json
 import re
+import sys
 
 from ..errors import (
     InvalidArgument,
@@ -41,6 +42,16 @@ PKG_USAGE = (
     "pkg pack <root-dir> <output-pkg> --name <name> --version <version> "
     "[--release <n>] [--arch <arch>] [--depends <dep>]... "
     "[--description <text>] [--license <text>] [--dry-run]")
+
+
+def _write_stderr(ctx, message):
+    """Пишет диагностику в stderr, не смешивая с результатом команды."""
+    shell = getattr(ctx, "shell", None)
+    if shell is not None:
+        shell.write_stderr(message)
+    else:
+        print(message, file=sys.stderr)
+
 
 # -- сравнение версий -------------------------------------------------------
 
@@ -2035,8 +2046,8 @@ def _remove_package(ctx, pkgname, force=False, dry_run=False):
         ctx.fs.unlink(f"{INSTALLED_ROOT}/{pkgname}.json", ctx.user, "/", "/")
     except NoSuchFileOrDirectory:
         pass
-    except PyOSError:
-        pass
+    except PyOSError as exc:
+        errors.append(str(exc))
     _remove_tree(ctx.fs, f"{LIB_ROOT}/{pkgname}", ctx.user)
     _write_owners(ctx.fs, ctx.user, owners)
 
@@ -2059,7 +2070,11 @@ def _remove_package(ctx, pkgname, force=False, dry_run=False):
                 break
 
     if errors:
-        return f"pkg: removed '{pkgname}' with {len(errors)} errors:\n" + "\n".join(errors)
+        for error in errors:
+            _write_stderr(ctx, f"pkg: remove '{pkgname}': {error}")
+        _write_stderr(
+            ctx, f"pkg: removed '{pkgname}' with {len(errors)} errors")
+        return "", 1
     return f"pkg: removed '{pkgname}'"
 
 
