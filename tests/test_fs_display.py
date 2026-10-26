@@ -1,11 +1,11 @@
-"""FS-HARD-1/2: отображение sticky bit и ``ls -d``.
+"""FS-HARD-1/2/3: отображение sticky bit и ``ls -d``.
 
 Sticky display исправлен в FS-HARD-2: ``perm_string()`` рендерит ``t``/``T``
 для mode с битом ``0o1000``; ``setuid``/``setgid`` по-прежнему не рендерятся
 (они не enforced).
 
-``ls -d`` всё ещё не реализован: флаг принимается, но игнорируется. Эти
-тесты остаются characterization до FS-HARD-3.
+``ls -d`` реализован в FS-HARD-3: печатает саму запись операнда, без
+содержимого каталога, ``total`` и заголовков; операнд выводится как введён.
 
 Тесты детерминированы: без сети, без wall-clock. Время модификации в
 длинном формате ``ls`` не проверяется — только структура строк.
@@ -119,26 +119,24 @@ def test_fixed_stat_tmp_access_has_numeric_1777_and_t(kernel, root, capsys):
 
 
 # ============================================================================
-# ls -d: текущее поведение (флаг игнорируется)
+# ls -d: запись операнда вместо содержимого (FIXED в FS-HARD-3)
 # ============================================================================
 
 
-def test_current_ls_d_prints_empty_line(kernel, root, capsys):
-    # CHARACTERIZE: -d принимается, но игнорируется; /tmp пуст, поэтому
-    # ls -d /tmp печатает пустую строку, а не саму запись.
+def test_fixed_ls_d_prints_entry(kernel, root, capsys):
+    # FIXED (FS-HARD-3): в FS-HARD-1 ls -d /tmp печатал пустую строку,
+    # потому что флаг игнорировался и печаталось содержимое каталога.
     sh = Shell(kernel, root)
     sh.handle_line("ls -d /tmp")
     captured = capsys.readouterr()
 
-    assert captured.out == ""
+    assert captured.out == "/tmp\n"
     assert captured.err == ""
     assert sh.last_code == 0
 
 
-def test_current_ls_ld_prints_total_and_contents_not_entry(kernel, root,
-                                                           capsys):
-    # CHARACTERIZE: ls -ld DIR печатает total и содержимое каталога, а не
-    # одну строку самого DIR. После FS-HARD-3 ожидается одна запись.
+def test_fixed_ls_ld_prints_single_entry(kernel, root, capsys):
+    # FIXED (FS-HARD-3): раньше печатались total и содержимое каталога.
     sh = Shell(kernel, root)
     sh.handle_line("mkdir -p /tmp/displaydir")
     sh.handle_line("echo x > /tmp/displaydir/file")
@@ -146,16 +144,16 @@ def test_current_ls_ld_prints_total_and_contents_not_entry(kernel, root,
     captured = capsys.readouterr()
 
     lines = captured.out.splitlines()
-    assert lines[0].startswith("total ")
-    assert any(line.endswith(" file") for line in lines)
-    assert all(not line.endswith(" displaydir") for line in lines)
+    assert len(lines) == 1
+    assert lines[0].startswith("drwxr-xr-x")
+    assert lines[0].endswith(" /tmp/displaydir")
+    assert "total" not in captured.out
     assert captured.err == ""
     assert sh.last_code == 0
 
 
-def test_current_ls_d_missing_path_current_behavior(kernel, root, capsys):
-    # CHARACTERIZE: путь не существует — обычная ошибка ls, код 2.
-    # Поведение не должно измениться и после FS-HARD-3.
+def test_fixed_ls_d_missing_path_behavior(kernel, root, capsys):
+    # Ошибка не изменилась при -d: прежний путь ls, stderr, код 2.
     sh = Shell(kernel, root)
     sh.handle_line("ls -d /tmp/does-not-exist")
     captured = capsys.readouterr()
@@ -166,24 +164,22 @@ def test_current_ls_d_missing_path_current_behavior(kernel, root, capsys):
     assert sh.last_code == 2
 
 
-def test_current_ls_d_symlink_current_behavior(kernel, root, capsys):
-    # CHARACTERIZE: -ld показывает сам symlink (длинный формат делает lstat);
-    # короткий -d разыменовывает ссылку и печатает имя цели, а не операнд.
+def test_fixed_ls_d_symlink_shows_link(kernel, root, capsys):
+    # FIXED (FS-HARD-3): -d делает lstat; короткий режим печатает операнд,
+    # а не имя цели, как было в FS-HARD-1.
     sh = Shell(kernel, root)
     sh.handle_line("echo target > /tmp/display_target")
     sh.handle_line("ln -s /tmp/display_target /tmp/display_link")
 
     sh.handle_line("ls -ld /tmp/display_link")
-    long_out = capsys.readouterr().out
-    long_lines = long_out.splitlines()
+    long_lines = capsys.readouterr().out.splitlines()
     assert len(long_lines) == 1
     assert long_lines[0].startswith("lrwxrwxrwx")
-    assert "display_link -> /tmp/display_target" in long_lines[0]
-    assert not long_out.startswith("total")
+    assert long_lines[0].endswith(
+        " /tmp/display_link -> /tmp/display_target")
 
     sh.handle_line("ls -d /tmp/display_link")
-    short_out = capsys.readouterr().out
-    assert short_out.strip() == "display_target"
+    assert capsys.readouterr().out == "/tmp/display_link\n"
     assert sh.last_code == 0
 
 
@@ -302,3 +298,196 @@ def test_symlink_perm_string_unchanged_if_no_sticky(kernel, root):
     assert link.perm_string() == "lrwxrwxrwx"
     assert "t" not in link.perm_string()
     assert "T" not in link.perm_string()
+
+
+# ============================================================================
+# FS-HARD-3: контракт ls -d
+# ============================================================================
+
+
+def _dir_with_file(kernel, root, path, name="file"):
+    """Создаёт каталог и один файл внутри (без вывода в stdout)."""
+    fs = kernel.fs
+    fs.mkdir(path, root, "/", "/")
+    fs.create_file(f"{path}/{name}", root, "/", "/", data="x")
+
+
+def test_ls_d_prints_operand_not_contents(kernel, root, capsys):
+    _dir_with_file(kernel, root, "/tmp/dir_x")
+    sh = Shell(kernel, root)
+    sh.handle_line("ls -d /tmp/dir_x")
+    captured = capsys.readouterr()
+
+    assert captured.out == "/tmp/dir_x\n"
+    assert "file" not in captured.out
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_ls_d_relative_operand_prints_operand(kernel, root, capsys):
+    _dir_with_file(kernel, root, "/tmp/dir_x")
+    sh = Shell(kernel, root)
+    sh.handle_line("cd /tmp")
+    sh.handle_line("ls -d dir_x")
+    captured = capsys.readouterr()
+
+    assert captured.out == "dir_x\n"
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_ls_ld_prints_single_long_entry_without_total(kernel, root, capsys):
+    _dir_with_file(kernel, root, "/tmp/dir_x")
+    sh = Shell(kernel, root)
+    sh.handle_line("ls -ld /tmp/dir_x")
+    captured = capsys.readouterr()
+
+    lines = captured.out.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("drwxr-xr-x")
+    assert lines[0].endswith(" /tmp/dir_x")
+    assert "total" not in captured.out
+    assert sh.last_code == 0
+
+
+def test_ls_ld_uses_operand_as_display_name(kernel, root, capsys):
+    _dir_with_file(kernel, root, "/tmp/dir_x")
+    Shell(kernel, root).handle_line("ls -ld /tmp/dir_x")
+    line = capsys.readouterr().out.strip()
+
+    assert line.rsplit(None, 1)[-1] == "/tmp/dir_x"
+    # не basename
+    assert not line.endswith(" dir_x")
+
+
+def test_ls_d_multiple_operands_one_line_each_no_headers(kernel, root, capsys):
+    _dir_with_file(kernel, root, "/tmp/dir_a")
+    _dir_with_file(kernel, root, "/tmp/dir_b")
+    sh = Shell(kernel, root)
+    sh.handle_line("ls -d /tmp/dir_a /tmp/dir_b")
+    captured = capsys.readouterr()
+
+    assert captured.out.splitlines() == ["/tmp/dir_a", "/tmp/dir_b"]
+    assert ":" not in captured.out
+    assert sh.last_code == 0
+
+
+def test_ls_ld_multiple_operands_no_headers(kernel, root, capsys):
+    _dir_with_file(kernel, root, "/tmp/dir_a")
+    _dir_with_file(kernel, root, "/tmp/dir_b")
+    sh = Shell(kernel, root)
+    sh.handle_line("ls -ld /tmp/dir_a /tmp/dir_b")
+    captured = capsys.readouterr()
+
+    lines = captured.out.splitlines()
+    assert len(lines) == 2
+    assert [line.rsplit(None, 1)[-1] for line in lines] == [
+        "/tmp/dir_a", "/tmp/dir_b"]
+    assert "total" not in captured.out
+    assert "/tmp/dir_a:" not in captured.out
+    assert "/tmp/dir_b:" not in captured.out
+
+
+def test_ls_d_symlink_shows_link_not_target(kernel, root, capsys):
+    fs = kernel.fs
+    fs.create_file("/tmp/tgt", root, "/", "/", data="target")
+    fs.symlink("/tmp/tgt", "/tmp/lnk", root, "/", "/")
+    sh = Shell(kernel, root)
+    sh.handle_line("ls -d /tmp/lnk")
+    captured = capsys.readouterr()
+
+    assert captured.out == "/tmp/lnk\n"
+    assert "tgt" not in captured.out
+    assert sh.last_code == 0
+
+
+def test_ls_ld_symlink_shows_link_arrow(kernel, root, capsys):
+    fs = kernel.fs
+    fs.create_file("/tmp/tgt", root, "/", "/", data="target")
+    fs.symlink("/tmp/tgt", "/tmp/lnk", root, "/", "/")
+    Shell(kernel, root).handle_line("ls -ld /tmp/lnk")
+    lines = capsys.readouterr().out.splitlines()
+
+    assert len(lines) == 1
+    assert lines[0].startswith("lrwxrwxrwx")
+    assert lines[0].endswith(" /tmp/lnk -> /tmp/tgt")
+
+
+def test_ls_d_missing_path_stderr_and_code_two(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("ls -d /tmp/absent")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err.strip() == (
+        "ls: cannot access '/tmp/absent': No such file or directory")
+    assert sh.last_code == 2
+
+
+def test_ls_d_permission_denied_for_intermediate_directory(
+        kernel, root, user, capsys):
+    # Нет x на промежуточном /secret → отказ, хотя сам /secret/file — файл.
+    fs = kernel.fs
+    fs.mkdir("/secret", root, "/", "/", mode=0o700)
+    fs.create_file("/secret/file", root, "/", "/", data="x")
+
+    sh = Shell(kernel, user)
+    sh.handle_line("ls -d /secret/file")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err.strip() == (
+        "ls: cannot access '/secret/file': Permission denied")
+    assert sh.last_code == 13
+
+
+def test_ls_d_proc_prints_entry_without_listing(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("ls -d /proc")
+    captured = capsys.readouterr()
+
+    assert captured.out == "/proc\n"
+    assert "version" not in captured.out
+    assert sh.last_code == 0
+
+
+def test_ls_ld_proc_prints_entry_without_listing(kernel, root, capsys):
+    Shell(kernel, root).handle_line("ls -ld /proc")
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+
+    assert len(lines) == 1
+    assert lines[0].startswith("d")
+    assert lines[0].endswith(" /proc")
+    assert "total" not in captured.out
+    assert "version" not in captured.out
+
+
+def test_ls_d_dev_prints_entry_without_listing(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("ls -d /dev")
+    captured = capsys.readouterr()
+
+    assert captured.out == "/dev\n"
+    assert "null" not in captured.out
+    assert sh.last_code == 0
+
+
+def test_ls_without_d_still_lists_directory_contents(kernel, root, capsys):
+    _dir_with_file(kernel, root, "/tmp/dir_x")
+    Shell(kernel, root).handle_line("ls /tmp/dir_x")
+    captured = capsys.readouterr()
+
+    assert captured.out == "file\n"
+    assert captured.err == ""
+
+
+def test_ls_l_without_d_still_prints_total_and_contents(kernel, root, capsys):
+    _dir_with_file(kernel, root, "/tmp/dir_x")
+    Shell(kernel, root).handle_line("ls -l /tmp/dir_x")
+    captured = capsys.readouterr()
+
+    lines = captured.out.splitlines()
+    assert lines[0].startswith("total ")
+    assert any(line.endswith(" file") for line in lines)
+    assert all(not line.endswith(" /tmp/dir_x") for line in lines)

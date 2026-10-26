@@ -46,7 +46,7 @@ def _resolve_args(ctx, args):
     return opts, pos
 
 
-@register("ls", usage="ls [-l] [-a] [-h] [path ...]",
+@register("ls", usage="ls [-l] [-a] [-h] [-d] [path ...]",
           summary="Список содержимого каталога", category="filesystem")
 def cmd_ls(ctx, args, stdin):
     opts, paths = _resolve_args(ctx, args)
@@ -54,6 +54,8 @@ def cmd_ls(ctx, args, stdin):
                    ("l" in o and o.startswith("-")) for o in opts)
     show_all = any("a" in o for o in opts if o.startswith("-"))
     human = any("h" in o for o in opts if o.startswith("-"))
+    # -d: печатать саму запись операнда, не содержимое каталога
+    dir_entry = any("d" in o for o in opts if o.startswith("-"))
     if not paths:
         paths = [ctx.cwd]
 
@@ -62,12 +64,22 @@ def cmd_ls(ctx, args, stdin):
     multi = len(paths) > 1
     for idx, path in enumerate(paths):
         try:
-            # ls -l показывает сам symlink (lstat), не разыменовывая его
+            # ls -l показывает сам symlink (lstat), не разыменовывая его;
+            # ls -d тем более обязан показать саму запись операнда
             node = ctx.fs.lookup(path, ctx.cwd, ctx.home,
-                                 follow=not long_fmt, user=ctx.user)
+                                 follow=not (long_fmt or dir_entry),
+                                 user=ctx.user)
         except PyOSError as exc:
             errors.append(
                 (f"ls: cannot access '{path}': {exc.message}", exc.errno or 1))
+            continue
+
+        if dir_entry:
+            if long_fmt:
+                out_lines.append(
+                    _long_line(ctx, node, human, display_name=path))
+            else:
+                out_lines.append(path)
             continue
 
         if node.is_dir():
@@ -117,13 +129,13 @@ def _fmt_size(size, human=False):
     return str(int(value))
 
 
-def _long_line(ctx, node, human=False):
+def _long_line(ctx, node, human=False, display_name=None):
     owner = ctx.users.get_by_uid(node.uid)
     owner_name = owner.name if owner else str(node.uid)
     group_name = ctx.users.group_name(node.gid)
-    name = node.name
+    name = node.name if display_name is None else display_name
     if node.is_link():
-        name = f"{node.name} -> {node.target}"
+        name = f"{name} -> {node.target}"
     size = getattr(node, "size", 0)
     return (f"{node.perm_string()} {node.nlink:>2} {owner_name:<8} "
             f"{group_name:<8} {_fmt_size(size, human):>6} "
