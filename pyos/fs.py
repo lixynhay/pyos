@@ -433,6 +433,8 @@ class FileSystem:
         head, _, tail = norm.rpartition("/")
         head = head or "/"
         parent = self._walk(head, "/", "/", True, 0, user)
+        if not parent.is_dir():
+            raise NotADirectory(norm)
         return parent, tail, norm
 
     # -- права ---------------------------------------------------------------
