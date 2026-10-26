@@ -307,8 +307,17 @@ def split_and_or(tokens: list[Token]):
 
 
 def _without_empty_segments(segments):
-    """Убирает сегменты, состоящие только из пробелов."""
-    return [(raw, connector) for raw, connector in segments if raw.strip()]
+    """Отбрасывает пустое задание, сохраняя пустые сегменты внутри ``&&``/``||``.
+
+    Пустое задание получается при делении по ``;`` / ``&`` (строка ``;``,
+    ``;;`` или завершающий ``;``) — такие задания шелл молча пропускает.
+    Пустой сегмент внутри цепочки ``&&`` / ``||`` — синтаксическая ошибка:
+    её печатает ``_execute_segments``, когда до сегмента доходит очередь
+    (после short-circuit он не выполняется и не ошибка).
+    """
+    if len(segments) == 1 and not segments[0][0].strip():
+        return []
+    return segments
 
 
 def split_raw_jobs(line: str):

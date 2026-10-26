@@ -438,3 +438,52 @@ def test_readme_example_name_alice_default_guest(kernel, root, capsys):
     shell = Shell(kernel, root)
     shell.handle_line("NAME=Alice; echo ${NAME:-guest}")
     assert capsys.readouterr().out.strip() == "Alice"
+
+
+def test_assignment_before_and_operator_still_works(kernel, root, capsys):
+    """Присваивание до && видно правому сегменту и сохраняется в шелле."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X && echo $NAME")
+    assert capsys.readouterr().out.strip() == "X"
+    assert shell._locals.get("NAME") == "X"
+
+
+def test_assignment_before_or_operator_still_works(kernel, root, capsys):
+    """Присваивание до || выполняется, || не запускает правый сегмент."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=X || echo fail")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == ""
+    assert captured.err == ""
+    assert shell.last_code == 0
+    assert shell._locals.get("NAME") == "X"
+
+
+def test_short_circuit_prevents_assignment_still_works(kernel, root, capsys):
+    """Сегмент, пропущенный по &&, не выполняет присваивание."""
+    shell = Shell(kernel, root)
+    shell.handle_line("false && NAME=X; echo ${NAME:-guest}")
+    assert capsys.readouterr().out.strip() == "guest"
+    assert "NAME" not in shell._locals
+
+
+def test_cd_then_pwd_same_line(kernel, root, capsys):
+    """$PWD пересчитывается перед каждым сегментом: cd виден дальше в строке."""
+    shell = Shell(kernel, root)
+    shell.handle_line("cd /tmp; echo $PWD")
+    assert capsys.readouterr().out.strip() == "/tmp"
+
+
+def test_var_default_assign_persists_same_line(kernel, root, capsys):
+    """${VAR:=word} сохраняет значение в шелле, а не только в выводе."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=; echo ${NAME:=guest}")
+    assert capsys.readouterr().out.strip() == "guest"
+    assert shell._locals.get("NAME") == "guest"
+
+
+def test_var_default_assign_then_echo_variable(kernel, root, capsys):
+    """После ${VAR:=word} следующая команда той же строки видит значение."""
+    shell = Shell(kernel, root)
+    shell.handle_line("NAME=; echo ${NAME:=guest}; echo $NAME")
+    assert capsys.readouterr().out.strip().splitlines() == ["guest", "guest"]

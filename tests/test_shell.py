@@ -225,3 +225,81 @@ def test_nice_background_bare_number_applies_value(kernel, root, capsys):
     proc = kernel.get_process(sh.jobs[-1]["pid"])
     assert proc is not None
     assert proc.nice == 5
+
+
+# --- пустые команды после && / || --------------------------------------------
+# Поведение как в main: пустой сегмент — синтаксическая ошибка, но только
+# если до него дошла очередь; после short-circuit он не выполняется.
+
+def test_trailing_and_operator_is_syntax_error(kernel, root, capsys):
+    """Пустая команда после &&, до которой дошла очередь, — syntax error."""
+    Shell(kernel, root).handle_line("echo hi &&")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "hi"
+    assert "syntax error: empty command" in captured.err
+
+
+def test_trailing_or_operator_is_syntax_error(kernel, root, capsys):
+    """Пустая команда после || при неуспехе слева — syntax error."""
+    Shell(kernel, root).handle_line("false ||")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == ""
+    assert "syntax error: empty command" in captured.err
+
+
+def test_trailing_or_after_success_is_skipped(kernel, root, capsys):
+    """После успеха || не выполняет пустую команду и не печатает ошибку."""
+    Shell(kernel, root).handle_line("echo hi ||")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "hi"
+    assert captured.err == ""
+
+
+def test_leading_and_operator_is_syntax_error(kernel, root, capsys):
+    """Пустая команда перед && — ошибка, правый сегмент не выполняется."""
+    Shell(kernel, root).handle_line("&& echo hi")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == ""
+    assert "syntax error: empty command" in captured.err
+
+
+def test_leading_or_operator_is_syntax_error(kernel, root, capsys):
+    """Пустая команда перед || — ошибка, затем выполняется правый сегмент."""
+    Shell(kernel, root).handle_line("|| echo hi")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "hi"
+    assert "syntax error: empty command" in captured.err
+
+
+def test_double_operator_sequence_is_syntax_error(kernel, root, capsys):
+    """&& || даёт ошибку пустой команды и продолжает цепочку по ||."""
+    Shell(kernel, root).handle_line("echo hi && || echo bye")
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["hi", "bye"]
+    assert "syntax error: empty command" in captured.err
+
+
+def test_valid_and_chain_still_works(kernel, root, capsys):
+    """Корректная цепочка && выполняется без ошибок."""
+    Shell(kernel, root).handle_line("echo hi && echo bye")
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["hi", "bye"]
+    assert captured.err == ""
+
+
+def test_valid_or_chain_still_works(kernel, root, capsys):
+    """Корректная цепочка || не выполняет правый сегмент после успеха."""
+    Shell(kernel, root).handle_line("echo hi || true")
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "hi"
+    assert captured.err == ""
+
+
+def test_background_chain_still_works(kernel, root, capsys):
+    """Фоновая цепочка && по-прежнему выполняется целиком."""
+    sh = Shell(kernel, root)
+    sh.handle_line("echo bg1 && echo bg2 &")
+    assert capsys.readouterr().out.strip().startswith("[1]")
+    kernel.scheduler.drain()
+    out = capsys.readouterr().out
+    assert "bg1" in out and "bg2" in out
