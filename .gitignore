@@ -1,11 +1,43 @@
+# Python bytecode / caches
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+
+# Coverage / build artifacts
 .coverage
 htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local environment files
+.env
+.env.*
+
+# Temporary files and logs
+*.tmp
+*.temp
+*.log
+logs/
+
+# pyOS snapshots
 pyos-snapshot.json
+pyos-*.json
 *.snapshot.json
+snapshot-*.json
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
