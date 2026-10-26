@@ -586,7 +586,7 @@ def test_glob_absolute_output_remains_documented_limit(kernel, root, user,
 
 def test_sticky_tmp_not_enforced_currently(kernel, root, user, capsys):
     # DOCUMENTED LIMIT: sticky-бит /tmp (1777) не enforced — rm чужого файла
-    # проходит при праве w на каталоге; README:43-45, 512-513.
+    # проходит при праве w на каталоге; README:70-72, 618-619.
     fs = kernel.fs
     fs.create_file("/tmp/root_file", root, "/", "/",
                    data="root", mode=0o644)
