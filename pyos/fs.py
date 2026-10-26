@@ -97,13 +97,21 @@ class Node:
         return S_IFREG | self.mode
 
     def perm_string(self) -> str:
-        """Возвращает строку вида ``-rwxr-xr-x``."""
+        """Возвращает строку вида ``-rwxr-xr-x``.
+
+        Sticky bit (``0o1000``) рендерится как POSIX ``t``/``T`` на позиции
+        other-execute: ``t`` при выставленном other-x, иначе ``T``.
+        ``setuid``/``setgid`` намеренно не рендерятся: в pyos они не enforced,
+        и ``s``/``S`` создали бы ложное впечатление работающей семантики.
+        """
         out = [self.type_char]
         for shift in (6, 3, 0):
             bits = (self.mode >> shift) & 7
             out.append("r" if bits & R_BIT else "-")
             out.append("w" if bits & W_BIT else "-")
             out.append("x" if bits & X_BIT else "-")
+        if self.mode & STICKY_BIT:
+            out[-1] = "t" if out[-1] == "x" else "T"
         return "".join(out)
 
     def touch_mtime(self):
