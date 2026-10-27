@@ -422,6 +422,14 @@ class Shell:
 
     # -- утилиты -------------------------------------------------------------
     def write_stdout(self, text):
+        if isinstance(text, bytes):
+            # В терминал пишем только текст: raw bytes не должны попадать
+            # в sys.stdout (это ломает capsys/capfd и засоряет tty).
+            try:
+                text = text.decode("utf-8")
+            except UnicodeDecodeError:
+                self.write_stderr("pyos: binary output suppressed")
+                return
         if not text:
             return
         sys.stdout.write(text)
@@ -602,6 +610,14 @@ class Shell:
 
     def execute_pipeline(self, cmds, user=None):
         user = user or self.user
+        # Транспорт пайплайна умеет переносить и str, и bytes: _normalize
+        # сохраняет bytes (не приводит к "b'...'"), поэтому байтовый вывод
+        # команды доходит до следующей стадии без перекодирования.
+        #
+        # str намеренно остаётся str: команды, которые склеивают stdin с
+        # текстом (например, `cat -`), пока не умеют смешивать типы, и
+        # принудительное str -> bytes сломало бы их пользовательское
+        # поведение. Начальный stdin тоже остаётся "" по той же причине.
         stdin_data = ""
         out = err = ""
         code = 0
@@ -724,6 +740,10 @@ class Shell:
     def _normalize(result):
         if result is None:
             return "", 0
+        if isinstance(result, bytes):
+            # bytes — законный вывод команды (binary-capable pipeline);
+            # не превращаем его в "b'...'".
+            return result, 0
         if isinstance(result, str):
             return result, 0
         if isinstance(result, tuple):
