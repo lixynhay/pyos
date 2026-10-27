@@ -225,9 +225,10 @@ python -m pyos
   понятную ошибку `cat: binary file: PATH (not valid UTF-8)` без traceback и
   без raw-вывода; binary stdin в терминале подавляется сообщением
   `pyos: binary output suppressed`;
-- `grep` не печатает строки binary-файла. Если шаблон найден по точным bytes,
-  выводится `Binary file PATH matches`; binary **stdin** для `grep` не
-  поддерживается (strict UTF-8);
+- `grep` не печатает строки binary-данных. Если шаблон найден по точным bytes,
+  выводится `Binary file PATH matches`; для binary **stdin** действует та же
+  policy: `Binary file <stdin> matches`, exit 0, а при отсутствии совпадения —
+  пустой stdout и exit 1. `grep -a` не реализован;
 - `head`, `tail`, `sort`, `uniq`, `rev` и `cut` на невалидном UTF-8 дают
   ошибку `<команда>: not valid UTF-8 text: PATH`, а на binary stdin —
   `<команда>: not valid UTF-8 text: <stdin>`; файл не обрабатывается
@@ -245,8 +246,8 @@ python -m pyos
 
 Шелл передаёт данные между стадиями без принудительного перекодирования:
 `str` остаётся `str`, `bytes` остаются `bytes`. Binary-safe путь реализован
-для `cat`, `wc -c` и `curl`; остальные текстовые утилиты сознательно остаются
-strict UTF-8.
+для `cat`, `wc -c`, `curl` и stdin-режима `grep`; остальные текстовые утилиты
+сознательно остаются strict UTF-8.
 
 - ФС хранит regular-файлы как bytes, `read_bytes()` возвращает их точно;
 - `cat FILE...` при stdout **не в терминале** (pipe или `>`/`>>`) возвращает
@@ -264,6 +265,9 @@ strict UTF-8.
 - `curl URL | wc -c` даёт точное число байт тела, `curl URL | cat > FILE`
   пишет точные bytes, `curl URL > FILE` и `>> FILE` пишут/дописывают тело
   как есть, с кодом 0;
+- `grep PATTERN` на binary stdin выполняет raw-поиск по bytes и печатает
+  `Binary file <stdin> matches` (exit 0) либо ничего (exit 1), не выводя
+  matched строки;
 - raw binary в терминал не печатается никогда: последняя стадия без
   редиректа декодирует bytes как UTF-8 и при ошибке выводит
   `pyos: binary output suppressed` в stderr.
@@ -273,14 +277,13 @@ strict UTF-8.
 - код завершения pipeline — код **последней** команды; `pipefail` нет,
   поэтому ошибка upstream может маскироваться, если downstream завершился
   успешно или не читал binary-поток;
-- `grep`, `head`, `tail`, `sort`, `uniq`, `rev`, `cut` и `tr` остаются
-  strict UTF-8 для stdin: binary stdin даёт
-  `<команда>: not valid UTF-8 text: <stdin>`;
+- `head`, `tail`, `sort`, `uniq`, `rev`, `cut` и `tr` остаются strict UTF-8
+  для stdin: binary stdin даёт `<команда>: not valid UTF-8 text: <stdin>`;
 - `cat BIN | sort` (и аналогичные) по-прежнему завершается ошибкой текстовой
   утилиты — это допустимое поведение, а не регресс;
-- binary stdin для `grep` и режимы `head -c`/`tail -c` не реализованы;
-- binary-safe покрывает `cat`, `wc -c`, `curl` и редиректы; произвольная
-  команда не обязана возвращать bytes.
+- `grep -a` не реализован; `head -c`/`tail -c` не реализованы;
+- binary-safe покрывает `cat`, `wc -c`, `curl`, stdin-режим `grep` и
+  редиректы; произвольная команда не обязана возвращать bytes.
 
 ### Пакетный менеджер
 
@@ -770,10 +773,10 @@ pyos/
   parent-child waitpid нет.
 - Binary pipeline поддержан только частично: `cat` и `curl` могут передавать
   точные bytes через `|` и `>`/`>>`, `wc -c` считает bytes из файлов, stdin
-  и pipeline. Остальные текстовые утилиты (`grep`, `head`, `tail`, `sort`,
-  `uniq`, `rev`, `cut`, `tr`) требуют валидный UTF-8 на stdin; `pipefail`
-  нет, код завершения — код последней команды. Raw binary в терминал не
-  выводится.
+  и pipeline, `grep` на binary stdin выдаёт `Binary file <stdin> matches`.
+  Остальные текстовые утилиты (`head`, `tail`, `sort`, `uniq`, `rev`, `cut`,
+  `tr`) требуют валидный UTF-8 на stdin; `pipefail` нет, код завершения —
+  код последней команды. Raw binary в терминал не выводится.
 - `setuid`/`setgid`-биты хранятся в `mode`, но не enforced: смена
   эффективных uid/gid при исполнении файла не моделируется. В permission
   string они не рендерятся как `s`/`S` (чтобы не создавать ложного
