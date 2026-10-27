@@ -18,6 +18,7 @@ from pyos.shell import Shell
 
 BIN = b"PYOS-BINARY-EXAMPLE\x00\xff\x10\n"
 BIN2 = b"\x00second\xff"
+NEEDLE_BIN = b"PYOS\x00needle\xff\x10\n"
 TEXT = b"b\na\nb\n"
 
 
@@ -260,18 +261,107 @@ def test_wc_c_input_redirect_binary_exact_count(kernel, root, capsys):
     assert sh.exit_code == 0
 
 
-# -- text utilities: binary stdin is still strict text ----------------------
+# -- text utilities: grep follows the binary-file policy on stdin -----------
 
-def test_grep_binary_stdin_still_strict_text(kernel, root, capsys):
-    _write(kernel, root, "/tmp/bin", BIN)
+def test_grep_binary_stdin_match_reports_binary_file_stdin(
+        kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", NEEDLE_BIN)
     sh = _shell(kernel, root)
 
     sh.handle_line("cat /tmp/bin | grep needle")
     captured = capsys.readouterr()
 
+    assert captured.out == "Binary file <stdin> matches\n"
+    assert captured.err == ""
+    assert sh.exit_code == 0
+
+
+def test_grep_binary_stdin_no_match_exits_one(kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", NEEDLE_BIN)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/bin | grep absent")
+    captured = capsys.readouterr()
+
     assert captured.out == ""
-    assert captured.err == "grep: not valid UTF-8 text: <stdin>\n"
-    assert sh.exit_code == 22
+    assert captured.err == ""
+    assert sh.exit_code == 1
+
+
+def test_cat_binary_pipe_grep_after_bs7(kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", NEEDLE_BIN)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/bin | grep needle")
+    captured = capsys.readouterr()
+
+    assert "not valid UTF-8 text" not in captured.err
+    assert captured.out == "Binary file <stdin> matches\n"
+    assert sh.exit_code == 0
+
+
+def test_grep_binary_stdin_does_not_print_raw_matched_lines(
+        kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", NEEDLE_BIN)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/bin | grep needle")
+    captured = capsys.readouterr()
+
+    assert captured.out == "Binary file <stdin> matches\n"
+    assert "needle" not in captured.out
+    assert "\x00" not in captured.out
+    assert "\xff" not in captured.out
+
+
+def test_grep_binary_stdin_invalid_utf8_no_traceback(kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", b"\x00\xff\xc3needle\x80")
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/bin | grep needle")
+    captured = capsys.readouterr()
+
+    assert "Traceback" not in captured.out + captured.err
+    assert captured.out == "Binary file <stdin> matches\n"
+    assert sh.exit_code == 0
+
+
+def test_grep_binary_file_unchanged(kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", NEEDLE_BIN)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("grep needle /tmp/bin")
+    captured = capsys.readouterr()
+
+    assert captured.out == "Binary file /tmp/bin matches\n"
+    assert captured.err == ""
+    assert sh.exit_code == 0
+
+
+def test_grep_text_stdin_unchanged(kernel, root, capsys):
+    sh = _shell(kernel, root)
+
+    sh.handle_line("echo hello | grep hello")
+    captured = capsys.readouterr()
+
+    assert captured.out == "hello\n"
+    assert captured.err == ""
+    assert sh.exit_code == 0
+
+
+def test_grep_text_stdin_options_unchanged(kernel, root, capsys):
+    _write(kernel, root, "/tmp/text", b"Apple\nbanana\n")
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/text | grep -i apple")
+    captured = capsys.readouterr()
+    assert captured.out == "Apple\n"
+    assert sh.exit_code == 0
+
+    sh.handle_line("cat /tmp/text | grep -v Apple")
+    captured = capsys.readouterr()
+    assert captured.out == "banana\n"
+    assert sh.exit_code == 0
 
 
 def test_sort_binary_stdin_still_strict_text(kernel, root, capsys):

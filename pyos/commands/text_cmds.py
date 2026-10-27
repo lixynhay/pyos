@@ -143,7 +143,15 @@ def cmd_grep(ctx, args, stdin):
         raise InvalidArgument(f"grep: invalid pattern: {exc}")
 
     if not files or files == ["-"]:
-        text = _stdin_text("grep", stdin)
+        raw = _stdin_bytes(stdin)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # Та же policy, что и для binary-файлов: raw-поиск по bytes,
+            # без декодирования с заменами и без печати binary-строк.
+            if _grep_binary_match(raw, pattern, flags, invert):
+                return ("Binary file <stdin> matches", 0)
+            return ("", 1)
         out, matched = _grep_text(rx, text, invert, numbered, 1)
         return ("\n".join(out), 0 if matched else 1)
 
