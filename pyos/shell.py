@@ -20,11 +20,12 @@ from .context import Context
 from .errors import InvalidArgument, PyOSError, UserError
 from .process import ProcessState
 from .scheduler import TICKS_PER_SECOND
+from .signals import signal_name, signal_number
 
 BUILTIN_NAMES = {
     "exit", "export", "unset", "alias", "unalias", "history",
     "jobs", "fg", "bg", "wait", "waitpid",
-    "su", "sudo", "source", "set", "nice",
+    "su", "sudo", "source", "set", "nice", "trap",
 }
 
 # Короткий usage для help/man. Полноценных man-страниц у builtins нет.
@@ -35,6 +36,8 @@ BUILTIN_USAGE = {
     "fg": "fg [%job|pid]",
     "bg": "bg [%job|pid]",
     "nice": "nice [-n N] command [args...]\n    nice N command [args...]",
+    # Сейчас поддерживается только EXIT; настоящие сигналы отклоняются.
+    "trap": "trap [action] EXIT\n    trap - EXIT\n    trap",
 }
 
 
@@ -398,6 +401,10 @@ class Shell:
         self.jobs: list[dict] = []
         self._next_job = 1
         self._in_worker = False
+        # TRAP-2: хранится только EXIT. Настоящие сигналы не поддерживаются.
+        self._exit_trap: str | None = None
+        self._exit_trap_done = False
+        self._exit_override: int | None = None
         # stdout текущей стадии; обновляется run_single и читается builtins,
         # которые запускают вложенную команду (nice, sudo).
         self._stdout_is_terminal = True
@@ -464,6 +471,7 @@ class Shell:
                 line = input(self.prompt())
             except EOFError:
                 sys.stdout.write("\nexit\n")
+                self._shutdown_shell(self.last_code)
                 break
             except KeyboardInterrupt:
                 sys.stdout.write("\n^C\n")
@@ -476,6 +484,9 @@ class Shell:
             return
         self.history.append(line)
         for segments, background in split_raw_jobs(line):
+            if not self.running:
+                # exit остановил шелл: остаток строки не исполняется.
+                break
             if not segments:
                 continue
             try:
@@ -524,6 +535,9 @@ class Shell:
         code = 0
         run = True
         for raw, connector in segments:
+            if not self.running:
+                # exit остановил шелл: остаток сегментов не исполняется.
+                break
             if run:
                 env = self._segment_env()
                 before = dict(env)
@@ -563,6 +577,9 @@ class Shell:
         code = 0
         run = True
         for seg_tokens, connector in segments:
+            if not self.running:
+                # exit остановил шелл: остаток цепочки && / || не исполняется.
+                break
             if run:
                 try:
                     cmds = parse_pipeline(seg_tokens)
@@ -999,14 +1016,114 @@ class Shell:
             return "", f"{name}: {exc}", 1
 
     def _bi_exit(self, args, stdin, user):
-        code = 0
         if args:
             try:
                 code = int(args[0])
             except ValueError:
                 code = 0
-        self.exit_code = code
+        else:
+            # exit без аргумента сохраняет текущий $?.
+            code = self.last_code
+        self._shutdown_shell(code)
+        return None, self.exit_code
+
+    # -- EXIT trap -----------------------------------------------------------
+    def _shutdown_shell(self, exit_code: int) -> None:
+        """Останавливает шелл и один раз выполняет EXIT trap.
+
+        Guard ``_exit_trap_done`` не даёт запустить handler повторно, в том
+        числе если handler сам вызывает ``exit``. Handler исполняется тем же
+        shell-парсером (без Python eval) и не попадает в history.
+        """
         self.running = False
+        if self._exit_trap_done:
+            # Повторный exit (например, изнутри handler): код уточняется,
+            # второй запуск handler не происходит.
+            self.exit_code = exit_code
+            self._exit_override = exit_code
+            return
+
+        self._exit_trap_done = True
+        self.exit_code = exit_code
+        self.last_code = exit_code
+        self.env["?"] = str(exit_code)
+
+        handler = self._exit_trap
+        if handler is None:
+            return
+
+        self._exit_override = None
+        # Handler должен исполниться, хотя шелл уже остановлен; собственный
+        # exit внутри handler снова выставит running=False и оборвёт остаток.
+        self.running = True
+        try:
+            self._run_exit_trap(handler)
+        except Exception as exc:  # noqa: BLE001 - шелл обязан завершиться
+            self.write_stderr(f"trap: handler failed: {exc}")
+        finally:
+            self.running = False
+
+        if self._exit_override is not None:
+            exit_code = self._exit_override
+        self.exit_code = exit_code
+        self.last_code = exit_code
+        self.env["?"] = str(exit_code)
+
+    def _run_exit_trap(self, handler: str) -> None:
+        """Выполняет handler как обычную shell-строку."""
+        jobs = split_raw_jobs(handler)
+        if any(background for _, background in jobs):
+            self.write_stderr(
+                "trap: background jobs are not allowed in EXIT trap")
+            return
+        for segments, _background in jobs:
+            if not self.running:
+                # handler вызвал exit: остаток handler не исполняется.
+                break
+            if segments:
+                self.run_segments(segments)
+
+    @staticmethod
+    def _quote_trap_action(handler: str) -> str:
+        """POSIX-подобное экранирование handler в одинарных кавычках."""
+        return "'" + handler.replace("'", "'\\''") + "'"
+
+    def _bi_trap(self, args, stdin, user):
+        if self._in_worker:
+            self.write_stderr("trap: not supported in background job")
+            return None, 2
+
+        if not args:
+            if self._exit_trap is not None:
+                return (f"trap -- {self._quote_trap_action(self._exit_trap)}"
+                        " EXIT")
+            return None
+
+        action = str(args[0])
+        specs = [str(a) for a in args[1:]]
+        if not specs:
+            self.write_stderr("trap: EXIT expected")
+            return None, 2
+
+        # Сначала валидируются все сигналы: при ошибке состояние не меняется.
+        for spec in specs:
+            if spec.upper() == "EXIT":
+                continue
+            number = signal_number(spec)
+            if number is not None:
+                self.write_stderr(
+                    f"trap: signal is not supported yet: {signal_name(number)}")
+                return None, 2
+            self.write_stderr(f"trap: invalid signal specification: {spec}")
+            return None, 2
+
+        if action == "":
+            self.write_stderr("trap: cannot ignore EXIT")
+            return None, 2
+        if action == "-":
+            self._exit_trap = None
+            return None
+        self._exit_trap = action
         return None
 
     def _bi_export(self, args, stdin, user):

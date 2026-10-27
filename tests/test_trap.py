@@ -1,8 +1,11 @@
-"""TRAP-1: characterize the signal, jobs and exit model before ``trap``.
+"""TRAP-1/TRAP-2: signal model characterization and the EXIT-only trap.
 
-These tests pin down behavior that exists before ``trap`` is implemented. They
-are intended to be inverted or extended in TRAP-2..TRAP-5; nothing here should
-be softened on the way.
+TRAP-1 tests pin down behavior that existed before ``trap``. TRAP-2 inverts
+the four trap/exit expectations and adds the EXIT trap contract: storage,
+validation, printing, background guard and one-shot execution.
+
+Real signals are still not supported: ``trap`` rejects them explicitly. Signal
+delivery, ``kill`` and the process model are intentionally untouched.
 
 Determinism notes:
 
@@ -57,47 +60,48 @@ def _assert_signal_terminates_job(kernel, root, capsys, spec, expected):
     assert kernel.get_process(job["pid"]) is None
 
 
-# -- A. trap is absent -------------------------------------------------------
+# -- A. trap builtin basics --------------------------------------------------
 
 
-def test_current_trap_command_not_found(kernel, root, capsys):
+def test_fixed_trap_builtin_bare_prints_nothing(kernel, root, capsys):
     sh = Shell(kernel, root)
+    assert "trap" in sh.builtins
+    # trap is a shell builtin, not a registry command.
+    assert get_command("trap") is None
 
     sh.handle_line("trap")
     captured = capsys.readouterr()
 
     assert captured.out == ""
-    assert captured.err == "trap: command not found\n"
-    assert sh.last_code == 127
-    assert sh.exit_code == 127
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert sh.exit_code == 0
     assert sh.running is True
-    # Baseline for TRAP-2: trap is neither a builtin nor a registered command.
-    assert "trap" not in sh.builtins
-    assert get_command("trap") is None
 
 
-def test_current_trap_with_signal_command_not_found(kernel, root, capsys):
+def test_fixed_trap_signal_reports_unsupported(kernel, root, capsys):
     sh = Shell(kernel, root)
 
     sh.handle_line("trap 'echo hi' INT")
     captured = capsys.readouterr()
 
     assert captured.out == ""
-    assert captured.err == "trap: command not found\n"
-    assert sh.last_code == 127
-    assert sh.exit_code == 127
+    assert captured.err == "trap: signal is not supported yet: INT\n"
+    assert sh.last_code == 2
+    assert sh.exit_code == 2
+    assert sh._exit_trap is None
 
 
-def test_current_trap_exit_command_not_found(kernel, root, capsys):
+def test_fixed_trap_exit_sets_exit_trap(kernel, root, capsys):
     sh = Shell(kernel, root)
 
     sh.handle_line("trap 'echo bye' EXIT")
     captured = capsys.readouterr()
 
     assert captured.out == ""
-    assert captured.err == "trap: command not found\n"
-    assert sh.last_code == 127
-    assert sh.exit_code == 127
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert sh._exit_trap == "echo bye"
 
 
 # -- B. terminating signals on background jobs -------------------------------
@@ -351,100 +355,477 @@ def test_current_jobs_history_after_kill_remains_documented_limit(
     assert f"[{job['id']}] Done(143) sleep 100" in out
 
 
-# -- F. current exit behavior ------------------------------------------------
+# -- F. EXIT trap storage, printing and validation ---------------------------
 
 
-def test_current_exit_sets_shell_not_running(kernel, root, capsys):
+def test_trap_exit_set_and_print(kernel, root, capsys):
     sh = Shell(kernel, root)
 
-    sh.handle_line("exit")
+    sh.handle_line("trap 'echo bye' EXIT")
+    assert capsys.readouterr().err == ""
+    assert sh._exit_trap == "echo bye"
+
+    sh.handle_line("trap")
     captured = capsys.readouterr()
 
-    assert captured.out == ""
+    assert captured.out == "trap -- 'echo bye' EXIT\n"
     assert captured.err == ""
-    assert sh.running is False
-    assert sh.exit_code == 0
     assert sh.last_code == 0
 
 
-def test_current_exit_with_code_sets_exit_code(kernel, root, capsys):
-    """CHARACTERIZE current behavior: the requested code is not preserved.
-
-    ``_bi_exit`` assigns ``exit_code = 7``, but ``handle_line`` overwrites
-    ``exit_code`` with the segment status (0). Public behavior is therefore 0,
-    not 7; TRAP-3 has to decide the target explicitly instead of assuming 7.
-    """
+def test_trap_bare_prints_nothing_when_no_exit_trap(kernel, root, capsys):
     sh = Shell(kernel, root)
 
-    sh.handle_line("exit 7")
+    sh.handle_line("trap")
     captured = capsys.readouterr()
 
     assert captured.out == ""
     assert captured.err == ""
-    assert sh.running is False
     assert sh.last_code == 0
-    assert sh.exit_code == 0  # NOT 7: current bug, characterization only
 
 
-def test_current_exit_does_not_stop_rest_of_line_current_bug(kernel, root,
-                                                             capsys):
+def test_trap_exit_reset(kernel, root, capsys):
     sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo bye' EXIT")
+    capsys.readouterr()
 
-    # CHARACTERIZE current bug, will be fixed in TRAP-3: the segments after
-    # exit still run because handle_line does not check shell.running.
-    sh.handle_line("exit; echo after")
+    sh.handle_line("trap - EXIT")
     captured = capsys.readouterr()
 
-    assert captured.out == "after\n"
-    assert captured.err == ""
-    assert sh.running is False
-    assert sh.exit_code == 0
-
-
-def test_current_exit_in_pipeline_or_segment_current_behavior(kernel, root,
-                                                              capsys):
-    sh = Shell(kernel, root)
-    sh.handle_line("true && exit; echo after")
-    captured = capsys.readouterr()
-
-    # exit inside && still lets the following top-level segment run.
-    assert captured.out == "after\n"
-    assert captured.err == ""
-    assert sh.running is False
-
-    piped = Shell(kernel, root)
-    piped.handle_line("exit | cat")
-    captured = capsys.readouterr()
-
-    # exit runs in-process inside the pipeline stage: no output, shell stops.
     assert captured.out == ""
     assert captured.err == ""
-    assert piped.running is False
-    assert piped.exit_code == 0
+    assert sh.last_code == 0
+    assert sh._exit_trap is None
+
+    sh.handle_line("trap")
+    assert capsys.readouterr().out == ""
 
 
-# -- G. background isolation baseline ---------------------------------------
-
-
-def test_current_background_job_does_not_have_trap_builtin(kernel, root,
-                                                           capsys):
+def test_trap_escapes_single_quote_in_exit_handler(kernel, root, capsys):
     sh = Shell(kernel, root)
 
-    sh.handle_line("trap 'echo hi' INT &")
+    # Shell-level handler value: it's
+    sh.handle_line("trap 'it'\\''s' EXIT")
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert sh._exit_trap == "it's"
+
+    sh.handle_line("trap")
+    captured = capsys.readouterr()
+    assert captured.out == "trap -- 'it'\\''s' EXIT\n"
+
+
+def test_trap_double_quoted_handler_expanded_at_install(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line('X=hi; trap "echo $X" EXIT')
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    # Double quotes expand at install time, so the handler is already "echo hi".
+    assert sh._exit_trap == "echo hi"
+
+
+def test_trap_duplicate_exit_signals_allowed(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo once' EXIT EXIT")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert sh._exit_trap == "echo once"
+
+
+def test_trap_invalid_signal_does_not_set_exit_trap(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo hi' NOPE")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "trap: invalid signal specification: NOPE\n"
+    assert sh.last_code == 2
+    assert sh._exit_trap is None
+
+
+def test_trap_mixed_exit_and_int_is_atomic_failure(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo keep' EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("trap 'echo new' EXIT INT")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "trap: signal is not supported yet: INT\n"
+    assert sh.last_code == 2
+    # Atomic: EXIT was not overwritten by the failing command.
+    assert sh._exit_trap == "echo keep"
+
+    sh.handle_line("trap - EXIT INT")
+    captured = capsys.readouterr()
+
+    assert captured.err == "trap: signal is not supported yet: INT\n"
+    assert sh.last_code == 2
+    assert sh._exit_trap == "echo keep"
+
+
+def test_trap_ignore_exit_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap '' EXIT")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "trap: cannot ignore EXIT\n"
+    assert sh.last_code == 2
+    assert sh.exit_code == 2
+    assert sh._exit_trap is None
+
+
+def test_trap_missing_signal_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo hi'")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "trap: EXIT expected\n"
+    assert sh.last_code == 2
+    assert sh._exit_trap is None
+
+
+def test_trap_reset_missing_signal_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo keep' EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("trap -")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "trap: EXIT expected\n"
+    assert sh.last_code == 2
+    assert sh._exit_trap == "echo keep"
+
+
+# -- G. real signals are explicitly unsupported ------------------------------
+
+
+def _assert_trap_signal_unsupported(kernel, root, capsys, spec, canonical):
+    sh = Shell(kernel, root)
+
+    sh.handle_line(f"trap 'echo hi' {spec}")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == (
+        f"trap: signal is not supported yet: {canonical}\n")
+    assert sh.last_code == 2
+    assert sh.exit_code == 2
+    assert sh._exit_trap is None
+
+
+def test_trap_int_unsupported_yet(kernel, root, capsys):
+    _assert_trap_signal_unsupported(kernel, root, capsys, "INT", "INT")
+
+
+def test_trap_term_unsupported_yet(kernel, root, capsys):
+    _assert_trap_signal_unsupported(kernel, root, capsys, "TERM", "TERM")
+
+
+def test_trap_hup_unsupported_yet(kernel, root, capsys):
+    _assert_trap_signal_unsupported(kernel, root, capsys, "HUP", "HUP")
+
+
+def test_trap_kill_unsupported_yet(kernel, root, capsys):
+    _assert_trap_signal_unsupported(kernel, root, capsys, "KILL", "KILL")
+
+
+def test_trap_stop_unsupported_yet(kernel, root, capsys):
+    _assert_trap_signal_unsupported(kernel, root, capsys, "STOP", "STOP")
+
+
+def test_trap_chld_unsupported_yet(kernel, root, capsys):
+    _assert_trap_signal_unsupported(kernel, root, capsys, "CHLD", "CHLD")
+
+
+def test_trap_numeric_signal_unsupported_yet(kernel, root, capsys):
+    _assert_trap_signal_unsupported(kernel, root, capsys, "15", "TERM")
+
+
+def test_trap_sig_prefix_unsupported_yet(kernel, root, capsys):
+    _assert_trap_signal_unsupported(kernel, root, capsys, "SIGINT", "INT")
+
+
+def test_trap_unknown_signal_invalid(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo hi' NOPE")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "trap: invalid signal specification: NOPE\n"
+    assert sh.last_code == 2
+    assert sh._exit_trap is None
+
+
+# -- H. background guard -----------------------------------------------------
+
+
+def test_trap_in_background_job_is_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo bg' EXIT &")
     captured = capsys.readouterr()
     job = sh.jobs[0]
-
     assert captured.err == ""
     assert captured.out == f"[{job['id']}] {job['pid']}\n"
 
     sh.handle_line(f"wait {job['pid']}")
     captured = capsys.readouterr()
 
-    # The background worker uses the same Shell and hits the same missing
-    # command. TRAP-5 target: an explicit background restriction instead of
-    # command-not-found.
-    assert captured.err == "trap: command not found\n"
-    assert f"Done(127) {job['cmdline']}" in captured.out
-    assert sh.last_code == 127
-    assert job["proc"].exit_code == 127
-    assert job["proc"].is_alive is False
+    assert captured.err == "trap: not supported in background job\n"
+    assert "Done(2)" in captured.out
+    assert job["proc"].exit_code == 2
+    assert sh._exit_trap is None
+
+
+def test_trap_in_background_does_not_modify_parent_exit_trap(kernel, root,
+                                                             capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo parent' EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("trap 'echo bg' EXIT &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+    sh.handle_line(f"wait {job['pid']}")
+    captured = capsys.readouterr()
+
+    assert captured.err == "trap: not supported in background job\n"
+    assert sh._exit_trap == "echo parent"
+
+
+# -- I. EXIT trap execution --------------------------------------------------
+
+
+def test_exit_trap_runs_on_exit(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo bye' EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("exit")
+    captured = capsys.readouterr()
+
+    assert captured.out == "bye\n"
+    assert captured.err == ""
+    assert sh.running is False
+    assert sh.exit_code == 0
+    assert sh._exit_trap_done is True
+
+
+def test_exit_trap_runs_once(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo first; trap \"echo second\" EXIT' EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("exit")
+    captured = capsys.readouterr()
+
+    assert captured.out == "first\n"
+    assert captured.err == ""
+    assert sh.exit_code == 0
+
+
+def test_exit_trap_sees_exit_code_from_exit_argument(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo code-$?' EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("exit 7")
+    captured = capsys.readouterr()
+
+    assert captured.out == "code-7\n"
+    assert sh.exit_code == 7
+
+
+def test_exit_trap_sees_last_code_on_bare_exit(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo code-$?' EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("false")
+    capsys.readouterr()
+    sh.handle_line("exit")
+    captured = capsys.readouterr()
+
+    assert captured.out == "code-1\n"
+    assert sh.exit_code == 1
+
+
+def test_exit_trap_can_change_final_code_via_exit(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'exit 9' EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("exit 3")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.running is False
+    assert sh.exit_code == 9
+
+
+def test_exit_trap_reset_prevents_execution(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo bye' EXIT")
+    capsys.readouterr()
+    sh.handle_line("trap - EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("exit")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.exit_code == 0
+
+
+def test_exit_trap_runs_on_eof_if_testable(kernel, root, capsys, monkeypatch):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo bye' EXIT")
+    capsys.readouterr()
+
+    def eof(_prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    code = sh.run()
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "bye\n" in captured.out
+    assert captured.err == ""
+    assert sh._exit_trap_done is True
+
+
+def test_exit_trap_handler_does_not_enter_history(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo bye' EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("exit")
+    capsys.readouterr()
+
+    assert sh.history == ["trap 'echo bye' EXIT", "exit"]
+    assert "echo bye" not in sh.history
+
+
+def test_exit_trap_handler_background_ampersand_rejected_or_safe(
+        kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi &' EXIT")
+    capsys.readouterr()
+
+    sh.handle_line("exit")
+    captured = capsys.readouterr()
+
+    assert "hi" not in captured.out
+    assert "background jobs are not allowed" in captured.err
+    assert sh.jobs == []
+    assert sh.exit_code == 0
+
+
+# -- J. exit stops the rest of the line --------------------------------------
+
+
+def test_exit_stops_remaining_semicolon_segments(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("exit; echo after")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.running is False
+    assert sh.exit_code == 0
+
+
+def test_exit_with_code_stops_remaining_semicolon_segments(kernel, root,
+                                                           capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("exit 3; echo after")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.running is False
+    assert sh.exit_code == 3
+
+
+def test_exit_after_and_operator_stops_rest(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("true && exit; echo after")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.running is False
+    assert sh.exit_code == 0
+
+
+def test_exit_after_or_operator_stops_rest(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("false || exit; echo after")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.running is False
+    # bare exit keeps $? from the preceding false.
+    assert sh.exit_code == 1
+
+
+def test_exit_in_first_job_stops_remaining_jobs(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("echo one; exit; echo after")
+    captured = capsys.readouterr()
+
+    assert captured.out == "one\n"
+    assert captured.err == ""
+    assert sh.running is False
+    assert sh.exit_code == 0
+
+
+# -- K. help/usage -----------------------------------------------------------
+
+
+def test_help_mentions_trap(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("help")
+    out = capsys.readouterr().out
+    assert "trap" in out
+
+    sh.handle_line("help trap")
+    captured = capsys.readouterr()
+    assert "SYNOPSIS" in captured.out
+    assert "trap [action] EXIT" in captured.out
+
+
+def test_trap_usage_does_not_promise_real_signals(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("help trap")
+    out = capsys.readouterr().out
+
+    assert "EXIT" in out
+    for name in ("INT", "TERM", "HUP", "USR1"):
+        assert name not in out
