@@ -20,7 +20,7 @@ from .context import Context
 from .errors import InvalidArgument, PyOSError, UserError
 from .process import ProcessState
 from .scheduler import TICKS_PER_SECOND
-from .signals import signal_name, signal_number
+from .signals import SIGINT, signal_name, signal_number
 
 BUILTIN_NAMES = {
     "exit", "export", "unset", "alias", "unalias", "history",
@@ -36,8 +36,9 @@ BUILTIN_USAGE = {
     "fg": "fg [%job|pid]",
     "bg": "bg [%job|pid]",
     "nice": "nice [-n N] command [args...]\n    nice N command [args...]",
-    # Сейчас поддерживается только EXIT; настоящие сигналы отклоняются.
-    "trap": "trap [action] EXIT\n    trap - EXIT\n    trap",
+    # Поддерживаются EXIT и INT; остальные сигналы отклоняются.
+    "trap": ("trap [action] EXIT|INT\n    trap - EXIT|INT\n"
+             "    trap '' INT\n    trap"),
 }
 
 
@@ -401,10 +402,15 @@ class Shell:
         self.jobs: list[dict] = []
         self._next_job = 1
         self._in_worker = False
-        # TRAP-2: хранится только EXIT. Настоящие сигналы не поддерживаются.
+        # TRAP-2/TRAP-3: EXIT и SIGINT. Остальные сигналы не поддерживаются.
         self._exit_trap: str | None = None
         self._exit_trap_done = False
         self._exit_override: int | None = None
+        self._traps: dict[int, str] = {}
+        self._ignored: set[int] = set()
+        self._pending_signals: list[int] = []
+        self._in_trap = False
+        self._signal_overflow_warned = False
         # stdout текущей стадии; обновляется run_single и читается builtins,
         # которые запускают вложенную команду (nice, sudo).
         self._stdout_is_terminal = True
@@ -474,7 +480,8 @@ class Shell:
                 self._shutdown_shell(self.last_code)
                 break
             except KeyboardInterrupt:
-                sys.stdout.write("\n^C\n")
+                if not self._handle_prompt_interrupt():
+                    sys.stdout.write("\n^C\n")
                 continue
             self.handle_line(line)
         return self.exit_code
@@ -802,6 +809,9 @@ class Shell:
     NICE_MIN = -20
     NICE_MAX = 19
 
+    # Предел очереди сигналов, пришедших во время выполнения handler'а.
+    MAX_PENDING_SIGNALS = 8
+
     @staticmethod
     def _parse_nice(argv):
         """Разбирает префикс ``nice [-n N]`` / ``nice N``.
@@ -1069,12 +1079,12 @@ class Shell:
         self.last_code = exit_code
         self.env["?"] = str(exit_code)
 
-    def _run_exit_trap(self, handler: str) -> None:
+    def _run_trap_body(self, handler: str, label: str) -> None:
         """Выполняет handler как обычную shell-строку."""
         jobs = split_raw_jobs(handler)
         if any(background for _, background in jobs):
             self.write_stderr(
-                "trap: background jobs are not allowed in EXIT trap")
+                f"trap: background jobs are not allowed in {label} trap")
             return
         for segments, _background in jobs:
             if not self.running:
@@ -1082,6 +1092,81 @@ class Shell:
                 break
             if segments:
                 self.run_segments(segments)
+
+    def _run_exit_trap(self, handler: str) -> None:
+        self._run_trap_body(handler, "EXIT")
+
+    # -- доставка SIGINT -----------------------------------------------------
+    def _handle_prompt_interrupt(self) -> bool:
+        """Обрабатывает ^C на prompt; True — печатать ^C не нужно."""
+        if SIGINT in self._ignored:
+            return True
+        if SIGINT not in self._traps:
+            return False
+        self.deliver_signal(SIGINT)
+        return True
+
+    def deliver_signal(self, signum: int) -> bool:
+        """Детерминированно доставляет сигнал шеллу.
+
+        В TRAP-3 обрабатывается только SIGINT. Возвращает True, если сигнал
+        перехвачен handler'ом или игнорируется, и False, если остаётся
+        действием по умолчанию.
+        """
+        if signum != SIGINT:
+            return False
+        if SIGINT in self._ignored:
+            return True
+        handler = self._traps.get(SIGINT)
+        if handler is None:
+            return False
+        if self._in_trap:
+            # Не запускаем handler вложенно: складываем в pending.
+            if len(self._pending_signals) >= self.MAX_PENDING_SIGNALS:
+                self._pending_signals.clear()
+                if not self._signal_overflow_warned:
+                    self._signal_overflow_warned = True
+                    self.write_stderr(
+                        "trap: too many pending signals, dropped")
+            else:
+                self._pending_signals.append(signum)
+            return True
+        self._run_int_trap(handler)
+        return True
+
+    def _run_int_trap(self, handler: str) -> None:
+        self._in_trap = True
+        try:
+            self._execute_int_handler(handler)
+            while self._pending_signals and self.running:
+                self._pending_signals.pop(0)
+                if SIGINT in self._ignored:
+                    continue
+                pending = self._traps.get(SIGINT)
+                if pending is None:
+                    continue
+                self._execute_int_handler(pending)
+        finally:
+            if not self.running:
+                self._pending_signals.clear()
+            self._in_trap = False
+
+    def _execute_int_handler(self, handler: str) -> None:
+        was_running = self.running
+        self.running = True
+        # $? на входе handler'а и после него отражает прерывание.
+        self.last_code = 128 + SIGINT
+        self.env["?"] = str(self.last_code)
+        try:
+            self._run_trap_body(handler, "INT")
+        except Exception as exc:  # noqa: BLE001 - шелл не должен падать
+            self.write_stderr(f"trap: handler failed: {exc}")
+        finally:
+            if self.running:
+                self.last_code = 128 + SIGINT
+                self.env["?"] = str(self.last_code)
+            if not was_running:
+                self.running = False
 
     @staticmethod
     def _quote_trap_action(handler: str) -> str:
@@ -1094,36 +1179,65 @@ class Shell:
             return None, 2
 
         if not args:
+            lines = []
             if self._exit_trap is not None:
-                return (f"trap -- {self._quote_trap_action(self._exit_trap)}"
-                        " EXIT")
-            return None
+                lines.append(
+                    f"trap -- {self._quote_trap_action(self._exit_trap)} EXIT")
+            for signum in sorted(self._traps):
+                lines.append(
+                    f"trap -- {self._quote_trap_action(self._traps[signum])}"
+                    f" {signal_name(signum)}")
+            for signum in sorted(self._ignored):
+                lines.append(f"trap -- '' {signal_name(signum)}")
+            if not lines:
+                return None
+            return "\n".join(lines)
 
         action = str(args[0])
         specs = [str(a) for a in args[1:]]
         if not specs:
-            self.write_stderr("trap: EXIT expected")
+            self.write_stderr("trap: signal expected")
             return None, 2
 
         # Сначала валидируются все сигналы: при ошибке состояние не меняется.
+        parsed = []
         for spec in specs:
             if spec.upper() == "EXIT":
+                parsed.append("EXIT")
                 continue
             number = signal_number(spec)
-            if number is not None:
+            if number is None:
+                self.write_stderr(
+                    f"trap: invalid signal specification: {spec}")
+                return None, 2
+            if number != SIGINT:
                 self.write_stderr(
                     f"trap: signal is not supported yet: {signal_name(number)}")
                 return None, 2
-            self.write_stderr(f"trap: invalid signal specification: {spec}")
-            return None, 2
+            parsed.append(SIGINT)
 
         if action == "":
-            self.write_stderr("trap: cannot ignore EXIT")
-            return None, 2
-        if action == "-":
-            self._exit_trap = None
+            if "EXIT" in parsed:
+                self.write_stderr("trap: cannot ignore EXIT")
+                return None, 2
+            for signum in parsed:
+                self._ignored.add(signum)
+                self._traps.pop(signum, None)
             return None
-        self._exit_trap = action
+        if action == "-":
+            for signum in parsed:
+                if signum == "EXIT":
+                    self._exit_trap = None
+                else:
+                    self._traps.pop(signum, None)
+                    self._ignored.discard(signum)
+            return None
+        for signum in parsed:
+            if signum == "EXIT":
+                self._exit_trap = action
+            else:
+                self._traps[signum] = action
+                self._ignored.discard(signum)
         return None
 
     def _bi_export(self, args, stdin, user):

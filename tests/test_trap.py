@@ -18,6 +18,7 @@ Determinism notes:
 from pyos.commands import get as get_command
 from pyos.process import ProcessState
 from pyos.shell import Shell
+from pyos.signals import SIGINT, signal_number
 
 
 def _start_sleep_job(sh, capsys):
@@ -79,17 +80,18 @@ def test_fixed_trap_builtin_bare_prints_nothing(kernel, root, capsys):
     assert sh.running is True
 
 
-def test_fixed_trap_signal_reports_unsupported(kernel, root, capsys):
+def test_fixed_trap_term_reports_unsupported(kernel, root, capsys):
     sh = Shell(kernel, root)
 
-    sh.handle_line("trap 'echo hi' INT")
+    sh.handle_line("trap 'echo hi' TERM")
     captured = capsys.readouterr()
 
     assert captured.out == ""
-    assert captured.err == "trap: signal is not supported yet: INT\n"
+    assert captured.err == "trap: signal is not supported yet: TERM\n"
     assert sh.last_code == 2
     assert sh.exit_code == 2
     assert sh._exit_trap is None
+    assert sh._traps == {}
 
 
 def test_fixed_trap_exit_sets_exit_trap(kernel, root, capsys):
@@ -449,26 +451,17 @@ def test_trap_invalid_signal_does_not_set_exit_trap(kernel, root, capsys):
     assert sh._exit_trap is None
 
 
-def test_trap_mixed_exit_and_int_is_atomic_failure(kernel, root, capsys):
+def test_trap_int_exit_both_accepted(kernel, root, capsys):
     sh = Shell(kernel, root)
-    sh.handle_line("trap 'echo keep' EXIT")
-    capsys.readouterr()
 
-    sh.handle_line("trap 'echo new' EXIT INT")
+    sh.handle_line("trap 'echo both' EXIT INT")
     captured = capsys.readouterr()
 
     assert captured.out == ""
-    assert captured.err == "trap: signal is not supported yet: INT\n"
-    assert sh.last_code == 2
-    # Atomic: EXIT was not overwritten by the failing command.
-    assert sh._exit_trap == "echo keep"
-
-    sh.handle_line("trap - EXIT INT")
-    captured = capsys.readouterr()
-
-    assert captured.err == "trap: signal is not supported yet: INT\n"
-    assert sh.last_code == 2
-    assert sh._exit_trap == "echo keep"
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert sh._exit_trap == "echo both"
+    assert sh._traps == {2: "echo both"}
 
 
 def test_trap_ignore_exit_rejected(kernel, root, capsys):
@@ -491,7 +484,7 @@ def test_trap_missing_signal_rejected(kernel, root, capsys):
     captured = capsys.readouterr()
 
     assert captured.out == ""
-    assert captured.err == "trap: EXIT expected\n"
+    assert captured.err == "trap: signal expected\n"
     assert sh.last_code == 2
     assert sh._exit_trap is None
 
@@ -505,7 +498,7 @@ def test_trap_reset_missing_signal_rejected(kernel, root, capsys):
     captured = capsys.readouterr()
 
     assert captured.out == ""
-    assert captured.err == "trap: EXIT expected\n"
+    assert captured.err == "trap: signal expected\n"
     assert sh.last_code == 2
     assert sh._exit_trap == "echo keep"
 
@@ -527,8 +520,16 @@ def _assert_trap_signal_unsupported(kernel, root, capsys, spec, canonical):
     assert sh._exit_trap is None
 
 
-def test_trap_int_unsupported_yet(kernel, root, capsys):
-    _assert_trap_signal_unsupported(kernel, root, capsys, "INT", "INT")
+def test_trap_int_is_supported(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo hi' INT")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert sh._traps == {2: "echo hi"}
 
 
 def test_trap_term_unsupported_yet(kernel, root, capsys):
@@ -555,8 +556,30 @@ def test_trap_numeric_signal_unsupported_yet(kernel, root, capsys):
     _assert_trap_signal_unsupported(kernel, root, capsys, "15", "TERM")
 
 
-def test_trap_sig_prefix_unsupported_yet(kernel, root, capsys):
-    _assert_trap_signal_unsupported(kernel, root, capsys, "SIGINT", "INT")
+def test_trap_int_numeric_form_accepted(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo hi' 2")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh._traps == {2: "echo hi"}
+
+
+def test_trap_int_sig_prefix_accepted(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo hi' SIGINT")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh._traps == {2: "echo hi"}
+
+
+def test_trap_sigterm_unsupported_yet(kernel, root, capsys):
+    _assert_trap_signal_unsupported(kernel, root, capsys, "SIGTERM", "TERM")
 
 
 def test_trap_unknown_signal_invalid(kernel, root, capsys):
@@ -820,12 +843,673 @@ def test_help_mentions_trap(kernel, root, capsys):
     assert "trap [action] EXIT" in captured.out
 
 
-def test_trap_usage_does_not_promise_real_signals(kernel, root, capsys):
+def test_help_mentions_trap_int_and_exit(kernel, root, capsys):
     sh = Shell(kernel, root)
 
     sh.handle_line("help trap")
     out = capsys.readouterr().out
 
     assert "EXIT" in out
-    for name in ("INT", "TERM", "HUP", "USR1"):
+    assert "INT" in out
+    assert "trap [action] EXIT|INT" in out
+
+
+def test_trap_usage_does_not_promise_unsupported_signals(kernel, root,
+                                                         capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("help trap")
+    out = capsys.readouterr().out
+
+    for name in ("TERM", "HUP", "QUIT", "USR1", "USR2", "ALRM", "PIPE"):
         assert name not in out
+
+
+# -- L. INT storage, printing and reset --------------------------------------
+
+
+def test_trap_int_set_and_print(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo int' INT")
+    assert capsys.readouterr().err == ""
+    assert sh._traps == {SIGINT: "echo int"}
+
+    sh.handle_line("trap")
+    captured = capsys.readouterr()
+
+    assert captured.out == "trap -- 'echo int' INT\n"
+    assert captured.err == ""
+    assert sh.last_code == 0
+
+
+def test_trap_int_reset(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo int' INT")
+    capsys.readouterr()
+
+    sh.handle_line("trap - INT")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert sh._traps == {}
+    assert sh._ignored == set()
+
+    sh.handle_line("trap")
+    assert capsys.readouterr().out == ""
+
+
+def test_trap_int_ignore_prints_empty_action(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap '' INT")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh._ignored == {SIGINT}
+    assert sh._traps == {}
+
+    sh.handle_line("trap")
+    assert capsys.readouterr().out == "trap -- '' INT\n"
+
+
+def test_trap_int_set_after_ignore_replaces_ignore(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap '' INT")
+    capsys.readouterr()
+
+    sh.handle_line("trap 'echo int' INT")
+    capsys.readouterr()
+
+    assert sh._ignored == set()
+    assert sh._traps == {SIGINT: "echo int"}
+
+
+def test_trap_int_ignore_after_set_replaces_handler(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo int' INT")
+    capsys.readouterr()
+
+    sh.handle_line("trap '' INT")
+    capsys.readouterr()
+
+    assert sh._traps == {}
+    assert sh._ignored == {SIGINT}
+
+
+def test_trap_int_duplicate_signals_allowed(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo int' INT INT")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.last_code == 0
+    assert sh._traps == {SIGINT: "echo int"}
+
+
+def test_trap_int_and_exit_print_order(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'exit handler' EXIT")
+    sh.handle_line("trap 'int handler' INT")
+    capsys.readouterr()
+
+    sh.handle_line("trap")
+    captured = capsys.readouterr()
+
+    assert captured.out == (
+        "trap -- 'exit handler' EXIT\n"
+        "trap -- 'int handler' INT\n")
+    assert captured.err == ""
+
+
+def test_trap_int_escapes_single_quote_in_handler(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'it'\\''s' INT")
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert sh._traps == {SIGINT: "it's"}
+
+    sh.handle_line("trap")
+    assert capsys.readouterr().out == "trap -- 'it'\\''s' INT\n"
+
+
+# -- M. INT validation and atomicity -----------------------------------------
+
+
+def test_trap_int_term_atomic_failure(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo keep' INT")
+    capsys.readouterr()
+
+    sh.handle_line("trap 'echo new' INT TERM")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "trap: signal is not supported yet: TERM\n"
+    assert sh.last_code == 2
+    assert sh._traps == {SIGINT: "echo keep"}
+
+
+def test_trap_int_unknown_atomic_failure(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo keep' INT")
+    capsys.readouterr()
+
+    sh.handle_line("trap 'echo new' INT NOPE")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "trap: invalid signal specification: NOPE\n"
+    assert sh.last_code == 2
+    assert sh._traps == {SIGINT: "echo keep"}
+
+
+def test_trap_int_reset_with_term_atomic_failure(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo keep' INT")
+    capsys.readouterr()
+
+    sh.handle_line("trap - INT TERM")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "trap: signal is not supported yet: TERM\n"
+    assert sh.last_code == 2
+    assert sh._traps == {SIGINT: "echo keep"}
+
+
+def test_trap_int_ignore_with_term_atomic_failure(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo keep' INT")
+    capsys.readouterr()
+
+    sh.handle_line("trap '' INT TERM")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "trap: signal is not supported yet: TERM\n"
+    assert sh.last_code == 2
+    assert sh._traps == {SIGINT: "echo keep"}
+    assert sh._ignored == set()
+
+
+def test_trap_other_signals_remain_unsupported(kernel, root, capsys):
+    names = ["HUP", "QUIT", "USR1", "USR2", "ALRM", "PIPE", "KILL",
+             "STOP", "TSTP", "CONT", "CHLD", "WINCH", "ABRT", "SEGV"]
+
+    for name in names:
+        sh = Shell(kernel, root)
+        sh.handle_line(f"trap 'echo x' {name}")
+        captured = capsys.readouterr()
+
+        assert captured.out == ""
+        assert captured.err == (
+            f"trap: signal is not supported yet: {name}\n")
+        assert sh.last_code == 2
+        assert sh._traps == {}
+        assert sh._ignored == set()
+
+
+# -- N. deterministic delivery API -------------------------------------------
+
+
+def test_deliver_signal_int_runs_handler(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+
+    assert sh.deliver_signal(SIGINT) is True
+    captured = capsys.readouterr()
+
+    assert captured.out == "hi\n"
+    assert captured.err == ""
+    assert sh.running is True
+
+
+def test_deliver_signal_int_ignored_does_not_run_handler(kernel, root,
+                                                         capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap '' INT")
+    capsys.readouterr()
+
+    assert sh.deliver_signal(SIGINT) is True
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.running is True
+
+
+def test_deliver_signal_int_reset_runs_default_no_handler(kernel, root,
+                                                          capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+    sh.handle_line("trap - INT")
+    capsys.readouterr()
+
+    assert sh.deliver_signal(SIGINT) is False
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_deliver_signal_non_int_returns_false(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+
+    assert sh.deliver_signal(signal_number("TERM")) is False
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh._traps == {SIGINT: "echo hi"}
+
+
+def test_deliver_signal_int_sets_last_code_130_on_entry(kernel, root,
+                                                        capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo code-$?' INT")
+    capsys.readouterr()
+
+    sh.deliver_signal(SIGINT)
+    captured = capsys.readouterr()
+
+    assert captured.out == "code-130\n"
+
+
+def test_deliver_signal_int_restores_last_code_130_after_handler(
+        kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'false' INT")
+    capsys.readouterr()
+
+    sh.deliver_signal(SIGINT)
+    capsys.readouterr()
+
+    assert sh.running is True
+    assert sh.last_code == 130
+
+
+def test_deliver_signal_int_handler_false_does_not_change_final_question_mark(
+        kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'false' INT")
+    capsys.readouterr()
+
+    sh.deliver_signal(SIGINT)
+    capsys.readouterr()
+
+    sh.handle_line("echo status-$?")
+    assert capsys.readouterr().out == "status-130\n"
+
+
+def test_deliver_signal_int_handler_can_change_variables(kernel, root,
+                                                         capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'X=hello' INT")
+    capsys.readouterr()
+
+    sh.deliver_signal(SIGINT)
+    capsys.readouterr()
+
+    sh.handle_line("echo $X")
+    assert capsys.readouterr().out == "hello\n"
+
+
+def test_deliver_signal_int_handler_can_cd(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'cd /tmp' INT")
+    capsys.readouterr()
+
+    sh.deliver_signal(SIGINT)
+    capsys.readouterr()
+
+    assert sh.cwd == "/tmp"
+
+
+def test_deliver_signal_int_handler_can_set_trap(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap \"trap 'echo second' INT\" INT")
+    capsys.readouterr()
+
+    sh.deliver_signal(SIGINT)
+    assert capsys.readouterr().out == ""
+    assert sh._traps == {SIGINT: "echo second"}
+
+    sh.deliver_signal(SIGINT)
+    assert capsys.readouterr().out == "second\n"
+
+
+def test_deliver_signal_int_handler_exit_changes_final_code(kernel, root,
+                                                            capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'exit 5' INT")
+    capsys.readouterr()
+
+    assert sh.deliver_signal(SIGINT) is True
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.running is False
+    assert sh.exit_code == 5
+
+
+def test_deliver_signal_int_handler_exit_triggers_exit_trap_once(
+        kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo bye' EXIT")
+    sh.handle_line("trap 'exit 5' INT")
+    capsys.readouterr()
+
+    sh.deliver_signal(SIGINT)
+    captured = capsys.readouterr()
+
+    assert captured.out == "bye\n"
+    assert captured.err == ""
+    assert sh.exit_code == 5
+    assert sh._exit_trap_done is True
+
+
+def test_deliver_signal_int_handler_does_not_enter_history(kernel, root,
+                                                           capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+
+    sh.deliver_signal(SIGINT)
+    capsys.readouterr()
+
+    assert sh.history == ["trap 'echo hi' INT"]
+
+
+def test_deliver_signal_int_handler_background_ampersand_rejected_or_safe(
+        kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi &' INT")
+    capsys.readouterr()
+
+    sh.deliver_signal(SIGINT)
+    captured = capsys.readouterr()
+
+    assert "hi" not in captured.out
+    assert "background jobs are not allowed in INT trap" in captured.err
+    assert sh.jobs == []
+    assert sh.running is True
+
+
+def test_deliver_signal_int_reentrancy_queues_pending(kernel, root, capsys,
+                                                      monkeypatch):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+
+    real = sh.run_segments
+    calls = {"count": 0}
+
+    def wrapped(segments, user=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # Внутри handler'а сигнал должен попасть в pending, а не
+            # запустить handler вложенно.
+            assert sh.deliver_signal(SIGINT) is True
+            assert sh._pending_signals == [SIGINT]
+        return real(segments, user)
+
+    monkeypatch.setattr(sh, "run_segments", wrapped)
+
+    sh.deliver_signal(SIGINT)
+    captured = capsys.readouterr()
+
+    assert captured.out == "hi\nhi\n"
+    assert captured.err == ""
+    assert sh._pending_signals == []
+    assert sh._in_trap is False
+
+
+def test_deliver_signal_int_pending_cap_does_not_crash(kernel, root, capsys,
+                                                       monkeypatch):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+
+    real = sh.run_segments
+    calls = {"count": 0}
+
+    def wrapped(segments, user=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            for _ in range(10):
+                assert sh.deliver_signal(SIGINT) is True
+        return real(segments, user)
+
+    monkeypatch.setattr(sh, "run_segments", wrapped)
+
+    sh.deliver_signal(SIGINT)
+    captured = capsys.readouterr()
+
+    assert "trap: too many pending signals, dropped" in captured.err
+    assert sh._in_trap is False
+    assert sh.running is True
+
+
+# -- O. prompt KeyboardInterrupt ---------------------------------------------
+
+
+def _feed_input(monkeypatch, events):
+    queue = list(events)
+
+    def fake_input(_prompt=""):
+        if not queue:
+            raise EOFError
+        event = queue.pop(0)
+        if isinstance(event, BaseException):
+            raise event
+        if isinstance(event, type) and issubclass(event, BaseException):
+            raise event
+        return event
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+
+def test_prompt_keyboard_interrupt_without_trap_prints_caret_c(
+        kernel, root, capsys, monkeypatch):
+    sh = Shell(kernel, root)
+    _feed_input(monkeypatch, [KeyboardInterrupt])
+
+    code = sh.run()
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "^C" in captured.out
+    assert captured.err == ""
+
+
+def test_prompt_keyboard_interrupt_with_int_trap_runs_handler(
+        kernel, root, capsys, monkeypatch):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+    _feed_input(monkeypatch, [KeyboardInterrupt, "exit"])
+
+    sh.run()
+    captured = capsys.readouterr()
+
+    assert captured.out == "hi\n"
+    assert captured.err == ""
+
+
+def test_prompt_keyboard_interrupt_with_int_trap_does_not_print_caret_c(
+        kernel, root, capsys, monkeypatch):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+    _feed_input(monkeypatch, [KeyboardInterrupt, "exit"])
+
+    sh.run()
+    captured = capsys.readouterr()
+
+    assert "^C" not in captured.out
+
+
+def test_prompt_keyboard_interrupt_with_ignored_int_does_not_print_caret_c(
+        kernel, root, capsys, monkeypatch):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap '' INT")
+    capsys.readouterr()
+    _feed_input(monkeypatch, [KeyboardInterrupt, "exit"])
+
+    sh.run()
+    captured = capsys.readouterr()
+
+    assert "^C" not in captured.out
+    assert captured.out == ""
+
+
+def test_prompt_keyboard_interrupt_with_ignored_int_continues_shell(
+        kernel, root, capsys, monkeypatch):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap '' INT")
+    capsys.readouterr()
+    _feed_input(monkeypatch, [KeyboardInterrupt, "echo alive", "exit"])
+
+    sh.run()
+    captured = capsys.readouterr()
+
+    assert "alive\n" in captured.out
+    assert "^C" not in captured.out
+
+
+def test_prompt_keyboard_interrupt_handler_exit_stops_shell(
+        kernel, root, capsys, monkeypatch):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'exit 5' INT")
+    capsys.readouterr()
+    _feed_input(monkeypatch, [KeyboardInterrupt])
+
+    code = sh.run()
+    captured = capsys.readouterr()
+
+    assert code == 5
+    assert sh.running is False
+    assert captured.err == ""
+
+
+def test_prompt_keyboard_interrupt_handler_exit_triggers_exit_trap(
+        kernel, root, capsys, monkeypatch):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo bye' EXIT")
+    sh.handle_line("trap 'exit 5' INT")
+    capsys.readouterr()
+    _feed_input(monkeypatch, [KeyboardInterrupt])
+
+    code = sh.run()
+    captured = capsys.readouterr()
+
+    assert code == 5
+    assert captured.out == "bye\n"
+    assert captured.err == ""
+
+
+def test_prompt_keyboard_interrupt_after_exit_trap_still_works(
+        kernel, root, capsys, monkeypatch):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo bye' EXIT")
+    capsys.readouterr()
+    _feed_input(monkeypatch, [KeyboardInterrupt, "exit"])
+
+    code = sh.run()
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "^C" in captured.out
+    assert "bye\n" in captured.out
+
+
+# -- P. kill/background regressions ------------------------------------------
+
+
+def test_kill_int_background_job_does_not_run_shell_trap(kernel, root,
+                                                          capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+    job = _start_sleep_job(sh, capsys)
+
+    sh.handle_line(f"kill -INT {job['pid']}")
+    capsys.readouterr()
+    sh.handle_line(f"wait {job['pid']}")
+    captured = capsys.readouterr()
+
+    assert "hi" not in captured.out
+    assert job["proc"].exit_code == 130
+    assert sh._traps == {SIGINT: "echo hi"}
+
+
+def test_kill_term_background_job_does_not_run_shell_trap(kernel, root,
+                                                           capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+    job = _start_sleep_job(sh, capsys)
+
+    sh.handle_line(f"kill -TERM {job['pid']}")
+    capsys.readouterr()
+    sh.handle_line(f"wait {job['pid']}")
+    captured = capsys.readouterr()
+
+    assert "hi" not in captured.out
+    assert job["proc"].exit_code == 143
+    assert sh._traps == {SIGINT: "echo hi"}
+
+
+def test_kill_shell_pid_does_not_run_int_trap(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo hi' INT")
+    capsys.readouterr()
+
+    sh.handle_line("kill -INT $$")
+    captured = capsys.readouterr()
+
+    assert "hi" not in captured.out
+    assert captured.err == "kill: (1) - No such process\n"
+    assert sh.last_code == 1
+    assert sh.running is True
+
+
+def test_background_trap_int_is_rejected(kernel, root, capsys):
+    sh = Shell(kernel, root)
+
+    sh.handle_line("trap 'echo bg' INT &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+    sh.handle_line(f"wait {job['pid']}")
+    captured = capsys.readouterr()
+
+    assert captured.err == "trap: not supported in background job\n"
+    assert "Done(2)" in captured.out
+    assert sh._traps == {}
+
+
+def test_background_trap_int_does_not_modify_parent(kernel, root, capsys):
+    sh = Shell(kernel, root)
+    sh.handle_line("trap 'echo parent' INT")
+    capsys.readouterr()
+
+    sh.handle_line("trap 'echo bg' INT &")
+    capsys.readouterr()
+    job = sh.jobs[0]
+    sh.handle_line(f"wait {job['pid']}")
+    captured = capsys.readouterr()
+
+    assert captured.err == "trap: not supported in background job\n"
+    assert sh._traps == {SIGINT: "echo parent"}
