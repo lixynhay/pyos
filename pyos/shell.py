@@ -578,7 +578,10 @@ class Shell:
 
     # -- конвейеры и редиректы ----------------------------------------------
     def _read_redirect(self, target, user):
-        return self.kernel.fs.read_file(target, user, self.cwd, self.user.home)
+        # `<` отдаёт команде точные bytes: текстовые команды сами решают,
+        # декодировать ли UTF-8 (_stdin_text/_read_input).
+        return self.kernel.fs.read_bytes(target, user, self.cwd,
+                                         self.user.home)
 
     def _write_redirect(self, target, data, append, user):
         # Проверка ulimit -f (максимальный размер файла) — всегда в байтах

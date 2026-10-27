@@ -9,6 +9,7 @@ Binary file used everywhere: ``b"PYOS-BINARY-EXAMPLE\\x00\\xff\\x10\\n"``.
 """
 
 from pyos.commands import network_cmds
+from pyos.commands.registry import COMMANDS, Command
 from pyos.shell import Shell
 
 BIN = b"PYOS-BINARY-EXAMPLE\x00\xff\x10\n"
@@ -104,31 +105,67 @@ def test_current_cat_binary_redirect_append_does_not_modify_file(
     assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == b"keep\n"
 
 
-def test_current_cat_binary_input_redirect_fails(kernel, root, capsys):
+def test_input_redirect_missing_file_still_errors(kernel, root, capsys):
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat < /tmp/no-such-input.txt")
+    captured = capsys.readouterr()
+
+    # Прежняя семантика: команда не запускается, exit code 1.
+    assert captured.out == ""
+    assert captured.err == (
+        "cat: /tmp/no-such-input.txt: No such file or directory\n")
+    assert sh.exit_code == 1
+
+
+def test_input_redirect_text_file_passes_bytes_to_command(
+        kernel, root, capsys, monkeypatch):
+    _write(kernel, root, "/tmp/text", TEXT)
+    seen = []
+
+    def probe(ctx, args, stdin):
+        seen.append(stdin)
+        return ""
+
+    monkeypatch.setitem(COMMANDS, "stdinprobe", Command("stdinprobe", probe))
+
+    sh = _shell(kernel, root)
+    sh.handle_line("stdinprobe < /tmp/text")
+    captured = capsys.readouterr()
+
+    assert seen == [TEXT]
+    assert isinstance(seen[0], bytes)
+    assert captured.err == ""
+    assert sh.exit_code == 0
+
+
+def test_input_redirect_binary_file_to_cat_current_behavior_after_bytes_wire(
+        kernel, root, capsys):
     _write(kernel, root, "/tmp/bin", BIN)
     sh = _shell(kernel, root)
 
     sh.handle_line("cat < /tmp/bin")
     captured = capsys.readouterr()
 
-    # `_read_redirect` uses read_file() and the message repeats the path.
+    # BS7-3: `<` отдаёт bytes, cat возвращает их как есть, терминал
+    # подавляет binary output. Старый двойной path больше не появляется.
     assert captured.out == ""
-    assert captured.err == (
-        "cat: /tmp/bin: /tmp/bin: not valid UTF-8 text\n")
-    assert sh.exit_code == 1
+    assert captured.err == "pyos: binary output suppressed\n"
+    assert sh.exit_code == 0
 
 
-def test_current_wc_c_input_redirect_binary_fails(kernel, root, capsys):
+def test_input_redirect_binary_file_to_wc_c_current_behavior_after_bytes_wire(
+        kernel, root, capsys):
     _write(kernel, root, "/tmp/bin", BIN)
     sh = _shell(kernel, root)
 
     sh.handle_line("wc -c < /tmp/bin")
     captured = capsys.readouterr()
 
+    # BS7-3: bytes доходят до wc, а он декодирует stdin как текст.
     assert captured.out == ""
-    assert captured.err == (
-        "wc: /tmp/bin: /tmp/bin: not valid UTF-8 text\n")
-    assert sh.exit_code == 1
+    assert captured.err == "wc: not valid UTF-8 text: <stdin>\n"
+    assert sh.exit_code == 22
 
 
 def test_current_cat_binary_pipe_cat(kernel, root, capsys):
