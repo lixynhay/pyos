@@ -325,7 +325,7 @@ def test_dev_null_pipe_wc_c_still_works(kernel, root, capsys):
 
 # -- network: deterministic mocked transport --------------------------------
 
-def test_current_curl_binary_stdout_suppressed(
+def test_curl_binary_terminal_suppression_unchanged(
         kernel, root, capsys, monkeypatch):
     _fake_transport(monkeypatch, BIN)
     sh = _shell(kernel, root)
@@ -339,7 +339,7 @@ def test_current_curl_binary_stdout_suppressed(
     assert sh.exit_code == 1
 
 
-def test_current_curl_binary_o_writes_exact_bytes(
+def test_curl_o_binary_exact_bytes_unchanged(
         kernel, root, capsys, monkeypatch):
     _fake_transport(monkeypatch, BIN)
     sh = _shell(kernel, root)
@@ -353,20 +353,34 @@ def test_current_curl_binary_o_writes_exact_bytes(
     assert sh.exit_code == 0
 
 
-def test_current_curl_binary_pipe_wc_c(kernel, root, capsys, monkeypatch):
+def test_curl_binary_pipe_wc_c_returns_exact_byte_count(
+        kernel, root, capsys, monkeypatch):
     _fake_transport(monkeypatch, BIN)
     sh = _shell(kernel, root)
 
     sh.handle_line("curl http://example.com/blob.bin | wc -c")
     captured = capsys.readouterr()
 
-    # curl suppresses binary stdout, wc counts empty stdin, exit code is 0.
-    assert captured.out == "0\n"
-    assert "curl: binary output suppressed; use -o FILE" in captured.err
+    assert captured.out == f"{len(BIN)}\n"
+    assert captured.err == ""
     assert sh.exit_code == 0
 
 
-def test_current_curl_binary_redirect_overwrite(
+def test_curl_binary_pipe_cat_terminal_suppressed(
+        kernel, root, capsys, monkeypatch):
+    _fake_transport(monkeypatch, BIN)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("curl http://example.com/blob.bin | cat")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "pyos: binary output suppressed\n"
+    assert "Traceback" not in captured.err
+    assert sh.exit_code == 0
+
+
+def test_curl_binary_redirect_overwrite_exact_bytes(
         kernel, root, capsys, monkeypatch):
     _fake_transport(monkeypatch, BIN)
     sh = _shell(kernel, root)
@@ -375,7 +389,72 @@ def test_current_curl_binary_redirect_overwrite(
     captured = capsys.readouterr()
 
     assert captured.out == ""
+    assert captured.err == ""
+    assert sh.exit_code == 0
+    assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == BIN
+
+
+def test_curl_binary_redirect_append_exact_bytes(
+        kernel, root, capsys, monkeypatch):
+    _fake_transport(monkeypatch, BIN)
+    _write(kernel, root, "/tmp/out", b"keep\n")
+    sh = _shell(kernel, root)
+
+    sh.handle_line("curl http://example.com/blob.bin >> /tmp/out")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.exit_code == 0
+    assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == b"keep\n" + BIN
+
+
+def test_curl_binary_pipe_cat_redirect_exact_bytes(
+        kernel, root, capsys, monkeypatch):
+    _fake_transport(monkeypatch, BIN)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("curl http://example.com/blob.bin | cat > /tmp/out")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.exit_code == 0
+    assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == BIN
+
+
+def test_curl_text_pipe_unchanged(kernel, root, capsys, monkeypatch):
+    body = b"line1\nline2\n"
+    _fake_transport(monkeypatch, body)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("curl http://example.com/text | wc -c")
+    captured = capsys.readouterr()
+
+    assert captured.out == f"{len(body)}\n"
+    assert captured.err == ""
+    assert sh.exit_code == 0
+
+    sh.handle_line("curl http://example.com/text | cat")
+    captured = capsys.readouterr()
+
+    assert captured.out == "line1\nline2\n"
+    assert captured.err == ""
+    assert sh.exit_code == 0
+
+
+def test_curl_verbose_binary_remains_limited(
+        kernel, root, capsys, monkeypatch):
+    _fake_transport(monkeypatch, BIN)
+    sh = _shell(kernel, root)
+
+    # -v остаётся текстовым режимом: binary body не пробрасывается.
+    sh.handle_line("curl -v http://example.com/blob.bin > /tmp/out")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
     assert "curl: binary output suppressed; use -o FILE" in captured.err
+    assert "Traceback" not in captured.err
     assert sh.exit_code == 1
     assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == b""
 

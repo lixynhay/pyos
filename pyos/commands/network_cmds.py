@@ -207,7 +207,12 @@ def cmd_curl(ctx, args, stdin):
         # -v: заголовки видны в stdout, но в файл попадает только тело
         return header_block + message
 
-    return header_block + _stdout_body(body, headers, "curl", "-o")
+    if verbose or ctx.stdout_is_terminal:
+        # Терминал и -v остаются текстовыми; binary в терминал не пишем.
+        return header_block + _stdout_body(body, headers, "curl", "-o")
+
+    # stdout не терминал (pipe или редирект в файл): отдаём точные bytes.
+    return body
 
 
 # -- wget ------------------------------------------------------------------
