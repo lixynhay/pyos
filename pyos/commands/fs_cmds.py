@@ -169,11 +169,34 @@ def cmd_pwd(ctx, args, stdin):
 def cmd_cat(ctx, args, stdin):
     opts, paths = _resolve_args(ctx, args)
     if not paths:
+        # stdin отдаём как есть: bytes остаются bytes, str — str.
         return stdin
+
+    if not ctx.stdout_is_terminal:
+        # Pipeline/redirect: точные bytes без декодирования и без newline.
+        chunks = []
+        for path in paths:
+            if path == "-":
+                if isinstance(stdin, bytes):
+                    chunks.append(stdin)
+                elif isinstance(stdin, str):
+                    chunks.append(stdin.encode("utf-8"))
+            else:
+                chunks.append(
+                    ctx.fs.read_bytes(path, ctx.user, ctx.cwd, ctx.home))
+        return b"".join(chunks)
+
     parts = []
     for path in paths:
         if path == "-":
-            parts.append(stdin)
+            if isinstance(stdin, bytes):
+                try:
+                    parts.append(stdin.decode("utf-8"))
+                except UnicodeDecodeError:
+                    raise InvalidArgument(
+                        "cat: binary file: <stdin> (not valid UTF-8)")
+            else:
+                parts.append(stdin)
             continue
         raw = ctx.fs.read_bytes(path, ctx.user, ctx.cwd, ctx.home)
         try:

@@ -25,15 +25,29 @@ def _decode_text(command, label, raw):
         raise InvalidArgument(f"{command}: not valid UTF-8 text: {label}")
 
 
+def _stdin_bytes(stdin):
+    """Возвращает stdin как точные bytes (без UTF-8-валидации)."""
+    if stdin is None:
+        return b""
+    if isinstance(stdin, bytes):
+        return stdin
+    if isinstance(stdin, str):
+        return stdin.encode("utf-8")
+    return bytes(stdin)
+
+
 def _read_raw_input(ctx, paths, stdin, command):
-    """Возвращает bytes: из файлов или из stdin, если файлов нет."""
+    """Возвращает bytes: из файлов или из stdin, если файлов нет.
+
+    В отличие от ``_read_input`` не требует валидного UTF-8: используется
+    командами, которым нужны точные bytes (``wc -c``).
+    """
     if not paths or paths == ["-"]:
-        text = _stdin_text(command, stdin)
-        return text.encode("utf-8")
+        return _stdin_bytes(stdin)
     chunks = []
     for p in paths:
         if p == "-":
-            chunks.append(_stdin_text(command, stdin).encode("utf-8"))
+            chunks.append(_stdin_bytes(stdin))
         else:
             chunks.append(ctx.fs.read_bytes(p, ctx.user, ctx.cwd, ctx.home))
     return b"".join(chunks)

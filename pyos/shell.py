@@ -398,6 +398,9 @@ class Shell:
         self.jobs: list[dict] = []
         self._next_job = 1
         self._in_worker = False
+        # stdout текущей стадии; обновляется run_single и читается builtins,
+        # которые запускают вложенную команду (nice, sudo).
+        self._stdout_is_terminal = True
 
         self._locals: dict[str, str] = {}
         self.ulimit: dict[str, int] = {"file_size": -1}  # -1 = unlimited
@@ -638,7 +641,12 @@ class Shell:
                             self.exit_code = 1
                             return 1
                 argv = self._glob_argv(argv, user)
-                out, err, code = self.run_single(argv, stdin_data, user)
+                redirected_out = any(op in (">", ">>")
+                                     for op, _ in redirects)
+                stdout_is_terminal = (idx == total - 1) and not redirected_out
+                out, err, code = self.run_single(
+                    argv, stdin_data, user,
+                    stdout_is_terminal=stdout_is_terminal)
             else:
                 # команда из одних редиректов (например, ``> file``)
                 out, err, code = "", "", 0
@@ -668,7 +676,8 @@ class Shell:
         return code
 
     # -- запуск одной команды -----------------------------------------------
-    def run_single(self, argv, stdin_data, user=None, nice=0):
+    def run_single(self, argv, stdin_data, user=None, nice=0,
+                   stdout_is_terminal=True):
         user = user or self.user
 
         # Извлекаем ведущие VAR=value (локальные присваивания)
@@ -700,7 +709,12 @@ class Shell:
             name = str(argv[0]) if argv else ""
 
         if name in BUILTIN_NAMES:
-            return self.run_builtin(name, argv[1:], stdin_data, user)
+            prev_terminal = self._stdout_is_terminal
+            self._stdout_is_terminal = stdout_is_terminal
+            try:
+                return self.run_builtin(name, argv[1:], stdin_data, user)
+            finally:
+                self._stdout_is_terminal = prev_terminal
 
         cmd = get(name)
         if cmd is None:
@@ -717,7 +731,8 @@ class Shell:
         )
         proc.state = ProcessState.RUNNING
         self.kernel.current_proc = proc  # для /proc/self
-        ctx = Context(self.kernel, user, self.cwd, self, proc, self.env)
+        ctx = Context(self.kernel, user, self.cwd, self, proc, self.env,
+                      stdout_is_terminal=stdout_is_terminal)
         try:
             result = cmd.func(ctx, args, stdin_data)
             out, code = self._normalize(result)
@@ -1029,7 +1044,9 @@ class Shell:
         adjustment, rest = self._parse_nice(["nice"] + list(args))
         if not rest:
             return "0"
-        out, err, code = self.run_single(rest, stdin, user, nice=adjustment)
+        out, err, code = self.run_single(
+            rest, stdin, user=user, nice=adjustment,
+            stdout_is_terminal=self._stdout_is_terminal)
         if err:
             self.write_stderr(err)
         return out, code
@@ -1141,7 +1158,9 @@ class Shell:
         target = self.kernel.users.get_by_name(target_name)
         if target is None:
             raise InvalidArgument(f"sudo: unknown user: {target_name}")
-        out, err, code = self.run_single(rest, stdin, user=target)
+        out, err, code = self.run_single(
+            rest, stdin, user=target,
+            stdout_is_terminal=self._stdout_is_terminal)
         if err:
             self.write_stderr(err)
         return out, code

@@ -1,18 +1,23 @@
-"""BS7-1: characterization of the current text-only pipeline ABI.
+"""BS7 pipeline characterization: text and binary data through the shell.
 
-Every test here records what pyOS does *today* with binary data in pipes,
-redirects and terminal output. The tests are intentionally not aspirational:
-BS7-2..BS7-5 will invert or replace the marked cases, while the text-only
-ones must keep passing unchanged.
+Text cases must stay exactly as before. Binary cases were recorded in BS7-1
+and are inverted here for BS7-4: `cat` is byte-capable outside the terminal,
+`wc -c` counts raw stdin bytes, and `>`/`>>` preserve exact bytes.
 
 Binary file used everywhere: ``b"PYOS-BINARY-EXAMPLE\\x00\\xff\\x10\\n"``.
 """
 
+import pytest
+
 from pyos.commands import network_cmds
+from pyos.commands.fs_cmds import cmd_cat
 from pyos.commands.registry import COMMANDS, Command
+from pyos.context import Context
+from pyos.errors import PyOSError
 from pyos.shell import Shell
 
 BIN = b"PYOS-BINARY-EXAMPLE\x00\xff\x10\n"
+BIN2 = b"\x00second\xff"
 TEXT = b"b\na\nb\n"
 
 
@@ -34,7 +39,7 @@ def _fake_transport(monkeypatch, body):
 
 # -- text pipeline: must keep working ---------------------------------------
 
-def test_current_cat_text_pipeline_to_wc_c(kernel, root, capsys):
+def test_cat_text_pipeline_unchanged(kernel, root, capsys):
     _write(kernel, root, "/tmp/text", TEXT)
     sh = _shell(kernel, root)
 
@@ -48,24 +53,16 @@ def test_current_cat_text_pipeline_to_wc_c(kernel, root, capsys):
     assert captured.err == ""
     assert sh.exit_code == 0
 
-
-# -- binary through cat: current failure and masking ------------------------
-
-def test_current_cat_binary_file_to_wc_c(kernel, root, capsys):
-    _write(kernel, root, "/tmp/bin", BIN)
-    sh = _shell(kernel, root)
-
-    sh.handle_line("cat /tmp/bin | wc -c")
+    sh.handle_line("cat /tmp/text | cat")
     captured = capsys.readouterr()
-
-    # Current behaviour: cat fails, wc receives empty stdin and reports 0,
-    # and the pipeline exit code is masked by the last command.
-    assert captured.out == "0\n"
-    assert "cat: binary file: /tmp/bin" in captured.err
+    assert captured.out == "b\na\nb\n"
+    assert captured.err == ""
     assert sh.exit_code == 0
 
 
-def test_current_cat_binary_to_stdout_terminal(kernel, root, capsys):
+# -- cat binary: terminal vs non-terminal -----------------------------------
+
+def test_cat_terminal_binary_message_preserved(kernel, root, capsys):
     _write(kernel, root, "/tmp/bin", BIN)
     sh = _shell(kernel, root)
 
@@ -78,21 +75,68 @@ def test_current_cat_binary_to_stdout_terminal(kernel, root, capsys):
     assert sh.exit_code == 22
 
 
-def test_current_cat_binary_redirect_overwrite_creates_empty_file(
+def test_cat_nonterminal_binary_returns_bytes(kernel, root):
+    _write(kernel, root, "/tmp/bin", BIN)
+    ctx = Context(kernel, root, "/root", shell=_shell(kernel, root),
+                  stdout_is_terminal=False)
+
+    assert cmd_cat(ctx, ["/tmp/bin"], "") == BIN
+
+
+def test_cat_binary_to_wc_c_returns_exact_byte_count(kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", BIN)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/bin | wc -c")
+    captured = capsys.readouterr()
+
+    assert captured.out == f"{len(BIN)}\n"
+    assert captured.err == ""
+    assert sh.exit_code == 0
+
+
+def test_cat_binary_to_cat_to_wc_c_returns_exact_byte_count(
         kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", BIN)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/bin | cat | wc -c")
+    captured = capsys.readouterr()
+
+    assert captured.out == f"{len(BIN)}\n"
+    assert captured.err == ""
+    assert sh.exit_code == 0
+
+
+def test_cat_binary_pipe_cat_terminal_safe_suppression(kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", BIN)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/bin | cat")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == "pyos: binary output suppressed\n"
+    assert "Traceback" not in captured.err
+    assert sh.exit_code == 0
+
+
+# -- output redirection ------------------------------------------------------
+
+def test_cat_binary_redirect_overwrite_exact_bytes(kernel, root, capsys):
     _write(kernel, root, "/tmp/bin", BIN)
     sh = _shell(kernel, root)
 
     sh.handle_line("cat /tmp/bin > /tmp/out")
     captured = capsys.readouterr()
 
-    assert "cat: binary file: /tmp/bin" in captured.err
-    assert sh.exit_code == 22
-    assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == b""
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.exit_code == 0
+    assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == BIN
 
 
-def test_current_cat_binary_redirect_append_does_not_modify_file(
-        kernel, root, capsys):
+def test_cat_binary_redirect_append_exact_bytes(kernel, root, capsys):
     _write(kernel, root, "/tmp/bin", BIN)
     _write(kernel, root, "/tmp/out", b"keep\n")
     sh = _shell(kernel, root)
@@ -100,10 +144,62 @@ def test_current_cat_binary_redirect_append_does_not_modify_file(
     sh.handle_line("cat /tmp/bin >> /tmp/out")
     captured = capsys.readouterr()
 
-    assert "cat: binary file: /tmp/bin" in captured.err
-    assert sh.exit_code == 22
-    assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == b"keep\n"
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.exit_code == 0
+    assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == b"keep\n" + BIN
 
+
+def test_cat_binary_pipe_cat_redirect_exact_bytes(kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", BIN)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/bin | cat > /tmp/out")
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == ""
+    assert sh.exit_code == 0
+    assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == BIN
+
+
+def test_cat_multiple_files_binary_concat_exact_bytes(kernel, root, capsys):
+    _write(kernel, root, "/tmp/bin", BIN)
+    _write(kernel, root, "/tmp/bin2", BIN2)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/bin2 /tmp/bin > /tmp/out")
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert sh.exit_code == 0
+    assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == BIN2 + BIN
+
+
+def test_cat_no_newline_added_in_binary_redirect(kernel, root, capsys):
+    data = BIN[:-1]
+    _write(kernel, root, "/tmp/nonl", data)
+    sh = _shell(kernel, root)
+
+    sh.handle_line("cat /tmp/nonl > /tmp/out")
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert sh.exit_code == 0
+    assert kernel.fs.read_bytes("/tmp/out", root, "/", "/") == data
+
+
+def test_ulimit_f_counts_bytes_for_binary_redirect(kernel, root):
+    sh = _shell(kernel, root)
+    sh.ulimit["file_size"] = len(BIN) - 1
+
+    with pytest.raises(
+            PyOSError,
+            match=f"{len(BIN)} > {len(BIN) - 1} bytes"):
+        sh._write_redirect("/tmp/out", BIN, False, root)
+
+
+# -- input redirection -------------------------------------------------------
 
 def test_input_redirect_missing_file_still_errors(kernel, root, capsys):
     sh = _shell(kernel, root)
@@ -139,7 +235,7 @@ def test_input_redirect_text_file_passes_bytes_to_command(
     assert sh.exit_code == 0
 
 
-def test_input_redirect_binary_file_to_cat_current_behavior_after_bytes_wire(
+def test_input_redirect_binary_file_to_cat_terminal_suppressed(
         kernel, root, capsys):
     _write(kernel, root, "/tmp/bin", BIN)
     sh = _shell(kernel, root)
@@ -147,53 +243,38 @@ def test_input_redirect_binary_file_to_cat_current_behavior_after_bytes_wire(
     sh.handle_line("cat < /tmp/bin")
     captured = capsys.readouterr()
 
-    # BS7-3: `<` отдаёт bytes, cat возвращает их как есть, терминал
-    # подавляет binary output. Старый двойной path больше не появляется.
     assert captured.out == ""
     assert captured.err == "pyos: binary output suppressed\n"
     assert sh.exit_code == 0
 
 
-def test_input_redirect_binary_file_to_wc_c_current_behavior_after_bytes_wire(
-        kernel, root, capsys):
+def test_wc_c_input_redirect_binary_exact_count(kernel, root, capsys):
     _write(kernel, root, "/tmp/bin", BIN)
     sh = _shell(kernel, root)
 
     sh.handle_line("wc -c < /tmp/bin")
     captured = capsys.readouterr()
 
-    # BS7-3: bytes доходят до wc, а он декодирует stdin как текст.
-    assert captured.out == ""
-    assert captured.err == "wc: not valid UTF-8 text: <stdin>\n"
-    assert sh.exit_code == 22
-
-
-def test_current_cat_binary_pipe_cat(kernel, root, capsys):
-    _write(kernel, root, "/tmp/bin", BIN)
-    sh = _shell(kernel, root)
-
-    sh.handle_line("cat /tmp/bin | cat")
-    captured = capsys.readouterr()
-
-    assert captured.out == ""
-    assert "cat: binary file: /tmp/bin" in captured.err
+    assert captured.out == f"{len(BIN)}\n"
+    assert captured.err == ""
     assert sh.exit_code == 0
 
 
-def test_current_cat_binary_pipe_grep(kernel, root, capsys):
+# -- text utilities: binary stdin is still strict text ----------------------
+
+def test_grep_binary_stdin_still_strict_text(kernel, root, capsys):
     _write(kernel, root, "/tmp/bin", BIN)
     sh = _shell(kernel, root)
 
     sh.handle_line("cat /tmp/bin | grep needle")
     captured = capsys.readouterr()
 
-    # grep sees empty stdin, so it finds nothing and returns 1.
     assert captured.out == ""
-    assert "cat: binary file: /tmp/bin" in captured.err
-    assert sh.exit_code == 1
+    assert captured.err == "grep: not valid UTF-8 text: <stdin>\n"
+    assert sh.exit_code == 22
 
 
-def test_current_cat_binary_pipe_sort(kernel, root, capsys):
+def test_sort_binary_stdin_still_strict_text(kernel, root, capsys):
     _write(kernel, root, "/tmp/bin", BIN)
     sh = _shell(kernel, root)
 
@@ -201,11 +282,11 @@ def test_current_cat_binary_pipe_sort(kernel, root, capsys):
     captured = capsys.readouterr()
 
     assert captured.out == ""
-    assert "cat: binary file: /tmp/bin" in captured.err
-    assert sh.exit_code == 0
+    assert captured.err == "sort: not valid UTF-8 text: <stdin>\n"
+    assert sh.exit_code == 22
 
 
-def test_current_cat_binary_pipe_tr(kernel, root, capsys):
+def test_tr_binary_stdin_still_strict_text(kernel, root, capsys):
     _write(kernel, root, "/tmp/bin", BIN)
     sh = _shell(kernel, root)
 
@@ -213,13 +294,13 @@ def test_current_cat_binary_pipe_tr(kernel, root, capsys):
     captured = capsys.readouterr()
 
     assert captured.out == ""
-    assert "cat: binary file: /tmp/bin" in captured.err
-    assert sh.exit_code == 0
+    assert captured.err == "tr: not valid UTF-8 text: <stdin>\n"
+    assert sh.exit_code == 22
 
 
 # -- virtual files: current text behaviour stays intact ---------------------
 
-def test_current_proc_version_pipe_wc_c(kernel, root, capsys):
+def test_proc_version_pipe_wc_c_still_works(kernel, root, capsys):
     sh = _shell(kernel, root)
     expected = len(kernel.fs.read_bytes("/proc/version", root, "/", "/"))
 
@@ -231,7 +312,7 @@ def test_current_proc_version_pipe_wc_c(kernel, root, capsys):
     assert sh.exit_code == 0
 
 
-def test_current_dev_null_pipe_wc_c(kernel, root, capsys):
+def test_dev_null_pipe_wc_c_still_works(kernel, root, capsys):
     sh = _shell(kernel, root)
 
     sh.handle_line("cat /dev/null | wc -c")

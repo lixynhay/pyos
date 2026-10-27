@@ -296,18 +296,18 @@ def test_proc_dev_restored_after_load(kernel, root, tmp_path):
 
 # -- shell redirects / ulimit ----------------------------------------------
 
-def test_redirect_from_binary_file_errors_clearly(kernel, root, capsys):
+def test_redirect_from_binary_file_preserves_bytes(kernel, root, capsys):
     fs = kernel.fs
-    fs.create_file("/tmp/bin", root, "/", "/", data=b"\xff\xfe")
+    data = b"\xff\xfe"
+    fs.create_file("/tmp/bin", root, "/", "/", data=data)
     shell = Shell(kernel, root)
     shell.handle_line("cat /tmp/bin > /tmp/out")
 
-    err = capsys.readouterr().err
-    assert "not valid UTF-8" in err
-    assert "Traceback" not in err
-    assert shell.exit_code != 0
-    # Как и для любой упавшей команды с `>`, редирект создаёт пустой файл.
-    assert fs.read_bytes("/tmp/out", root, "/", "/") == b""
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "Traceback" not in captured.out + captured.err
+    assert shell.exit_code == 0
+    assert fs.read_bytes("/tmp/out", root, "/", "/") == data
 
 
 def test_ulimit_f_counts_bytes(kernel, root):
